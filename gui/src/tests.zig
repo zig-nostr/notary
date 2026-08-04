@@ -180,7 +180,7 @@ test "the empty view shows the connection status and a zero count" {
     var model = main.initialModel(); // .connecting, empty queue
     const tree = try buildTree(arena_state.allocator(), &model);
 
-    _ = try expectByText(tree.root, .text, "Signet");
+    _ = try expectByText(tree.root, .text, "Notary");
     _ = try expectByText(tree.root, .text, "Connecting to the signer…");
     _ = try expectByText(tree.root, .status_bar, "0 pending");
 }

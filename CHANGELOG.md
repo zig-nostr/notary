@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to **Signet** are documented in this file.
+All notable changes to **Notary** are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 While pre-1.0, minor versions add capability and patch versions are fixes.
@@ -18,7 +18,7 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
   (#24).
 - A **one-line macOS installer**:
   `curl -fsSL …/scripts/install-macos.sh | bash` resolves the latest release,
-  verifies its SHA-256, installs `Signet.app` to `/Applications`, clears the
+  verifies its SHA-256, installs `Notary.app` to `/Applications`, clears the
   download quarantine, and opens it (#25).
 
 ### Changed

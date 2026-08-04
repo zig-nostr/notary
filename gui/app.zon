@@ -1,8 +1,8 @@
 .{
-    .id = "com.zig-nostr.signet",
-    .name = "signet",
-    .display_name = "Signet",
-    .description = "Signet — approve or deny Nostr signing requests; your key stays in the signer daemon.",
+    .id = "com.zig-nostr.notary",
+    .name = "notary",
+    .display_name = "Notary",
+    .description = "Notary — approve or deny Nostr signing requests; your key stays in the signer daemon.",
     .version = "0.2.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
@@ -12,13 +12,13 @@
         .windows = .{
             .{
                 .label = "main",
-                .title = "Signet",
+                .title = "Notary",
                 .width = 460,
                 .height = 560,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
                 .views = .{
-                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Signet canvas", .accessibility_label = "Signet", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
+                    .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                 },
             },
         },
