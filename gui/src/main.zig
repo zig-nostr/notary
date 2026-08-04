@@ -1,4 +1,4 @@
-//! Signet — a native desktop approver for the signer daemon.
+//! Notary — a native desktop approver for the signer daemon.
 //!
 //! Architecture: the signer daemon (the daemon/ package in this repo) holds the
 //! secret key and does all Nostr work; this app is a *separate process* that
@@ -41,11 +41,11 @@ const window_height: f32 = 560;
 
 const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard };
 const shell_views = [_]native_sdk.ShellView{
-    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Signet canvas", .accessibility_label = "Signet", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
+    .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
     .label = "main",
-    .title = "Signet",
+    .title = "Notary",
     .width = window_width,
     .height = window_height,
     .restore_state = false,
@@ -552,8 +552,8 @@ pub const Msg = union(enum) {
 pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 
-const SignetApp = native_sdk.UiApp(Model, Msg);
-const Effects = SignetApp.Effects;
+const NotaryApp = native_sdk.UiApp(Model, Msg);
+const Effects = NotaryApp.Effects;
 
 fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.phase = .starting;
@@ -1049,8 +1049,8 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
 }
 
 pub fn main(init: std.process.Init) !void {
-    const app_state = try SignetApp.create(std.heap.page_allocator, .{
-        .name = "signet",
+    const app_state = try NotaryApp.create(std.heap.page_allocator, .{
+        .name = "notary",
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .init_fx = boot,
@@ -1062,9 +1062,9 @@ pub fn main(init: std.process.Init) !void {
     loadConfig(&app_state.model, init.io, init.environ_map);
 
     try runner.runWithOptions(app_state.app(), .{
-        .app_name = "signet",
-        .window_title = "Signet",
-        .bundle_id = "com.zig-nostr.signet",
+        .app_name = "notary",
+        .window_title = "Notary",
+        .bundle_id = "com.zig-nostr.notary",
         .icon_path = "assets/icon.png",
         .default_frame = geometry.RectF.init(0, 0, window_width, window_height),
         .restore_state = false,

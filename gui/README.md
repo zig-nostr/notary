@@ -1,6 +1,6 @@
-# Signet — the GUI
+# Notary — the GUI
 
-**Signet** — a native desktop app that approves or denies Nostr
+**Notary** — a native desktop app that approves or denies Nostr
 signing requests from your [signer daemon](../daemon).
 
 > **Status: early / work in progress.** This is the interactive front end for
@@ -11,7 +11,7 @@ signing requests from your [signer daemon](../daemon).
 > `.app`, shipped as ad-hoc-signed macOS releases (not notarized — see the
 > top-level [Install](../README.md#install)).
 
-![Signet: first-run key setup, then approving a live signing request](assets/demo.gif)
+![Notary: first-run key setup, then approving a live signing request](assets/demo.gif)
 
 <sub>First-run key setup, then the serving screen — the `bunker://` connection URL
 to copy into a client, live per-relay status, and approving a real NIP-46 signing
@@ -106,8 +106,8 @@ in the daemon child.
 ## Packaging
 
 `scripts/package-macos.sh` produces a single, self-contained
-`Signet.app` with both executables side by side in `Contents/MacOS`
-(`signet` and `signer`), so one download brings up both:
+`Notary.app` with both executables side by side in `Contents/MacOS`
+(`notary` and `signer`), so one download brings up both:
 
 ```sh
 # builds the GUI, packages the .app, injects the daemon, and ad-hoc signs it

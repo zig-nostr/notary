@@ -1,11 +1,11 @@
-<!-- Signet — the live view. The header shows the connection state
+<!-- Notary — the live view. The header shows the connection state
      and which key you are approving for; the body is one of several mutually
      exclusive states (signer stopped / first-run setup / unlock / no requests /
      the request queue); the status bar counts the queue. Logic is in
      src/main.zig. Validate with: native check -->
 <column gap="0">
   <column gap="4" padding="16">
-    <text size="heading">Signet</text>
+    <text size="heading">Notary</text>
     <text>{status}</text>
     <text>signer {pubkey_short}</text>
   </column>

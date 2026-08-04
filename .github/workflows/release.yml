@@ -40,13 +40,13 @@ jobs:
         run: cd gui && scripts/package-macos.sh --signer ../daemon/zig-out/bin/signer
 
       - name: Zip the .app (ditto preserves the signature)
-        run: ditto -c -k --sequesterRsrc --keepParent "gui/dist/Signet.app" "Signet-${{ github.ref_name }}-macos.zip"
+        run: ditto -c -k --sequesterRsrc --keepParent "gui/dist/Notary.app" "Notary-${{ github.ref_name }}-macos.zip"
 
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
           gh release create "${{ github.ref_name }}"
-          "Signet-${{ github.ref_name }}-macos.zip"
-          --title "Signet ${{ github.ref_name }}"
+          "Notary-${{ github.ref_name }}-macos.zip"
+          --title "Notary ${{ github.ref_name }}"
           --notes-file .github/RELEASE_NOTES.md
