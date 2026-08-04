@@ -1,21 +1,21 @@
-# Notary — the GUI
+# Notary, the GUI
 
-**Notary** — a native desktop app that approves or denies Nostr
+**Notary**: a native desktop app that approves or denies Nostr
 signing requests from your [signer daemon](../daemon).
 
 > **Status: early / work in progress.** This is the interactive front end for
 > the headless signer daemon. It walks you through first-run key setup (create
 > or import), unlocks the key on later launches, then shows each pending signing
-> request and sends back your approve/deny decision — and spawns and supervises
+> request and sends back your approve/deny decision, and spawns and supervises
 > the daemon itself. `scripts/package-macos.sh` bundles both into a single
-> `.app`, shipped as ad-hoc-signed macOS releases (not notarized — see the
+> `.app`, shipped as ad-hoc-signed macOS releases (not notarized, see the
 > top-level [Install](../README.md#install)).
 
 ![Notary: first-run key setup, then approving a live signing request](assets/demo.gif)
 
-<sub>First-run key setup, then the serving screen — the `bunker://` connection URL
+<sub>First-run key setup, then the serving screen, the `bunker://` connection URL
 to copy into a client, live per-relay status, and approving a real NIP-46 signing
-request. The key is generated and held by the signer daemon — it never enters this
+request. The key is generated and held by the signer daemon. It never enters this
 app.</sub>
 
 ## Architecture
@@ -29,7 +29,7 @@ The signer is split into two processes on purpose:
 - **This app** is a separate process that polls that API, shows each pending
   request, and sends back your approve/deny decision.
 
-The key never enters this process — it only ever sees request metadata and
+The key never enters this process. It only ever sees request metadata and
 returns a yes/no. Built with the
 [Native SDK](https://github.com/vercel-labs/native): declarative markup plus
 Zig, rendered natively (no WebView, no Electron).
@@ -53,9 +53,9 @@ Run the daemon in **GUI mode** (see the signer's
 section) so it serves the loopback approval API, then point this app at it
 with two environment variables:
 
-- `SIGNER_APPROVAL_HTTP` — the daemon's approval address (default
+- `SIGNER_APPROVAL_HTTP`: the daemon's approval address (default
   `127.0.0.1:8787`).
-- `SIGNER_APPROVAL_TOKEN_FILE` — the bearer-token file the daemon wrote
+- `SIGNER_APPROVAL_TOKEN_FILE`: the bearer-token file the daemon wrote
   (default `$HOME/.zig-nostr-signer.token`).
 
 ```sh
@@ -76,20 +76,20 @@ The first time it connects to a daemon that has no key yet, the app shows a
 64-char hex), protected by a passphrase. On later launches the daemon comes up
 locked and the app shows an **unlock screen** for that passphrase. The key is
 generated and decrypted inside the daemon (over `POST /setup` and
-`POST /unlock`) — the app only ever sends the passphrase, and on import the
+`POST /unlock`): the app only ever sends the passphrase, and on import the
 secret you type, never a derived key.
 
 ### Managed mode (the app supervises the daemon)
 
 A packaged app is self-contained: the `.app` ships the `signer` daemon beside
 the GUI in `Contents/MacOS`, and at launch the GUI discovers that sibling and
-spawns it — one launch brings up both, no configuration. In development you get
+spawns it, one launch brings up both, no configuration. In development you get
 the same one-launch behavior without packaging by pointing `SIGNER_BIN` at a
 built daemon (it takes precedence over any bundled one):
 
 ```sh
 SIGNER_BIN="$(which signer)" \
-SIGNER_SECRET_KEY=<64-char hex, dev only — prefer SIGNER_KEY_FILE + SIGNER_PASSPHRASE> \
+SIGNER_SECRET_KEY=<64-char hex, dev only, prefer SIGNER_KEY_FILE + SIGNER_PASSPHRASE> \
 SIGNER_RELAYS="wss://relay.example.com" \
 SIGNER_APPROVAL_HTTP=127.0.0.1:8787 \
 SIGNER_APPROVAL_TOKEN_FILE="$HOME/.zig-nostr-signer.token" \
@@ -139,7 +139,7 @@ scripts/package-macos.sh --signing identity \
 - [x] App scaffold (native window, shell view, logic tests)
 - [x] Approval queue over the daemon's loopback API (poll, approve, deny)
 - [x] Supervise the daemon as a child process (one launch, key stays isolated)
-- [x] Bundle the daemon into the app — one `.app`, discovered and supervised
+- [x] Bundle the daemon into the app, one `.app`, discovered and supervised
 - [x] First-run key onboarding in-app (create / import / unlock)
 - [x] Ad-hoc signed macOS releases + one-line installer (CI on tag; clears quarantine on install)
 

@@ -12,7 +12,7 @@
 //!   decisions (`resolve`).
 //!
 //! The broker is deliberately independent of the `std.Io` model: a tiny atomic
-//! spinlock guards the small pending array (contention is near-zero — approvals
+//! spinlock guards the small pending array (contention is near-zero, approvals
 //! are human-paced and rare), and each entry carries an atomic decision slot.
 //! Only the submit poll-wait uses the caller's `io.sleep`, exactly as the relay
 //! reconnect loop already does.
@@ -74,7 +74,7 @@ pub const Broker = struct {
         const idx = self.claim(info) orelse return .reject;
 
         // Poll the decision slot, pacing with io.sleep (as the reconnect loop
-        // does). Elapsed time is counted in sleep steps — no wall clock needed.
+        // does). Elapsed time is counted in sleep steps, no wall clock needed.
         const step_ms = 50;
         var waited_ms: u64 = 0;
         var decision = self.slots[idx].decision.load(.acquire);
@@ -181,7 +181,7 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request) nip46.Decision {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — drive the broker across real threads (a resolver thread stands in for
+// Tests, drive the broker across real threads (a resolver thread stands in for
 // the GUI), and check the interactive policy's allowlist pre-filter.
 // ---------------------------------------------------------------------------
 

@@ -1,16 +1,16 @@
 //! First-run key onboarding for GUI mode.
 //!
 //! In GUI mode the daemon may boot without a key. This gate lets the connected
-//! GUI create one — generate a fresh key, or import an existing `nsec1…`/hex —
+//! GUI create one, generate a fresh key, or import an existing `nsec1…`/hex,
 //! or unlock an existing encrypted key file, all over the loopback approval API
 //! (see `approval_http.zig`). The secret key is generated and decrypted HERE,
 //! inside the key-holding daemon; only the passphrase (and, on import, the
 //! secret the operator chose to type) ever crosses the API. The key itself is
-//! never serialized back — the GUI only learns the derived public key.
+//! never serialized back, the GUI only learns the derived public key.
 //!
 //! Once a key is available the gate publishes it to the serving path, which
 //! blocks in `waitUnlocked` until then. The handoff is a single atomic flip
-//! (release/acquire) — the same io-model-independent idiom the broker uses —
+//! (release/acquire): the same io-model-independent idiom the broker uses,
 //! so no key derivation happens on any request path.
 
 const std = @import("std");
@@ -24,9 +24,9 @@ const hex = nostr.hex;
 const Dir = std.Io.Dir;
 
 pub const State = enum(u8) {
-    /// No key file yet — the GUI must `setup` (generate or import) one.
+    /// No key file yet, the GUI must `setup` (generate or import) one.
     uninitialized,
-    /// A key file exists but is still encrypted — the GUI must `unlock` it.
+    /// A key file exists but is still encrypted, the GUI must `unlock` it.
     locked,
     /// The key is loaded and the daemon can serve.
     unlocked,
@@ -131,7 +131,7 @@ pub const Gate = struct {
         self.publish(kp);
     }
 
-    /// Marks the gate `unlocked` with a key loaded outside the API — used in GUI
+    /// Marks the gate `unlocked` with a key loaded outside the API, used in GUI
     /// mode when the operator preconfigured a key in the environment, so the GUI
     /// skips onboarding. `kp` must already be validated.
     pub fn preload(self: *Gate, kp: keys.KeyPair) void {
@@ -171,7 +171,7 @@ fn decodeSecret(gpa: std.mem.Allocator, s: []const u8) ?[32]u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — exercise the gate end to end against a real temp dir: generate,
+// Tests, exercise the gate end to end against a real temp dir: generate,
 // import (nsec + hex), reject bad input, unlock a locked file, and prove the
 // state machine's rails (no double-init, wrong passphrase stays locked).
 // ---------------------------------------------------------------------------

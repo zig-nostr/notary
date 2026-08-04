@@ -5,15 +5,15 @@ remote signer ("bunker") for Nostr, built on the
 [zig-nostr/nostr](https://github.com/zig-nostr/nostr) library.
 
 It keeps your `nsec` on a machine you control and signs on behalf of web and
-native clients over a relay — the secret key never reaches the client.
+native clients over a relay, the secret key never reaches the client.
 
 > **Status: early / work in progress.** This is Showcase 1 of the zig-nostr
 > roadmap. The current build loads an encrypted (NIP-49) key from disk, connects
-> to your relays, and answers NIP-46 requests — `get_public_key`, `sign_event`,
-> `ping`, and NIP-44 encrypt/decrypt — behind the connection secret and an
+> to your relays, and answers NIP-46 requests, `get_public_key`, `sign_event`,
+> `ping`, and NIP-44 encrypt/decrypt, behind the connection secret and an
 > optional method/event-kind allowlist. It can also run in **GUI mode**: it
 > holds each request for interactive approval over a loopback API, and can
-> create or unlock the key on first run from that same API — the key never
+> create or unlock the key on first run from that same API, the key never
 > leaves the daemon. The native approval app itself is landing next.
 
 ## Build
@@ -27,7 +27,7 @@ zig build
 ## Usage
 
 The signer is configured with environment variables. First create an encrypted
-key file — it is stored `0600` as a NIP-49 `ncryptsec`, so your key is never on
+key file. It is stored `0600` as a NIP-49 `ncryptsec`, so your key is never on
 disk in the clear:
 
 ```sh
@@ -56,7 +56,7 @@ Paste the token into a NIP-46-capable client to sign with a key that never
 leaves this process.
 
 For quick local testing you can skip the key file and pass an unencrypted key
-directly with `SIGNER_SECRET_KEY=<64-char hex>` — but that keeps the key in your
+directly with `SIGNER_SECRET_KEY=<64-char hex>`: but that keeps the key in your
 environment in the clear, so prefer the encrypted file otherwise.
 
 ### Restricting what the signer will do
@@ -64,12 +64,12 @@ environment in the clear, so prefer the encrypted file otherwise.
 By default the signer honors every NIP-46 request behind the connection secret.
 Two optional variables narrow that to least privilege:
 
-- `SIGNER_ALLOWED_METHODS` — comma-separated methods the signer will honor, e.g.
+- `SIGNER_ALLOWED_METHODS`: comma-separated methods the signer will honor, e.g.
   `get_public_key,sign_event`. `connect`, `ping`, and `logout` are always
   allowed so the handshake can't be locked out. Use this to run a **sign-only**
   bunker that refuses `nip44_decrypt`, so a connected client can't read your DMs
   through it.
-- `SIGNER_ALLOWED_KINDS` — comma-separated event kinds `sign_event` may sign,
+- `SIGNER_ALLOWED_KINDS`: comma-separated event kinds `sign_event` may sign,
   e.g. `1,7`. A request to sign any other kind is denied.
 
 Denied requests are answered with a NIP-46 error and logged.
@@ -80,18 +80,18 @@ By default a request that passes the allowlist is answered immediately. Set
 `SIGNER_APPROVAL_HTTP` to instead hold each one for interactive approval: the
 daemon serves a small **loopback-only** HTTP API that a separate GUI connects
 to, so you approve or deny each request on screen. The key never leaves the
-daemon — the GUI only ever sees request metadata and sends back a yes/no.
+daemon, the GUI only ever sees request metadata and sends back a yes/no.
 
 In GUI mode the daemon can also boot **without a key** and let the GUI set one
 up on first run, so a freshly downloaded app is turnkey. It reports its key
 state on `GET /info` (`uninitialized` → `locked` → `unlocked`); the GUI creates
 a key with `POST /setup` (generate a fresh one, or import an existing `nsec1…`
 or 64-char hex) or decrypts an existing key file with `POST /unlock`. The key is
-generated and decrypted inside the daemon — only the passphrase (and, on import,
+generated and decrypted inside the daemon, only the passphrase (and, on import,
 the secret you type) ever crosses the API, never a derived key.
 
 ```sh
-# Turnkey: no key file and no passphrase on the command line — the GUI provides
+# Turnkey: no key file and no passphrase on the command line, the GUI provides
 # them. SIGNER_KEY_FILE ($HOME/.zig-nostr-signer.key), SIGNER_APPROVAL_TOKEN_FILE
 # ($HOME/.zig-nostr-signer.token) and SIGNER_RELAYS all default in this mode, so
 # this alone is enough:
@@ -99,7 +99,7 @@ SIGNER_APPROVAL_HTTP="127.0.0.1:8787" \
   zig build run
 ```
 
-You can still preconfigure the key instead of onboarding it — set
+You can still preconfigure the key instead of onboarding it, set
 `SIGNER_KEY_FILE` + `SIGNER_PASSPHRASE` (or the dev-only `SIGNER_SECRET_KEY`) and
 the daemon boots straight to `unlocked`.
 
@@ -107,7 +107,7 @@ The API is bound to loopback and every request must carry the bearer token
 written (mode `0600`) to `SIGNER_APPROVAL_TOKEN_FILE`. Endpoints: `GET /info`,
 `POST /setup`, `POST /unlock`, `GET /pending` (long-poll), `POST /decision`. A
 request left unanswered past the timeout is denied, and the allowlist still
-applies first — so disallowed requests are rejected without ever prompting.
+applies first, so disallowed requests are rejected without ever prompting.
 
 ## Roadmap
 

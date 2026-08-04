@@ -2,7 +2,7 @@
     .id = "com.zig-nostr.notary",
     .name = "notary",
     .display_name = "Notary",
-    .description = "Notary — approve or deny Nostr signing requests; your key stays in the signer daemon.",
+    .description = "Notary: approve or deny Nostr signing requests; your key stays in the signer daemon.",
     .version = "0.2.0",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
