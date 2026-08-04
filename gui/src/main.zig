@@ -1,4 +1,4 @@
-//! Notary — a native desktop approver for the signer daemon.
+//! Notary, a native desktop approver for the signer daemon.
 //!
 //! Architecture: the signer daemon (the daemon/ package in this repo) holds the
 //! secret key and does all Nostr work; this app is a *separate process* that
@@ -11,7 +11,7 @@
 //!  - **Attached** (default): the daemon is already running; the app connects
 //!    to its approval API at `SIGNER_APPROVAL_HTTP`.
 //!  - **Managed**: the app *spawns and supervises* the daemon binary as a child
-//!    process — one launch brings up both. The daemon is either a `signer`
+//!    process, one launch brings up both. The daemon is either a `signer`
 //!    bundled beside this executable (`…/Contents/MacOS/signer` in a packaged
 //!    app, so a single download is self-contained) or, taking precedence, an
 //!    explicit `SIGNER_BIN` override for development. The child inherits this
@@ -135,7 +135,7 @@ pub const RelayRow = struct {
             .disconnected => "offline",
         };
     }
-    // Status predicates — the view picks a literally-colored status word off
+    // Status predicates, the view picks a literally-colored status word off
     // these (`foreground` takes only a literal token, so the color can't bind).
     pub fn connected(self: *const RelayRow) bool {
         return self.conn == .connected;
@@ -156,7 +156,7 @@ pub const Phase = enum {
     /// Attached mode: trying to reach an already-running daemon.
     connecting,
     connected,
-    /// Was reachable, now failing — retrying.
+    /// Was reachable, now failing, retrying.
     disconnected,
     /// The API rejected our bearer token (attached mode).
     unauthorized,
@@ -240,7 +240,7 @@ pub const Model = struct {
     pub fn baseUrl(self: *const Model) []const u8 {
         return self.base_url_buf[0..self.base_url_len];
     }
-    /// The bare `host:port` we poll — passed to the spawned daemon as
+    /// The bare `host:port` we poll, passed to the spawned daemon as
     /// `--approval-http` so it serves the API there (a Finder-launched `.app`
     /// carries no `SIGNER_APPROVAL_HTTP` env for the child to inherit).
     pub fn approvalAddress(self: *const Model) []const u8 {
@@ -288,7 +288,7 @@ pub const Model = struct {
     pub fn count(self: *const Model) usize {
         return self.rows_len;
     }
-    /// Body states — exactly one is true, so the view renders plain `<if>`
+    /// Body states, exactly one is true, so the view renders plain `<if>`
     /// blocks instead of nested else chains.
     pub fn daemon_down(self: *const Model) bool {
         return self.phase == .daemon_exited;
@@ -355,8 +355,8 @@ pub const Model = struct {
             .starting => "Starting the signer…",
             .connecting => "Connecting to the signer…",
             .connected => "Connected",
-            .disconnected => "Signer unreachable — retrying…",
-            .unauthorized => "Unauthorized — check the token file",
+            .disconnected => "Signer unreachable, retrying…",
+            .unauthorized => "Unauthorized: check the token file",
             .daemon_exited => "Signer stopped",
             .needs_setup => "First-run setup",
             .needs_unlock => "Locked",
@@ -370,8 +370,8 @@ pub const Model = struct {
             .connected => "No pending requests",
             .starting => "Starting the signer…",
             .connecting => "Connecting to the signer…",
-            .disconnected => "Signer unreachable — retrying…",
-            .unauthorized => "Unauthorized — check the token file",
+            .disconnected => "Signer unreachable, retrying…",
+            .unauthorized => "Unauthorized: check the token file",
             .daemon_exited, .needs_setup, .needs_unlock => "",
         };
     }
@@ -462,7 +462,7 @@ pub const Model = struct {
 
     fn setExitNote(self: *Model, exit: native_sdk.EffectExit) void {
         const s = switch (exit.reason) {
-            .spawn_failed, .rejected => std.fmt.bufPrint(&self.exit_note_buf, "The signer failed to start — check SIGNER_BIN.", .{}),
+            .spawn_failed, .rejected => std.fmt.bufPrint(&self.exit_note_buf, "The signer failed to start, check SIGNER_BIN.", .{}),
             .signaled => std.fmt.bufPrint(&self.exit_note_buf, "The signer was terminated (signal).", .{}),
             else => std.fmt.bufPrint(&self.exit_note_buf, "The signer exited (code {d}).", .{exit.code}),
         } catch return;
@@ -595,7 +595,7 @@ fn fetchInfo(model: *Model, fx: *Effects) void {
 }
 
 /// A lightweight /info re-poll that only refreshes the live relay status (and the
-/// bunker URI), decoupled from the initial connect flow — its response never
+/// bunker URI), decoupled from the initial connect flow, its response never
 /// touches the phase or the pending-poll chain, and its failures are ignored (the
 /// pending poll is the real connection-health signal). Runs on its own effect key
 /// so it never collides with the initial `fetchInfo`.
@@ -646,7 +646,7 @@ fn sendDecision(model: *Model, fx: *Effects, id: u64, approve: bool) void {
     });
 }
 
-/// POST /setup — create the key (generate, or import the entered secret) and,
+/// POST /setup, create the key (generate, or import the entered secret) and,
 /// on success, start serving. The daemon's scrypt KDF makes this take a moment,
 /// so the timeout is generous. The body buffer is wiped after the send (fx.fetch
 /// copies it synchronously).
@@ -669,7 +669,7 @@ fn sendSetup(model: *Model, fx: *Effects) void {
     std.crypto.secureZero(u8, &body_buf);
 }
 
-/// POST /unlock — decrypt the key file with the entered passphrase.
+/// POST /unlock, decrypt the key file with the entered passphrase.
 fn sendUnlock(model: *Model, fx: *Effects) void {
     model.submitting = true;
     model.clearOnboardError();
@@ -740,8 +740,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .daemon_line => {}, // daemon stdout; the connection state is the signal we surface
 
         .daemon_exited => |exit| {
-            // A cancel we initiated (restart / app quit) reports `.cancelled` —
-            // that is expected teardown, not a crash to report.
+            // A cancel we initiated (restart / app quit) reports `.cancelled`.
+            // That is expected teardown, not a crash to report.
             if (exit.reason == .cancelled) return;
             model.phase = .daemon_exited;
             model.setExitNote(exit);
@@ -764,7 +764,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                     if (model.phase != .connected) model.phase = .connecting;
                     fetchInfo(model, fx);
                 } else {
-                    armRetry(fx); // empty file — the daemon has not written it yet
+                    armRetry(fx); // empty file, the daemon has not written it yet
                 }
             },
             // Not there yet (managed daemon still starting) or unreadable: retry.
@@ -994,8 +994,8 @@ pub fn initialModel() Model {
 }
 
 /// Which daemon binary to supervise, or null for attached mode (connect to a
-/// daemon someone else started). An explicit `SIGNER_BIN` always wins — it is
-/// the development / override path — otherwise a `signer` bundled beside this
+/// daemon someone else started). An explicit `SIGNER_BIN` always wins. It is
+/// the development / override path, otherwise a `signer` bundled beside this
 /// executable is used, so a downloaded app needs no configuration. `bundled`
 /// is expected to be null or non-empty (see `bundledDaemonPath`).
 pub fn chooseDaemonBin(env_bin: ?[]const u8, bundled: ?[]const u8) ?[]const u8 {
@@ -1005,7 +1005,7 @@ pub fn chooseDaemonBin(env_bin: ?[]const u8, bundled: ?[]const u8) ?[]const u8 {
     return bundled;
 }
 
-/// Absolute path to a runnable `signer` sitting next to this executable — the
+/// Absolute path to a runnable `signer` sitting next to this executable, the
 /// layout a packaged app has (`…/Contents/MacOS/signer` beside the GUI binary),
 /// so a single download is self-contained. Returns null when there is no
 /// runnable sibling (e.g. under `native dev`, where the binary lives in the

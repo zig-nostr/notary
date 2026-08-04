@@ -13,7 +13,7 @@
 # child.
 #
 # The daemon binary is built from the `daemon/` package in this repo; this
-# script does not build it — point --signer at a prebuilt binary (or build it:
+# script does not build it, point --signer at a prebuilt binary (or build it:
 # `cd ../daemon && zig build -Doptimize=ReleaseFast`).
 #
 # Usage:

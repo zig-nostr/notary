@@ -1,8 +1,8 @@
-//! zig-nostr signer — a headless NIP-46 remote signer ("bunker").
+//! zig-nostr signer, a headless NIP-46 remote signer ("bunker").
 //!
 //! Keeps the user's secret key on a machine they control and signs for remote
-//! clients over a relay. On startup it loads the key — decrypting an encrypted
-//! NIP-49 key file at rest (`nostr.keystore`), or an unencrypted dev key —
+//! clients over a relay. On startup it loads the key, decrypting an encrypted
+//! NIP-49 key file at rest (`nostr.keystore`), or an unencrypted dev key,
 //! prints the `bunker://` connection token, then connects to each configured
 //! relay and serves NIP-46 requests (`nostr.signer.serve`) until stopped.
 //! Requests are authorized by an optional method/event-kind allowlist
@@ -33,7 +33,7 @@ const default_key_file = ".zig-nostr-signer.key";
 const default_gui_relays = "wss://relay.damus.io";
 
 const usage =
-    \\zig-nostr signer — headless NIP-46 remote signer (bunker)
+    \\zig-nostr signer: headless NIP-46 remote signer (bunker)
     \\
     \\Configure via environment variables:
     \\  SIGNER_KEY_FILE        path to an encrypted (NIP-49) key file
@@ -50,8 +50,8 @@ const usage =
     \\Provide the key either as an encrypted file (SIGNER_KEY_FILE +
     \\SIGNER_PASSPHRASE, recommended) or as SIGNER_SECRET_KEY (dev only). To create
     \\an encrypted file, run once with SIGNER_INIT set plus SIGNER_KEY_FILE and
-    \\SIGNER_PASSPHRASE — it imports SIGNER_SECRET_KEY if present, else generates a
-    \\fresh key — then run again without SIGNER_INIT to start serving.
+    \\SIGNER_PASSPHRASE. It imports SIGNER_SECRET_KEY if present, else generates a
+    \\fresh key, then run again without SIGNER_INIT to start serving.
     \\
     \\Prints the signer's public key and the bunker:// token clients connect
     \\with, then serves NIP-46 requests over the relays until stopped.
@@ -74,8 +74,8 @@ pub fn main(init: std.process.Init) !void {
     // GUI create or unlock the key over /setup and /unlock, and only then serves.
     // The key is created/decrypted here; the GUI never receives it (see
     // onboarding.zig + approval_http.zig). The approval address arrives as
-    // `--approval-http <addr>` — how the GUI passes it when it spawns us, since a
-    // Finder-launched app has no environment for the child to inherit — or via
+    // `--approval-http <addr>`: how the GUI passes it when it spawns us, since a
+    // Finder-launched app has no environment for the child to inherit, or via
     // `SIGNER_APPROVAL_HTTP`. Parse argv here so the slice lives for the process
     // (GUI/relay mode never returns).
     var approval_addr = getEnv("SIGNER_APPROVAL_HTTP");
@@ -138,7 +138,7 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
 
     // Honor a preconfigured key (dev SIGNER_SECRET_KEY, or an existing key file
     // plus SIGNER_PASSPHRASE) so an operator can still bring their own; when none
-    // is configured — the turnkey case — the GUI onboards one over the API.
+    // is configured (the turnkey case) the GUI onboards one over the API.
     if (guiPreloadKey(gpa, io, key_file)) |kp| gate.preload(kp);
     const booted = gate.current();
 
@@ -264,8 +264,8 @@ fn fileExists(io: std.Io, path: []const u8) bool {
 }
 
 /// In GUI mode, loads a key straight from the environment when one is fully
-/// specified — `SIGNER_SECRET_KEY` (dev), or an existing key file together with
-/// `SIGNER_PASSPHRASE` — so an operator can still preconfigure the key. Returns
+/// specified, `SIGNER_SECRET_KEY` (dev), or an existing key file together with
+/// `SIGNER_PASSPHRASE`: so an operator can still preconfigure the key. Returns
 /// null (→ the GUI onboards the key) only when nothing is configured; a bad key
 /// or wrong passphrase still fails loudly rather than silently onboarding.
 fn guiPreloadKey(gpa: std.mem.Allocator, io: std.Io, key_file: []const u8) ?keys.KeyPair {

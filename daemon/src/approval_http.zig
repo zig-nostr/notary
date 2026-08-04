@@ -1,6 +1,6 @@
 //! Minimal, hardened loopback HTTP approval API for GUI mode.
 //!
-//! The GUI process drives approvals over this API — it never holds the key.
+//! The GUI process drives approvals over this API. It never holds the key.
 //! Deliberately tiny (fixed routes, no keep-alive, no chunked encoding) to keep
 //! the key-holding daemon's attack surface small:
 //!
@@ -12,7 +12,7 @@
 //!
 //! `/info` reports the key state (`uninitialized`/`locked`/`unlocked`); the GUI
 //! drives first-run key onboarding through `/setup` and `/unlock`. The key is
-//! created and decrypted in the daemon — only the passphrase (and, on import,
+//! created and decrypted in the daemon, only the passphrase (and, on import,
 //! the operator's chosen secret) crosses the API, never a derived key.
 //!
 //! Every request must carry `Authorization: Bearer <token>`; the token is
@@ -103,7 +103,7 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     // blank line separating headers from the body.
     // Read available bytes until the blank line ends the headers. `readVec`
     // returns after one read (unlike `readSliceShort`, which blocks until it has
-    // filled the whole buffer or hit EOF — a deadlock when the client sends a
+    // filled the whole buffer or hit EOF, a deadlock when the client sends a
     // short request and then waits for our response).
     var buf: [8192]u8 = undefined;
     // A /setup or /unlock body carries a passphrase (and maybe an nsec) in these
@@ -222,7 +222,7 @@ fn handleInfo(self: *Server, w: *std.Io.Writer) !void {
     };
     // The pubkey and the bunker:// connection URI are known only once unlocked;
     // report "" until then. The URI is the string a client needs to connect, so
-    // the GUI shows and copies it — building it here keeps the canonical NIP-46
+    // the GUI shows and copies it, building it here keeps the canonical NIP-46
     // format (and the connection secret) in the daemon.
     const pubkey = if (state == .unlocked) self.gate.pubkeyHex() else "";
     const bunker_uri: ?[]u8 = if (state == .unlocked)
@@ -253,7 +253,7 @@ fn handleInfo(self: *Server, w: *std.Io.Writer) !void {
     return respond(w, 200, json.items);
 }
 
-/// POST /setup — first-run key creation. Body: `{"passphrase":..,"secret":..?}`.
+/// POST /setup, first-run key creation. Body: `{"passphrase":..,"secret":..?}`.
 /// A non-empty `secret` (an `nsec1…` or 64-char hex) imports an existing key;
 /// absent/empty generates a fresh one. The key is created and encrypted in the
 /// daemon; only the derived public key is returned.
@@ -272,7 +272,7 @@ fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !
     return respondPubkey(self, w);
 }
 
-/// POST /unlock — decrypt an existing key file. Body: `{"passphrase":".."}`.
+/// POST /unlock, decrypt an existing key file. Body: `{"passphrase":".."}`.
 fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
     const Body = struct { passphrase: []const u8 = "" };
     const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
@@ -381,7 +381,7 @@ test "GET /info reports the bunker URI once unlocked" {
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
-    // BIP-340 test vector — the same key/pubkey the main.zig bunker-token test uses.
+    // BIP-340 test vector, the same key/pubkey the main.zig bunker-token test uses.
     const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
     const kp = try signer.keyPairFromSecretKey(secret);
 
