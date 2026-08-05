@@ -1,7 +1,8 @@
 # Notary, the GUI
 
-**Notary**: a native desktop app that approves or denies Nostr
-signing requests from your [signer daemon](../daemon).
+**Notary**: a native desktop app that approves or denies Nostr signing requests
+from your [signer daemon](../daemon). Zig throughout, drawn by the toolkit
+itself, with no Electron and no WebView anywhere.
 
 > **Status: early / work in progress.** This is the interactive front end for
 > the headless signer daemon. It walks you through first-run key setup (create
