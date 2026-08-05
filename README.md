@@ -14,12 +14,19 @@ Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 > relays, including those that require NIP-42 authentication. Downloads are
 > ad-hoc signed (not notarized). See [Install](#install).
 
-![Notary: first-run key setup, then approving a live signing request](gui/assets/demo.gif)
+## The whole app
 
-<sub>First-run key setup, then the serving screen: the `bunker://` connection URL
-to copy into a client, live per-relay status, and approving a real NIP-46 signing
-request. The key is generated and held by the signer daemon. It never enters the
-GUI.</sub>
+Four screens, which is all of it.
+
+| | |
+| --- | --- |
+| ![Set up your signer: create a new key or import one you already have](docs/shots/setup.jpg) | ![Unlock your signer with your passphrase](docs/shots/unlock.jpg) |
+| **Set up.** Create a key or bring one you have. The key is generated and stored by the signer daemon; the app only ever sends the passphrase. | **Unlock.** The key is encrypted at rest. Nothing serves until you unlock it. |
+| ![Serving: the bunker URL to copy, and live per-relay status](docs/shots/serving.jpg) | ![A signing request naming itself, waiting for approve or deny](docs/shots/request.jpg) |
+| **Serve.** Copy the `bunker://` URL into any Nostr client. Each relay reports its own connection state, so you can see where you are reachable. | **Approve.** Every request names itself and waits. Nothing is signed while you are not looking. |
+
+<sub>Real windows, photographed from the running app against a backdrop. Every
+pixel inside the window is the app's own.</sub>
 
 ## Install
 
