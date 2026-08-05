@@ -12,7 +12,7 @@ itself, with no Electron and no WebView anywhere.
 > `.app`, shipped as ad-hoc-signed macOS releases (not notarized, see the
 > top-level [Install](../README.md#install)).
 
-The four screens are in the [top-level README](../README.md#the-whole-app).
+The screens are in the [top-level README](../README.md#what-it-does).
 
 <sub>First-run key setup, then the serving screen, the `bunker://` connection URL
 to copy into a client, live per-relay status, and approving a real NIP-46 signing
