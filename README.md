@@ -14,19 +14,18 @@ Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 > relays, including those that require NIP-42 authentication. Downloads are
 > ad-hoc signed (not notarized). See [Install](#install).
 
-## The whole app
+![Notary: a native home for your key. Zig and Metal, no Electron. Your key stays in the signer.](docs/shots/hero.jpg)
 
-Four screens, which is all of it.
+## What it does
 
-| | |
-| --- | --- |
-| ![Set up your signer: create a new key or import one you already have](docs/shots/setup.jpg) | ![Unlock your signer with your passphrase](docs/shots/unlock.jpg) |
-| **Set up.** Create a key or bring one you have. The key is generated and stored by the signer daemon; the app only ever sends the passphrase. | **Unlock.** The key is encrypted at rest. Nothing serves until you unlock it. |
-| ![Serving: the bunker URL to copy, and live per-relay status](docs/shots/serving.jpg) | ![A signing request naming itself, waiting for approve or deny](docs/shots/request.jpg) |
-| **Serve.** Copy the `bunker://` URL into any Nostr client. Each relay reports its own connection state, so you can see where you are reachable. | **Approve.** Every request names itself and waits. Nothing is signed while you are not looking. |
+| | | |
+| --- | --- | --- |
+| ![The key never arrives: it is created and held by the signer, and this window only forwards your passphrase](docs/shots/panel-setup.jpg) | ![One URL, any client: paste the bunker link into any Nostr app and you are connected](docs/shots/panel-serving.jpg) | ![Nothing signs quietly: every request names itself, and waits, before anything is signed](docs/shots/panel-request.jpg) |
 
-<sub>Real windows, photographed from the running app against a backdrop. Every
-pixel inside the window is the app's own.</sub>
+<sub>Real windows, photographed from the running app. Every pixel inside the
+window is the app's own, so nothing here shows a screen the app cannot draw. The
+signer pubkey and `bunker://` URL come from a stub daemon; no real key appears in
+any of them.</sub>
 
 ## Install
 
