@@ -5,6 +5,13 @@ All notable changes to **Notary** are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 While pre-1.0, minor versions add capability and patch versions are fixes.
 
+## [Unreleased]
+
+### Fixed
+- The first-run setup screen no longer truncates its explanation. "Create a new
+  key, or import one you already have…" was cut off mid-sentence at the window's
+  width; it now wraps and reads in full.
+
 ## [0.2.0] - 2026-07-13
 
 ### Added
