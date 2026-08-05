@@ -1,9 +1,12 @@
 # Notary
 
-**A native remote signer for [Nostr](https://nostr.com).** Notary keeps your
-Nostr secret key on a machine you control and signs for your apps over
-[NIP-46](https://github.com/nostr-protocol/nips/blob/master/46.md): the key
-never leaves the signer, and every request waits for your explicit approval.
+**A native remote signer for [Nostr](https://nostr.com).** Not a web app in a
+window: Zig throughout, drawn by the toolkit itself, with no Electron and no
+WebView anywhere. Notary keeps your secret key on a machine you control and
+signs for your apps over
+[NIP-46](https://github.com/nostr-protocol/nips/blob/master/46.md). The key
+never leaves the signer, and nothing gets signed quietly: you see what a client
+is asking for before it happens.
 
 Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 
