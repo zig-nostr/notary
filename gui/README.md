@@ -14,6 +14,8 @@ itself, with no Electron and no WebView anywhere.
 
 ![Notary: first-run key setup, then approving a live signing request](assets/demo.gif)
 
+The four screens, larger, are in the [top-level README](../README.md#the-whole-app).
+
 <sub>First-run key setup, then the serving screen, the `bunker://` connection URL
 to copy into a client, live per-relay status, and approving a real NIP-46 signing
 request. The key is generated and held by the signer daemon. It never enters this
