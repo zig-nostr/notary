@@ -14,13 +14,6 @@ Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 > relays, including those that require NIP-42 authentication. Downloads are
 > ad-hoc signed (not notarized). See [Install](#install).
 
-![Notary: first-run key setup, then approving a live signing request](gui/assets/demo.gif)
-
-<sub>First-run key setup, then the serving screen: the `bunker://` connection URL
-to copy into a client, live per-relay status, and approving a real NIP-46 signing
-request. The key is generated and held by the signer daemon. It never enters the
-GUI.</sub>
-
 ## The whole app
 
 Four screens, which is all of it.
