@@ -144,6 +144,14 @@ scripts/package-macos.sh --signing identity \
 - [x] First-run key onboarding in-app (create / import / unlock)
 - [x] Ad-hoc signed macOS releases + one-line installer (CI on tag; clears quarantine on install)
 
+What comes next is set by what clients ask a signer for:
+
+- [ ] Private-message approvals: one NIP-17 message is several requests
+      (`nip44_encrypt`, then a `sign_event` for the NIP-59 `kind:13` seal), and a
+      prompt for each one is unusable. They have to read as a single decision.
+- [ ] `nostrconnect://` connections, so a client can offer a link and this app
+      connects to it, instead of you copying a `bunker://` URL the other way.
+
 ## License
 
 MIT © Sepehr Safari

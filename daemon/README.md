@@ -7,14 +7,15 @@ remote signer ("bunker") for Nostr, built on the
 It keeps your `nsec` on a machine you control and signs on behalf of web and
 native clients over a relay, the secret key never reaches the client.
 
-> **Status: early / work in progress.** This is Showcase 1 of the zig-nostr
-> roadmap. The current build loads an encrypted (NIP-49) key from disk, connects
-> to your relays, and answers NIP-46 requests, `get_public_key`, `sign_event`,
-> `ping`, and NIP-44 encrypt/decrypt, behind the connection secret and an
-> optional method/event-kind allowlist. It can also run in **GUI mode**: it
-> holds each request for interactive approval over a loopback API, and can
-> create or unlock the key on first run from that same API, the key never
-> leaves the daemon. The native approval app itself is landing next.
+> **Status: early / work in progress.** The current build loads an encrypted
+> (NIP-49) key from disk, connects to your relays, and answers NIP-46 requests,
+> `get_public_key`, `sign_event`, `ping`, and NIP-44 encrypt/decrypt, behind the
+> connection secret and an optional method/event-kind allowlist. It works
+> against relays that require NIP-42 authentication. It can also run in **GUI
+> mode**: it holds each request for interactive approval over a loopback API,
+> and can create or unlock the key on first run from that same API, the key
+> never leaves the daemon. The native approval app ships with it: one download
+> brings up both.
 
 ## Build
 
@@ -112,12 +113,17 @@ applies first, so disallowed requests are rejected without ever prompting.
 ## Roadmap
 
 - [x] `bunker://` connection token from a key + relays
-- [x] Relay listen/sign loop (answer NIP-46 requests over a relay)
-- [x] Encrypted key storage at rest (NIP-49 `ncryptsec`)
+- [x] Relay listen/sign loop (NIP-46 `kind:24133` requests over a relay)
+- [x] NIP-44 v2 encryption on every request and response (no NIP-04)
+- [x] Encrypted key storage at rest (NIP-49 `ncryptsec`, scrypt + XChaCha20-Poly1305)
 - [x] Per-request approval policy (method + event-kind allowlists)
 - [x] Loopback approval API for interactive GUI approval
 - [x] First-run key onboarding over the approval API (generate / import / unlock)
-- [ ] Native macOS approval app + downloadable build
+- [x] NIP-42 relay auth, so relays that require it still deliver requests
+- [x] Native macOS approval app + downloadable build (one-line installer)
+- [ ] Private messages: `nip44_encrypt`, a `sign_event` for the NIP-59 `kind:13`
+      seal around each NIP-17 `kind:14` message, and `nip44_decrypt` to read one
+- [ ] `nostrconnect://` client-initiated connections (NIP-46)
 
 ## License
 
