@@ -7,7 +7,20 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Changed
+- The app is called **Notary**. It was Signet, which already meant a Bitcoin test
+  network, and a signer that shares a name with a testnet is a signer people
+  misread. Every surface says Notary now.
+- A copy pass over everything a reader sees: the setup screen, the serving
+  screen, the approval prompts and both READMEs.
+
 ### Fixed
+- **The installer works again.** It looks for `Notary.app`, and the newest release
+  still carried `Signet.app` from before the rename, so every install failed with
+  "the download did not contain Notary.app". Nothing was wrong with the script:
+  there had been no release since the app was renamed.
 - The first-run setup screen no longer truncates its explanation. "Create a new
   key, or import one you already have…" was cut off mid-sentence at the window's
   width; it now wraps and reads in full.
