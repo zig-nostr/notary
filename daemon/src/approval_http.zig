@@ -58,7 +58,70 @@ pub const Server = struct {
     port: u16,
 
     active: std.atomic.Value(u32) = .init(0),
+    in_flight: [max_conns]InFlight = [_]InFlight{.{}} ** max_conns,
+    in_flight_lock: std.atomic.Value(bool) = .init(false),
+
     const max_conns = 8;
+
+    /// A connection currently held by a handler thread, so it can be cut off
+    /// if it stops making progress.
+    const InFlight = struct {
+        used: bool = false,
+        stream: net.Stream = undefined,
+        started_ms: i64 = 0,
+    };
+
+    /// How long one connection may hold a handler thread.
+    ///
+    /// Generous next to what the GUI does, which is one request and one
+    /// response with a long poll bounded at a second. It is a floor under the
+    /// worst case, not a budget anything normally touches.
+    const conn_deadline_ms = 15_000;
+
+    fn lockInFlight(self: *Server) void {
+        while (self.in_flight_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+            std.Thread.yield() catch {};
+        }
+    }
+    fn unlockInFlight(self: *Server) void {
+        self.in_flight_lock.store(false, .release);
+    }
+
+    fn track(self: *Server, stream: net.Stream, now_ms: i64) ?usize {
+        self.lockInFlight();
+        defer self.unlockInFlight();
+        for (&self.in_flight, 0..) |*e, i| {
+            if (!e.used) {
+                e.* = .{ .used = true, .stream = stream, .started_ms = now_ms };
+                return i;
+            }
+        }
+        return null;
+    }
+
+    /// Releases slot `i`. Held under the lock and BEFORE the handler closes the
+    /// socket, so the reaper can never act on a descriptor that has been closed
+    /// and handed to something else.
+    fn untrack(self: *Server, i: usize) void {
+        self.lockInFlight();
+        defer self.unlockInFlight();
+        self.in_flight[i].used = false;
+    }
+
+    /// Cuts off every connection that has held a thread past the deadline.
+    ///
+    /// `shutdown` rather than `close`: the handler still owns the descriptor
+    /// and will close it on its way out. Shutting the read side down makes its
+    /// blocked read return, which is the whole point.
+    fn reapStale(self: *Server, io: std.Io, now_ms: i64) void {
+        self.lockInFlight();
+        defer self.unlockInFlight();
+        for (&self.in_flight) |*e| {
+            if (!e.used) continue;
+            if (now_ms - e.started_ms < conn_deadline_ms) continue;
+            e.stream.shutdown(io, .both) catch {};
+        }
+    }
 
     /// Binds loopback and serves forever on the calling thread.
     ///
@@ -76,6 +139,26 @@ pub const Server = struct {
     pub fn run(self: *Server, io: std.Io) !void {
         const addr = try net.IpAddress.parseIp4(self.host, self.port);
         var server = try addr.listen(io, .{});
+        // Watches the connections the handlers hold and cuts off any that stops
+        // making progress. There are only eight handler threads, and a peer
+        // that opened a socket and wrote half a request line held one forever:
+        // the read loop returns on EOF or a full head and nothing else. Eight
+        // such sockets took the whole server, and holding one costs no
+        // credential, because the bearer token is checked only after the
+        // request head has been read.
+        //
+        // What that bought an attacker was not a broken API but a signer that
+        // stops signing: the GUI cannot reach the queue, every request waiting
+        // on a human is denied when the broker times out, and a daemon that
+        // came up locked can never be unlocked.
+        //
+        // A watchdog rather than a socket timeout, and that is not a
+        // preference. SO_RCVTIMEO makes `recv` return EAGAIN, which this io
+        // model treats as a programmer bug and panics on, so the "fix" would
+        // have turned a stall into a remote crash. Measured, not guessed.
+        const reaper = std.Thread.spawn(.{}, runReaper, .{self}) catch
+            return error.CouldNotStartConnectionReaper;
+        reaper.detach();
         while (true) {
             const stream = server.accept(io) catch continue;
             if (self.active.load(.monotonic) >= max_conns) {
@@ -93,13 +176,31 @@ pub const Server = struct {
     }
 };
 
+/// Wakes once a second and cuts off connections that have stopped progressing.
+fn runReaper(self: *Server) void {
+    var threaded = std.Io.Threaded.init(self.gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    while (true) {
+        io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
+        self.reapStale(io, std.Io.Timestamp.now(io, .awake).toMilliseconds());
+    }
+}
+
 /// One connection on its own thread with its own io (for the long-poll sleep).
 fn handle(self: *Server, stream: net.Stream) void {
     defer _ = self.active.fetchSub(1, .monotonic);
     var threaded = std.Io.Threaded.init(self.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    // Registered before any read and released before the close, so the reaper
+    // only ever shuts down a descriptor this thread still owns. Defers unwind
+    // in reverse, so the untrack is declared SECOND to run FIRST: closing the
+    // socket while it is still tracked would let the reaper shut down a
+    // descriptor number the kernel had already handed to somebody else.
+    const slot = self.track(stream, std.Io.Timestamp.now(io, .awake).toMilliseconds());
     defer stream.close(io);
+    defer if (slot) |i| self.untrack(i);
     handleConn(self, io, stream) catch {};
 }
 
