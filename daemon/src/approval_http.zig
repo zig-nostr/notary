@@ -61,9 +61,21 @@ pub const Server = struct {
     const max_conns = 8;
 
     /// Binds loopback and serves forever on the calling thread.
+    ///
+    /// The bind is EXCLUSIVE, deliberately. `reuse_address` reads like the
+    /// ordinary "let me restart without waiting out TIME_WAIT" flag, and on
+    /// POSIX it also sets SO_REUSEPORT: a second process may then bind the same
+    /// address, and on this platform the newer socket takes the new
+    /// connections. Any process running as this user could therefore quietly
+    /// become the approval API without disturbing this one, and the GUI, which
+    /// has no way to tell one from the other, would hand it the unlock
+    /// passphrase or an imported nsec. That is measured behaviour, not theory.
+    ///
+    /// Without the flag a duplicate bind fails, this listener refuses to start,
+    /// and the daemon exits instead of leaving a hole open.
     pub fn run(self: *Server, io: std.Io) !void {
         const addr = try net.IpAddress.parseIp4(self.host, self.port);
-        var server = try addr.listen(io, .{ .reuse_address = true });
+        var server = try addr.listen(io, .{});
         while (true) {
             const stream = server.accept(io) catch continue;
             if (self.active.load(.monotonic) >= max_conns) {

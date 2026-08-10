@@ -512,12 +512,25 @@ fn makeAndWriteToken(gpa: std.mem.Allocator, path: []const u8) []u8 {
 }
 
 /// Runs the approval HTTP server on its own thread with its own io.
+///
+/// A listener that cannot come up KILLS the daemon. It used to print and let
+/// the thread die, and the consequence was not a missing feature: the daemon
+/// went on running with no listener, blocked forever waiting to be unlocked,
+/// while whatever was already holding that port answered the GUI instead. The
+/// GUI has no way to tell the difference, so it would read the token file, find
+/// something answering, and post the unlock passphrase, or an imported nsec,
+/// straight to it. Dying loudly is what turns that into a startup failure the
+/// GUI's supervision already knows how to show.
 fn runApprovalServer(server: *approval_http.Server) void {
     var threaded = std.Io.Threaded.init(server.gpa, .{});
     defer threaded.deinit();
     server.run(threaded.io()) catch |err| {
         std.debug.print("signer: approval server stopped: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
     };
+    // `run` loops forever, so reaching here at all means the listener is gone.
+    std.debug.print("signer: approval server exited\n", .{});
+    std.process.exit(1);
 }
 
 fn getEnv(name: [*:0]const u8) ?[]const u8 {
