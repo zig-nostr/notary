@@ -328,10 +328,20 @@ fn serveRelayForever(
 
     var bunker = nip46.Bunker.initSingleKey(signer, kp, request_policy);
     bunker.secret = conn_secret;
+    // The bunker now remembers which clients have connected, and refuses to
+    // sign for one it has not heard of. It lives out here, outside the dial
+    // loop, so a dropped socket does not make every client connect again.
+    //
+    // One consequence worth naming: this bunker belongs to THIS relay thread,
+    // which is how the rest of the state here works, so a client is authorized
+    // per relay. A client that connects over one relay in the token and then
+    // asks over another gets "not connected" and has to connect again. Clients
+    // hold one connection at a time, so that is a reconnect and not a wall, but
+    // a set shared across the threads would be better and is worth doing.
 
     while (true) {
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connecting), .monotonic);
-        serveOnce(gpa, io, url, bunker, kp, status) catch |err| {
+        serveOnce(gpa, io, url, &bunker, kp, status) catch |err| {
             std.debug.print("signer: [{s}] {s}\n", .{ url, @errorName(err) });
         };
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
@@ -345,7 +355,7 @@ fn serveOnce(
     gpa: std.mem.Allocator,
     io: std.Io,
     url: []const u8,
-    bunker: nip46.Bunker,
+    bunker: *nip46.Bunker,
     remote: keys.KeyPair,
     status: ?*std.atomic.Value(u8),
 ) !void {
