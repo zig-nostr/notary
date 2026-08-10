@@ -83,6 +83,10 @@
           <card padding="12">
             <column gap="10">
               <text>{r.label}</text>
+              <text foreground="text_muted">{r.asker}</text>
+              <if test="{r.has_preview}">
+                <text wrap="true">{r.preview}</text>
+              </if>
               <row gap="8">
                 <button variant="primary" grow="1" on-press="approve:{r.id}">Approve</button>
                 <button variant="destructive" grow="1" on-press="reject:{r.id}">Deny</button>
