@@ -198,12 +198,46 @@ fn handlePending(self: *Server, io: std.Io, w: *std.Io.Writer, path: []const u8)
     try json.appendSlice(self.gpa, head);
     for (pending[0..n], 0..) |p, i| {
         if (i != 0) try json.append(self.gpa, ',');
-        const item = try std.fmt.allocPrint(self.gpa, "{{\"id\":{d},\"method\":\"{s}\",\"kind\":{d},\"created_at\":{d}}}", .{ p.id, p.method(), p.kind, p.created_at });
+        // `method` and `client` are safe to interpolate: a request only reaches
+        // the policy once its method has parsed as one of seven fixed names,
+        // and the client is hex. `preview` is the requester's own text and is
+        // escaped, or a quote in a note would end the string and the rest of it
+        // would be read as fields of this object.
+        const item = try std.fmt.allocPrint(
+            self.gpa,
+            "{{\"id\":{d},\"method\":\"{s}\",\"kind\":{d},\"created_at\":{d},\"client\":\"{s}\",\"preview\":",
+            .{ p.id, p.method(), p.kind, p.created_at, p.client() },
+        );
         defer self.gpa.free(item);
         try json.appendSlice(self.gpa, item);
+        try appendJsonString(&json, self.gpa, p.preview());
+        try json.append(self.gpa, '}');
     }
     try json.appendSlice(self.gpa, "]}");
     return respond(w, 200, json.items);
+}
+
+/// Appends `s` as a JSON string literal, quotes included.
+///
+/// Everything a control character or a backslash or a quote could otherwise do
+/// to the surrounding document, it cannot do here. The one string in this API
+/// that the requester writes goes through this.
+fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const u8) !void {
+    try out.append(gpa, '"');
+    for (s) |c| switch (c) {
+        '"' => try out.appendSlice(gpa, "\\\""),
+        '\\' => try out.appendSlice(gpa, "\\\\"),
+        '\n' => try out.appendSlice(gpa, "\\n"),
+        '\r' => try out.appendSlice(gpa, "\\r"),
+        '\t' => try out.appendSlice(gpa, "\\t"),
+        0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+            var esc: [6]u8 = undefined;
+            _ = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+            try out.appendSlice(gpa, &esc);
+        },
+        else => try out.append(gpa, c),
+    };
+    try out.append(gpa, '"');
 }
 
 fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
@@ -367,6 +401,37 @@ fn eql(a: []const u8, b: []const u8) bool {
 // --- Tests ---------------------------------------------------------------
 
 const testing = std.testing;
+
+test "a note cannot write JSON into the approval listing" {
+    // The preview is the requester's own text, and the requester is whoever got
+    // past the connect secret. If it went in raw, a quote would end the string
+    // and everything after it would be read as fields of this object: an
+    // attacker could give their own request a different method, a different
+    // kind, or somebody else's pubkey, on the very screen a human is using to
+    // decide whether to sign it.
+    const gpa = std.testing.allocator;
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+
+    try appendJsonString(&out, gpa, "\",\"kind\":1,\"client\":\"ffff");
+    try std.testing.expectEqualStrings(
+        "\"\\\",\\\"kind\\\":1,\\\"client\\\":\\\"ffff\"",
+        out.items,
+    );
+
+    // It has to survive a round trip as one string, not merely look escaped.
+    const parsed = try std.json.parseFromSlice([]const u8, gpa, out.items, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("\",\"kind\":1,\"client\":\"ffff", parsed.value);
+
+    // Newlines, tabs and control bytes are all legal in event content and all
+    // illegal raw inside a JSON string.
+    out.clearRetainingCapacity();
+    try appendJsonString(&out, gpa, "line\none\ttwo\x01\\end");
+    const parsed2 = try std.json.parseFromSlice([]const u8, gpa, out.items, .{});
+    defer parsed2.deinit();
+    try std.testing.expectEqualStrings("line\none\ttwo\x01\\end", parsed2.value);
+}
 
 test "headerValue parses case-insensitively and trims" {
     try testing.expectEqualStrings("Bearer abc", headerValue("Authorization: Bearer abc", "authorization").?);

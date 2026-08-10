@@ -92,6 +92,12 @@ pub const Row = struct {
     /// Event kind for `sign_event`, else -1.
     kind: i32 = -1,
     created_at: i64 = 0,
+    /// The requesting client's pubkey, hex.
+    client_buf: [64]u8 = [_]u8{0} ** 64,
+    client_len: u8 = 0,
+    /// The start of what would be signed.
+    preview_buf: [160]u8 = [_]u8{0} ** 160,
+    preview_len: u8 = 0,
 
     pub fn method(self: *const Row) []const u8 {
         return self.method_buf[0..self.method_len];
@@ -103,6 +109,30 @@ pub const Row = struct {
         self.method_len = @intCast(n);
     }
 
+    pub fn client(self: *const Row) []const u8 {
+        return self.client_buf[0..self.client_len];
+    }
+
+    pub fn setClient(self: *Row, c: []const u8) void {
+        const n = @min(c.len, self.client_buf.len);
+        @memcpy(self.client_buf[0..n], c[0..n]);
+        self.client_len = @intCast(n);
+    }
+
+    pub fn preview(self: *const Row) []const u8 {
+        return self.preview_buf[0..self.preview_len];
+    }
+
+    pub fn has_preview(self: *const Row) bool {
+        return self.preview_len > 0;
+    }
+
+    pub fn setPreview(self: *Row, p: []const u8) void {
+        const n = @min(p.len, self.preview_buf.len);
+        @memcpy(self.preview_buf[0..n], p[0..n]);
+        self.preview_len = @intCast(n);
+    }
+
     /// One-line label for the row, e.g. "sign_event · kind 1" or
     /// "get_public_key". Formats into the build arena.
     pub fn label(self: *const Row, arena: std.mem.Allocator) []const u8 {
@@ -110,6 +140,17 @@ pub const Row = struct {
             return std.fmt.allocPrint(arena, "{s} · kind {d}", .{ self.method(), self.kind }) catch self.method();
         }
         return self.method();
+    }
+
+    /// Who is asking, short enough to read: the first and last of the pubkey.
+    ///
+    /// The whole point of putting it on the row is that a person can tell one
+    /// requester from another, and sixty-four hex characters is not something
+    /// anybody compares. Eight and eight is.
+    pub fn asker(self: *const Row, arena: std.mem.Allocator) []const u8 {
+        const c = self.client();
+        if (c.len < 20) return if (c.len == 0) "unknown client" else c;
+        return std.fmt.allocPrint(arena, "from {s}…{s}", .{ c[0..8], c[c.len - 8 ..] }) catch c;
     }
 };
 
@@ -971,6 +1012,8 @@ pub fn parsePending(model: *Model, body: []const u8) void {
             method: []const u8 = "",
             kind: i32 = -1,
             created_at: i64 = 0,
+            client: []const u8 = "",
+            preview: []const u8 = "",
         } = &.{},
     };
     const parsed = std.json.parseFromSliceLeaky(Pending, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return;
@@ -981,6 +1024,8 @@ pub fn parsePending(model: *Model, body: []const u8) void {
         if (n >= max_pending) break;
         var row = Row{ .id = p.id, .kind = p.kind, .created_at = p.created_at };
         row.setMethod(p.method);
+        row.setClient(p.client);
+        row.setPreview(p.preview);
         model.rows[n] = row;
         n += 1;
     }

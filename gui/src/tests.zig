@@ -185,6 +185,46 @@ test "the empty view shows the connection status and a zero count" {
     _ = try expectByText(tree.root, .status_bar, "0 pending");
 }
 
+test "an approval row says who is asking and what would be signed" {
+    // A row that reads "sign_event · kind 1" and nothing else asks somebody to
+    // authorize a signature without telling them whose request it is or what it
+    // says. It looks identical whether it came from their own client or from
+    // anyone else who reached the signer, and telling those apart is the only
+    // reason a human is in this loop at all.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = Model{};
+    model.phase = .connected;
+    main.parsePending(&model,
+        \\{"version":1,"pending":[{"id":7,"method":"sign_event","kind":1,"created_at":0,
+        \\"client":"ab12cd34ef56ab78cd90ef12ab34cd56ef78ab90cd12ef34ab56cd78ef90ab12",
+        \\"preview":"gm from a stranger"}]}
+    );
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    _ = try expectByText(tree.root, .text, "from ab12cd34…ef90ab12");
+    _ = try expectByText(tree.root, .text, "gm from a stranger");
+
+    // A method with nothing to preview does not draw an empty line.
+    var quiet = Model{};
+    quiet.phase = .connected;
+    main.parsePending(&quiet,
+        \\{"version":1,"pending":[{"id":8,"method":"get_public_key","kind":-1,"created_at":0,
+        \\"client":"ab12cd34ef56ab78cd90ef12ab34cd56ef78ab90cd12ef34ab56cd78ef90ab12","preview":""}]}
+    );
+    const quiet_tree = try buildTree(arena_state.allocator(), &quiet);
+    _ = try expectByText(quiet_tree.root, .text, "from ab12cd34…ef90ab12");
+    try testing.expect(!quiet.rows[0].has_preview());
+
+    // A daemon that sent no client at all must not print a misleading identity.
+    var old = Model{};
+    old.phase = .connected;
+    main.parsePending(&old, "{\"version\":1,\"pending\":[{\"id\":9,\"method\":\"sign_event\",\"kind\":1,\"created_at\":0}]}");
+    const old_tree = try buildTree(arena_state.allocator(), &old);
+    _ = try expectByText(old_tree.root, .text, "unknown client");
+}
+
 test "a populated view renders rows and dispatches typed approve/deny" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

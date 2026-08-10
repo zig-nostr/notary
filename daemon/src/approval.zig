@@ -34,11 +34,53 @@ pub const Pending = struct {
     /// Event kind for `sign_event`, else -1.
     kind: i32 = -1,
     created_at: i64 = 0,
+    /// Who is asking: the pubkey of the event that carried the request, hex.
+    ///
+    /// A row that says "sign_event, kind 1" and nothing else asks a person to
+    /// authorize a signature without telling them whose request it is. It reads
+    /// identically whether it came from their own client or from somebody who
+    /// read the connection token, and the second one is the whole reason this
+    /// queue exists.
+    client_buf: [64]u8 = [_]u8{0} ** 64,
+    client_len: u8 = 0,
+    /// What is being signed: the start of the event's content, for `sign_event`.
+    ///
+    /// The kind number says what SHAPE it is, never what it says. Approving a
+    /// kind:1 without seeing its text is approving a sentence published under
+    /// your name, sight unseen.
+    preview_buf: [160]u8 = [_]u8{0} ** 160,
+    preview_len: u8 = 0,
 
     pub fn method(self: *const Pending) []const u8 {
         return self.method_buf[0..self.method_len];
     }
+    pub fn client(self: *const Pending) []const u8 {
+        return self.client_buf[0..self.client_len];
+    }
+    pub fn preview(self: *const Pending) []const u8 {
+        return self.preview_buf[0..self.preview_len];
+    }
 };
+
+/// The `content` of a `sign_event` template, clipped to fit a `Pending`.
+///
+/// Clipped on a UTF-8 boundary, because half a character is not a character and
+/// this string goes straight into a JSON response and then onto a screen.
+fn signEventPreview(gpa: std.mem.Allocator, request: *const nip46.Request, out: *[160]u8) u8 {
+    if (request.params.len < 1) return 0;
+    const parsed = std.json.parseFromSlice(
+        struct { content: []const u8 = "" },
+        gpa,
+        request.params[0],
+        .{ .ignore_unknown_fields = true },
+    ) catch return 0;
+    defer parsed.deinit();
+    const text = std.mem.trim(u8, parsed.value.content, " \t\r\n");
+    var n = @min(text.len, out.len);
+    while (n > 0 and n < text.len and (text[n] & 0xc0) == 0x80) n -= 1;
+    @memcpy(out[0..n], text[0..n]);
+    return @intCast(n);
+}
 
 const Slot = struct {
     in_use: bool = false,
@@ -156,21 +198,26 @@ pub const Interactive = struct {
     }
 };
 
-fn decide(ctx: ?*anyopaque, request: *const nip46.Request) nip46.Decision {
+fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46.Decision {
     const self: *const Interactive = @ptrCast(@alignCast(ctx.?));
 
     // The static allowlist is the first gate: a disallowed request is denied
     // outright and never bothers the human.
-    if (self.config.policy().decide(request) == .reject) return .reject;
+    if (self.config.policy().decide(request, client) == .reject) return .reject;
 
     var info = Pending{};
     const mlen = @min(request.method.len, info.method_buf.len);
     @memcpy(info.method_buf[0..mlen], request.method[0..mlen]);
     info.method_len = @intCast(mlen);
     info.created_at = std.Io.Timestamp.now(self.io, .real).toSeconds();
+    // Who, and what. Neither was here, so the row said "sign_event, kind 1" and
+    // left the person to guess both.
+    _ = std.fmt.bufPrint(&info.client_buf, "{x}", .{client}) catch {};
+    info.client_len = 64;
     if (nip46.Method.fromString(request.method)) |method| {
         if (method == .sign_event) {
             if (nostr.nip46.signEventKind(self.gpa, request)) |k| info.kind = k;
+            info.preview_len = signEventPreview(self.gpa, request, &info.preview_buf);
         }
     }
 
@@ -237,7 +284,7 @@ test "interactive policy denies allowlist-disallowed requests without prompting"
 
     const tmpl = "{\"kind\":1,\"content\":\"x\",\"tags\":[],\"created_at\":1}";
     const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
-    try testing.expectEqual(nip46.Decision.reject, p.decide(&req));
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&req, [_]u8{0} ** 32));
     // Never enqueued: a disallowed request must not reach the GUI.
     var buf: [1]Pending = undefined;
     try testing.expectEqual(@as(usize, 0), broker.snapshot(&buf));
@@ -257,5 +304,5 @@ test "interactive policy escalates an allowed request and returns the GUI decisi
     defer t.join();
 
     const req = nip46.Request{ .id = "1", .method = "get_public_key", .params = &.{} };
-    try testing.expectEqual(nip46.Decision.reject, p.decide(&req));
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&req, [_]u8{0} ** 32));
 }
