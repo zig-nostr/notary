@@ -30,6 +30,7 @@
           <text grow="1" wrap="true">{rl.url}</text>
           <if test="{rl.connected}"><text foreground="success">connected</text></if>
           <if test="{rl.connecting}"><text foreground="text_muted">connecting…</text></if>
+          <if test="{rl.quiet}"><text foreground="warning">quiet</text></if>
           <if test="{rl.offline}"><text foreground="destructive">offline</text></if>
         </row>
       </for>
