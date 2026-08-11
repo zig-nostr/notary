@@ -31,7 +31,15 @@ const Pending = approval.Pending;
 const Gate = onboarding.Gate;
 
 /// Live connection state of one relay, reported per relay on `/info`.
-pub const RelayStatus = enum(u8) { connecting, connected, disconnected };
+/// A relay connection's live state.
+///
+/// `quiet` is the one this daemon could not express, and the reason
+/// "connected" could be a lie: the socket is open, nothing has come down it for
+/// a while, and a keepalive is out with no answer yet. Not disconnected,
+/// because nothing has failed; not plainly connected either, because the last
+/// evidence of that is a minute old. For a signer that distinction matters more
+/// than for a client, since the failure it hides is "signing silently stopped".
+pub const RelayStatus = enum(u8) { connecting, connected, disconnected, quiet };
 
 pub const Info = struct {
     relays: []const []const u8,

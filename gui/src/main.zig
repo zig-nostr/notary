@@ -161,7 +161,13 @@ pub const Row = struct {
 pub const max_relays = 8;
 
 /// Live connection state of one relay, as reported by `/info`.
-pub const RelayConn = enum { connecting, connected, disconnected };
+/// A relay's live state as the daemon reports it.
+///
+/// `quiet` means the socket is open but nothing has come down it for a while
+/// and a keepalive is out unanswered. Shown as its own thing because the
+/// alternative is a green dot over a connection that may already be dead, and
+/// for a signer the failure that hides is "signing stopped working".
+pub const RelayConn = enum { connecting, connected, disconnected, quiet };
 
 /// One configured relay and its live status, listed on the serving screen.
 pub const RelayRow = struct {
@@ -178,12 +184,16 @@ pub const RelayRow = struct {
             .connecting => "connecting…",
             .connected => "connected",
             .disconnected => "offline",
+            .quiet => "quiet",
         };
     }
     // Status predicates, the view picks a literally-colored status word off
     // these (`foreground` takes only a literal token, so the color can't bind).
     pub fn connected(self: *const RelayRow) bool {
         return self.conn == .connected;
+    }
+    pub fn quiet(self: *const RelayRow) bool {
+        return self.conn == .quiet;
     }
     pub fn connecting(self: *const RelayRow) bool {
         return self.conn == .connecting;
@@ -499,6 +509,8 @@ pub const Model = struct {
                 .connected
             else if (std.mem.eql(u8, r.status, "disconnected"))
                 .disconnected
+            else if (std.mem.eql(u8, r.status, "quiet"))
+                .quiet
             else
                 .connecting;
             self.relays[n] = row;

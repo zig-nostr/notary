@@ -19,6 +19,7 @@ const PolicyConfig = nostr.nip46.PolicyConfig;
 const approval = @import("approval.zig");
 const approval_http = @import("approval_http.zig");
 const onboarding = @import("onboarding.zig");
+const relay_keeper = @import("relay_keeper.zig");
 
 const keys = nostr.keys;
 const nip46 = nostr.nip46;
@@ -226,10 +227,34 @@ fn runRelays(
     gpa.free(token);
     gpa.free(pk_hex);
 
+    // One table for every relay connection, and one thread watching them all.
+    // It has to be a separate thread and not work folded into the relay
+    // threads: each of those is blocked inside `receive` exactly when there is
+    // something to notice, and a thread waiting on a dead peer is the last
+    // thing that can tell it has stopped answering.
+    var keeper_table = relay_keeper.Table.init(gpa, relays.len) catch
+        fail("out of memory tracking relay connections");
+    keeper_table.status = relay_status;
+    const keeper: ?*relay_keeper.Table = &keeper_table;
+    if (std.Thread.spawn(.{}, relay_keeper.run, .{
+        gpa,
+        keeper.?,
+        @intFromEnum(approval_http.RelayStatus.quiet),
+        @intFromEnum(approval_http.RelayStatus.disconnected),
+    })) |k| {
+        k.detach();
+    } else |err| {
+        // Not fatal: without it the daemon behaves as it did before, which is
+        // to say a half-open socket sits there. Said out loud rather than
+        // swallowed, because "signing quietly stopped working" is the symptom
+        // and it looks nothing like its cause.
+        std.debug.print("signer: relay keepalive did not start ({s}); a dropped connection will not be noticed\n", .{@errorName(err)});
+    }
+
     var threads: std.ArrayList(std.Thread) = .empty;
     for (relays, 0..) |url, i| {
         const slot: ?*std.atomic.Value(u8) = if (relay_status) |rs| &rs[i] else null;
-        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot }) catch |err| {
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot, keeper, i }) catch |err| {
             std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
             if (slot) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
             continue;
@@ -302,6 +327,8 @@ fn serveRelayForever(
     policy_config: *const PolicyConfig,
     broker: ?*approval.Broker,
     status: ?*std.atomic.Value(u8),
+    keeper: ?*relay_keeper.Table,
+    slot: usize,
 ) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -341,7 +368,7 @@ fn serveRelayForever(
 
     while (true) {
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connecting), .monotonic);
-        serveOnce(gpa, io, url, &bunker, kp, status) catch |err| {
+        serveOnce(gpa, io, url, &bunker, kp, status, keeper, slot) catch |err| {
             std.debug.print("signer: [{s}] {s}\n", .{ url, @errorName(err) });
         };
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
@@ -358,9 +385,16 @@ fn serveOnce(
     bunker: *nip46.Bunker,
     remote: keys.KeyPair,
     status: ?*std.atomic.Value(u8),
+    keeper: ?*relay_keeper.Table,
+    slot: usize,
 ) !void {
     var relay = try nostr.relay.dial(gpa, io, url);
+    // Withdrawn BEFORE the connection is freed. Defers unwind in reverse, so
+    // this one is declared second and runs first; the other order hands the
+    // keeper a pointer to a `Relay` that is already gone.
     defer relay.deinit();
+    if (keeper) |k| k.offer(slot, relay);
+    defer if (keeper) |k| k.offer(slot, null);
     if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connected), .monotonic);
     std.debug.print("signer: [{s}] connected; listening for NIP-46 requests\n", .{url});
     try nostr.signer.serve(gpa, io, relay, bunker, remote, url);
@@ -561,10 +595,16 @@ fn failFmt(comptime fmt: []const u8, args: anytype) noreturn {
 }
 
 test {
+    // Every source file with tests has to be named here. A file that is
+    // imported by the code but not listed here compiles into the test binary
+    // and its tests are never run: adding relay_keeper.zig left the count at
+    // 19 and looked exactly like eight passing tests.
+    //
     // The serve loop, keystore, and policy tests now run in the nostr library.
     _ = @import("approval.zig");
     _ = @import("approval_http.zig");
     _ = @import("onboarding.zig");
+    _ = @import("relay_keeper.zig");
 }
 
 test "derives the pubkey and builds a bunker token" {
