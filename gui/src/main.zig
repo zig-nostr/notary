@@ -62,6 +62,10 @@ const default_token_file = ".zig-nostr-signer.token";
 // long-lived daemon spawn holds one slot for the process's lifetime. Timer
 // keys are their own namespace. Decisions use a small pool so several can be
 // in flight at once (a fast double-approve never collides on one key).
+/// The one daemon stdout line the GUI parses. Must match
+/// `approval_http.port_line_prefix` in the daemon.
+const daemon_port_prefix = "notary-approval-port";
+
 const daemon_key: u64 = 1;
 const token_key: u64 = 2;
 const info_key: u64 = 3;
@@ -267,6 +271,18 @@ pub const Model = struct {
     secret_buf: canvas.TextBuffer(200) = .{},
     /// false: generate a fresh key; true: import an existing `nsec1…`/hex.
     import_mode: bool = false,
+    /// Managed mode: whether the daemon has told us which port it bound.
+    ///
+    /// It binds port 0 and reports what the kernel gave it, because a fixed
+    /// port can be taken before the daemon starts. Anything that got there
+    /// first would receive the unlock passphrase, or an imported nsec, from a
+    /// GUI with no way to tell the difference. A port nobody has chosen yet
+    /// cannot be squatted.
+    ///
+    /// Until this is true there is nothing to talk to, so no poll is sent.
+    /// Attached mode sets it at boot: the address came from the environment and
+    /// is the operator's business.
+    port_known: bool = false,
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -280,13 +296,6 @@ pub const Model = struct {
     }
     pub fn baseUrl(self: *const Model) []const u8 {
         return self.base_url_buf[0..self.base_url_len];
-    }
-    /// The bare `host:port` we poll, passed to the spawned daemon as
-    /// `--approval-http` so it serves the API there (a Finder-launched `.app`
-    /// carries no `SIGNER_APPROVAL_HTTP` env for the child to inherit).
-    pub fn approvalAddress(self: *const Model) []const u8 {
-        const url = self.baseUrl();
-        return if (std.mem.startsWith(u8, url, "http://")) url["http://".len..] else url;
     }
     pub fn setTokenPath(self: *Model, path: []const u8) void {
         const n = @min(path.len, self.token_path_buf.len);
@@ -596,11 +605,17 @@ pub const app_markup = @embedFile("app.native");
 const NotaryApp = native_sdk.UiApp(Model, Msg);
 const Effects = NotaryApp.Effects;
 
+/// What we ask the daemon to bind in managed mode: loopback, port chosen by the
+/// kernel. See `Model.port_known` for why.
+const managed_bind_address = "127.0.0.1:0";
+
 fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.phase = .starting;
+    // A restarted daemon gets a different port, so anything we knew is stale.
+    model.port_known = false;
     fx.spawn(.{
         .key = daemon_key,
-        .argv = &.{ model.daemonBin(), "--approval-http", model.approvalAddress() },
+        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address },
         .on_line = Effects.lineMsg(.daemon_line),
         .on_exit = Effects.exitMsg(.daemon_exited),
     });
@@ -610,6 +625,10 @@ fn spawnDaemon(model: *Model, fx: *Effects) void {
 /// every attempt means a freshly (re)started daemon's new token is always
 /// picked up, healing both the initial startup race and a restart.
 fn attemptConnect(model: *Model, fx: *Effects) void {
+    // Nothing to connect to until the daemon says where it landed. Staying in
+    // `.starting` is the honest state, and it is what the retry tick already
+    // knows how to leave.
+    if (!model.port_known) return;
     if (model.tokenPath().len == 0) {
         // No token file configured at all: nothing to authenticate with.
         model.phase = .unauthorized;
@@ -778,7 +797,22 @@ pub fn boot(model: *Model, fx: *Effects) void {
 
 pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     switch (msg) {
-        .daemon_line => {}, // daemon stdout; the connection state is the signal we surface
+        .daemon_line => |line| {
+            // One line out of the daemon's stdout matters: the port it bound.
+            // Everything else it prints is for a human reading a terminal.
+            const text = std.mem.trim(u8, line.line, " \t\r\n");
+            if (!std.mem.startsWith(u8, text, daemon_port_prefix)) return;
+            const rest = std.mem.trim(u8, text[daemon_port_prefix.len..], " \t");
+            const port = std.fmt.parseInt(u16, rest, 10) catch return;
+            if (port == 0) return;
+            var buf: [32]u8 = undefined;
+            const host_port = std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{port}) catch return;
+            model.setBaseUrl(host_port);
+            model.port_known = true;
+            // The daemon is listening by the time it prints this, so there is
+            // no reason to wait for the retry tick.
+            attemptConnect(model, fx);
+        },
 
         .daemon_exited => |exit| {
             // A cancel we initiated (restart / app quit) reports `.cancelled`.
@@ -1082,6 +1116,9 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
         model.setDaemonBin(bin);
         model.managed = true;
     }
+    // Attached mode talks to whatever the operator pointed us at, so the
+    // address above is already the answer. Managed mode waits to be told.
+    model.port_known = !model.managed;
 
     if (environ.get("SIGNER_APPROVAL_TOKEN_FILE")) |path| {
         model.setTokenPath(path);

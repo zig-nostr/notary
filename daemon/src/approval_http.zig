@@ -58,6 +58,9 @@ pub const Server = struct {
     port: u16,
 
     active: std.atomic.Value(u32) = .init(0),
+    /// Filled once the listener is up. With `port` 0 this is the only place the
+    /// real port exists.
+    bound_port: std.atomic.Value(u16) = .init(0),
     in_flight: [max_conns]InFlight = [_]InFlight{.{}} ** max_conns,
     in_flight_lock: std.atomic.Value(bool) = .init(false),
 
@@ -159,6 +162,22 @@ pub const Server = struct {
         const reaper = std.Thread.spawn(.{}, runReaper, .{self}) catch
             return error.CouldNotStartConnectionReaper;
         reaper.detach();
+
+        // Say which port we got. Asking for port 0 is how the GUI stops
+        // anything else from being there first: a port nobody has chosen yet
+        // cannot be squatted, and this line is the only way the GUI can learn
+        // which one it turned out to be.
+        //
+        // STDOUT, and that matters. The SDK's line-mode spawn ignores the
+        // child's stderr outright (`.stderr = ... else .ignore`), so the
+        // ordinary `std.debug.print` banner below would be dropped on the
+        // floor and the GUI would wait forever for a port it was never told.
+        self.bound_port.store(boundPort(server), .release);
+        var out_buf: [64]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(io, &out_buf);
+        stdout.interface.print("{s} {d}\n", .{ port_line_prefix, self.bound_port.load(.acquire) }) catch {};
+        stdout.interface.flush() catch {};
+
         while (true) {
             const stream = server.accept(io) catch continue;
             if (self.active.load(.monotonic) >= max_conns) {
@@ -175,6 +194,21 @@ pub const Server = struct {
         }
     }
 };
+
+/// The one line the GUI parses out of the daemon's stdout. Anything else the
+/// daemon prints is for a human reading a terminal.
+pub const port_line_prefix = "notary-approval-port";
+
+/// The port the listener actually bound, which is the entire point of asking
+/// for zero. `net.Server` carries no bound address (checked), so this asks the
+/// kernel. A pure query with no io involvement, unlike the socket-timeout
+/// route, which panicked this io model.
+fn boundPort(server: net.Server) u16 {
+    var sa: std.c.sockaddr.in = undefined;
+    var len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getsockname(server.socket.handle, @ptrCast(&sa), &len) != 0) return 0;
+    return std.mem.bigToNative(u16, sa.port);
+}
 
 /// Wakes once a second and cuts off connections that have stopped progressing.
 fn runReaper(self: *Server) void {
