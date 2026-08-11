@@ -198,12 +198,39 @@ pub const Interactive = struct {
     }
 };
 
+/// Whether answering `method` needs the secret key, and so needs a human.
+///
+/// Everything else is bookkeeping: `connect` and `logout` move a client in and
+/// out of the authorized set, `ping` is liveness, and `get_public_key` returns a
+/// value that is already printed in the `bunker://` token the user hands out.
+///
+/// Sending those to the queue was not merely noisy, it was a way to switch the
+/// signer off. `submit` parks the calling thread for the full two-minute
+/// timeout, and that caller is the relay serve loop, so one request nobody
+/// answers stops the signer answering anything. `ping` and `get_public_key`
+/// are answered for clients that have NOT connected, by design, so a stranger
+/// who knew the bunker pubkey could send one `ping` every two minutes and keep
+/// the signer permanently busy without ever presenting the secret.
+///
+/// An unknown method reaches the human. The bunker rejects it afterwards, but a
+/// name this does not recognise is not something to wave through here.
+fn touchesKey(method_name: []const u8) bool {
+    const method = nip46.Method.fromString(method_name) orelse return true;
+    return switch (method) {
+        .sign_event, .nip44_encrypt, .nip44_decrypt => true,
+        .connect, .ping, .get_public_key, .logout => false,
+    };
+}
+
 fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46.Decision {
     const self: *const Interactive = @ptrCast(@alignCast(ctx.?));
 
     // The static allowlist is the first gate: a disallowed request is denied
     // outright and never bothers the human.
     if (self.config.policy().decide(request, client) == .reject) return .reject;
+
+    // Only a request that uses the key is worth waking somebody up for.
+    if (!touchesKey(request.method)) return .approve;
 
     var info = Pending{};
     const mlen = @min(request.method.len, info.method_buf.len);
@@ -303,6 +330,37 @@ test "interactive policy escalates an allowed request and returns the GUI decisi
     const t = try std.Thread.spawn(.{}, resolveFirst, .{ &broker, Decision.reject });
     defer t.join();
 
-    const req = nip46.Request{ .id = "1", .method = "get_public_key", .params = &.{} };
+    // sign_event, because that is what a human is for. get_public_key used to
+    // stand in here and no longer escalates at all.
+    const tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const params = [_][]const u8{tmpl};
+    const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &params };
     try testing.expectEqual(nip46.Decision.reject, p.decide(&req, [_]u8{0} ** 32));
+}
+
+test "housekeeping never reaches the human, so a stranger cannot park the relay thread" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Short timeout, and nothing is resolving. Anything that escalates parks
+    // here for the whole timeout and then comes back .reject, so an .approve
+    // that returns immediately is the assertion: it never went to the queue.
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+
+    // ping and get_public_key are answered for clients that have NOT connected,
+    // so if these escalated, one every two minutes from anyone who knew the
+    // bunker pubkey would keep the signer permanently busy.
+    for ([_][]const u8{ "ping", "get_public_key", "connect", "logout" }) |m| {
+        const req = nip46.Request{ .id = "1", .method = m, .params = &.{} };
+        try testing.expectEqual(nip46.Decision.approve, p.decide(&req, [_]u8{0} ** 32));
+    }
+    try testing.expectEqual(@as(u64, 0), broker.version.load(.monotonic));
+
+    // An unrecognised name is not waved through.
+    const odd = nip46.Request{ .id = "2", .method = "nip04_decrypt", .params = &.{} };
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&odd, [_]u8{0} ** 32));
 }
