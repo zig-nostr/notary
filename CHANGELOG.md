@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-12
+
 ### Fixed
 - **A relay that goes quiet is noticed.** Each relay thread blocks in `receive`
   until its relay says something, so a peer that went away without closing left
@@ -34,10 +36,23 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
   evidence of that is a minute old. The GUI shows it in amber.
 
 ### Changed
-- Takes nostr v0.8.0 (from v0.6.0), which is where `ping`, `idleMs` and
-  `shutdown` live, and which serializes writes on a connection: a connection
-  being kept alive has two users on two threads, and over TLS half a record
-  from each is a session that cannot be decrypted again.
+- Takes nostr v0.9.0 (from v0.6.0). v0.8.0 is where `ping`, `idleMs` and
+  `shutdown` live, and where writes on a connection became serialized: a
+  connection being kept alive has two users on two threads, and over TLS half a
+  record from each is a session that cannot be decrypted again.
+
+  v0.9.0 carries a fix on this daemon's own request path. `worthAnswering`
+  measured a request's age with a plain subtraction on a `created_at` the
+  sender chose. A request stamped `minInt(i64)` makes the difference wider than
+  an i64 holds, so it wrapped to a NEGATIVE age, and a negative age is not
+  greater than the limit: the staleness guard accepted the one timestamp most
+  obviously worth refusing. The arithmetic saturates now, so a timestamp that
+  far away reads as stale, which is what both branches were reaching for.
+
+  It is a guard rather than the lock: a request still has to be sealed to this
+  bunker and authorized before anything is signed. But a replay window that can
+  be opened by choosing a number is not a window anybody should have to argue
+  about, and this daemon is the one thing here holding a key.
 
 ## [0.3.0]
 
