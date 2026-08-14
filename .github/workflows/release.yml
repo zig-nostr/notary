@@ -31,7 +31,17 @@ jobs:
           node-version: 22
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.7.2
+        run: npm install -g @native-sdk/cli@0.9.0
+
+      # The suites run on every pull request, but a tag can be pushed at any
+      # commit, and a release is the one artifact nobody gets to re-check. So
+      # they run again here and the release does not exist if they fail. Both,
+      # because the bundle carries both halves.
+      - name: Test the daemon
+        run: cd daemon && zig build test
+
+      - name: Test the GUI
+        run: cd gui && native test
 
       - name: Build the daemon (ReleaseFast)
         run: cd daemon && zig build -Doptimize=ReleaseFast
@@ -42,11 +52,35 @@ jobs:
       - name: Zip the .app (ditto preserves the signature)
         run: ditto -c -k --sequesterRsrc --keepParent "gui/dist/Notary.app" "Notary-${{ github.ref_name }}-macos.zip"
 
+      # The tag and the manifest have to agree, and this is the last place it can
+      # be checked. `gui/app.zon` is where the app reads the version it shows,
+      # so tagging v0.5.0 on a tree that still says 0.4.0 ships a build that
+      # tells people they are running the previous release.
+      - name: The tag and app.zon must agree
+        run: |
+          manifest="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' gui/app.zon | head -1)"
+          tagged="${GITHUB_REF_NAME#v}"
+          if [ "$manifest" != "$tagged" ]; then
+            echo "tag $GITHUB_REF_NAME says $tagged, gui/app.zon says $manifest" >&2
+            exit 1
+          fi
+          echo "both say $manifest"
+
+      # `create` for a new tag, `upload --clobber` for one that already has a
+      # release. Re-running this job is otherwise a red X on work that
+      # succeeded, and a re-run is what somebody reaches for when a publish
+      # fails halfway. The tests above still gate it, so nothing arrives here
+      # that has not passed them on the tag's own source.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "${{ github.ref_name }}"
-          "Notary-${{ github.ref_name }}-macos.zip"
-          --title "Notary ${{ github.ref_name }}"
-          --notes-file .github/RELEASE_NOTES.md
+        run: |
+          asset="Notary-${GITHUB_REF_NAME}-macos.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release exists; replacing its artifact with the one built here"
+            gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$asset" \
+              --title "Notary $GITHUB_REF_NAME" \
+              --notes-file .github/RELEASE_NOTES.md
+          fi
