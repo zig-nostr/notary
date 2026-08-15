@@ -31,7 +31,20 @@ const hex = nostr.hex;
 // token files sit under $HOME; relays default to a public relay.
 const default_token_file = ".zig-nostr-signer.token";
 const default_key_file = ".zig-nostr-signer.key";
-const default_gui_relays = "wss://relay.damus.io";
+// What the GUI serves on when the reader has not chosen. THREE, not one.
+//
+// A signer on a single relay is a signer that stops signing when that relay
+// does, and the failure is silent from the client's side: the request is
+// published, nothing answers, and the app just sits there. Amber ships three
+// defaults for the same reason (`defaultAppRelays` in AmberSettings.kt) and
+// makes them editable, which is the shape copied here.
+//
+// These are Amber's three verbatim, three separate operators, so one going down
+// is one thread reconnecting rather than a signer that has quietly stopped.
+// Deliberately NOT relay.nsec.app, which is the obvious pick and the wrong one:
+// it belongs to a signer project that looks unmaintained, and a default should
+// not point at infrastructure whose owner has moved on.
+const default_gui_relays = "wss://nostr.oxtr.dev,wss://theforest.nostr1.com,wss://relay.primal.net";
 
 const usage =
     \\zig-nostr signer: headless NIP-46 remote signer (bunker)
@@ -251,10 +264,26 @@ fn runRelays(
         std.debug.print("signer: relay keepalive did not start ({s}); a dropped connection will not be noticed\n", .{@errorName(err)});
     }
 
+    // ONE of each, shared by every relay thread, and this is what makes serving
+    // more than one relay correct rather than merely possible.
+    //
+    // A bunker token names every relay the signer listens on, and a client
+    // publishes its request to all of them, so one intent arrives as the same
+    // event id on each thread. Held per thread, the record of answered requests
+    // meant each relay answered its own copy: two approval prompts for one
+    // question, and two signatures published for one intent. And the set of
+    // clients that had completed `connect` was per bunker, so a client that
+    // connected over one relay and asked over another was told "not connected".
+    //
+    // Both now live out here for the life of the process. This is exactly what
+    // nostr v0.10.0 changed its two signatures for.
+    var seen_requests: nostr.signer.SeenRequests = .{};
+    var authorized_clients: nip46.AuthorizedClients = .{};
+
     var threads: std.ArrayList(std.Thread) = .empty;
     for (relays, 0..) |url, i| {
         const slot: ?*std.atomic.Value(u8) = if (relay_status) |rs| &rs[i] else null;
-        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot, keeper, i }) catch |err| {
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot, keeper, i, &seen_requests, &authorized_clients }) catch |err| {
             std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
             if (slot) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
             continue;
@@ -329,6 +358,8 @@ fn serveRelayForever(
     status: ?*std.atomic.Value(u8),
     keeper: ?*relay_keeper.Table,
     slot: usize,
+    seen: *nostr.signer.SeenRequests,
+    clients: *nip46.AuthorizedClients,
 ) void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -353,22 +384,20 @@ fn serveRelayForever(
     };
     const request_policy = if (broker != null) interactive.asPolicy() else policy_config.policy();
 
-    var bunker = nip46.Bunker.initSingleKey(signer, kp, request_policy);
+    var bunker = nip46.Bunker.initSingleKey(signer, kp, request_policy, clients);
     bunker.secret = conn_secret;
-    // The bunker now remembers which clients have connected, and refuses to
-    // sign for one it has not heard of. It lives out here, outside the dial
-    // loop, so a dropped socket does not make every client connect again.
+    // The bunker refuses to sign for a client it has not heard of. It lives out
+    // here, outside the dial loop, so a dropped socket does not make every
+    // client connect again.
     //
-    // One consequence worth naming: this bunker belongs to THIS relay thread,
-    // which is how the rest of the state here works, so a client is authorized
-    // per relay. A client that connects over one relay in the token and then
-    // asks over another gets "not connected" and has to connect again. Clients
-    // hold one connection at a time, so that is a reconnect and not a wall, but
-    // a set shared across the threads would be better and is worth doing.
+    // The authorized set is the caller's and shared with every other relay
+    // thread, so a client that connects over one relay and asks over another is
+    // recognised. It used to be per bunker and therefore per relay, and that
+    // reconnect-per-relay is what this fixes.
 
     while (true) {
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connecting), .monotonic);
-        serveOnce(gpa, io, url, &bunker, kp, status, keeper, slot) catch |err| {
+        serveOnce(gpa, io, url, &bunker, kp, status, keeper, slot, seen) catch |err| {
             std.debug.print("signer: [{s}] {s}\n", .{ url, @errorName(err) });
         };
         if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
@@ -387,6 +416,7 @@ fn serveOnce(
     status: ?*std.atomic.Value(u8),
     keeper: ?*relay_keeper.Table,
     slot: usize,
+    seen: *nostr.signer.SeenRequests,
 ) !void {
     var relay = try nostr.relay.dial(gpa, io, url);
     // Withdrawn BEFORE the connection is freed. Defers unwind in reverse, so
@@ -397,7 +427,7 @@ fn serveOnce(
     defer if (keeper) |k| k.offer(slot, null);
     if (status) |s| s.store(@intFromEnum(approval_http.RelayStatus.connected), .monotonic);
     std.debug.print("signer: [{s}] connected; listening for NIP-46 requests\n", .{url});
-    try nostr.signer.serve(gpa, io, relay, bunker, remote, url);
+    try nostr.signer.serve(gpa, io, relay, bunker, remote, url, seen);
 }
 
 /// Resolves the signer's 32-byte secret key from the environment, preferring
@@ -625,4 +655,27 @@ test "derives the pubkey and builds a bunker token" {
         "bunker://dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659?",
     );
     try std.testing.expect(std.mem.indexOf(u8, token, "secret=s3cret") != null);
+}
+
+test "the GUI default is more than one relay, and they are separate operators" {
+    const gpa = std.testing.allocator;
+    var relays: std.ArrayList([]const u8) = .empty;
+    defer relays.deinit(gpa);
+    parseRelays(gpa, &relays, default_gui_relays);
+
+    // The property, not the list. A signer on one relay stops signing when that
+    // relay does, and the client sees nothing: the request is published and
+    // never answered. This is pinned against the literal 1 rather than counted
+    // off the constant, so shrinking the default back to a single relay fails
+    // here instead of passing quietly.
+    try std.testing.expect(relays.items.len > 1);
+
+    // Distinct hosts. Three URLs at one operator is one operator, and would
+    // satisfy a count while delivering none of what the count is for.
+    for (relays.items, 0..) |a, i| {
+        try std.testing.expect(std.mem.startsWith(u8, a, "wss://"));
+        for (relays.items[i + 1 ..]) |b| {
+            try std.testing.expect(!std.mem.eql(u8, a, b));
+        }
+    }
 }
