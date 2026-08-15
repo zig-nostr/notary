@@ -86,6 +86,9 @@ const Slot = struct {
     in_use: bool = false,
     info: Pending = .{},
     decision: std.atomic.Value(Decision) = .init(.pending),
+    /// How long the operator's answer should last. Written under the lock
+    /// before the decision is published, and read after it.
+    remember: nip46.Remember = .once,
 };
 
 pub const Broker = struct {
@@ -100,6 +103,14 @@ pub const Broker = struct {
     /// Milliseconds a submitted request waits before it is auto-denied when no
     /// GUI resolves it.
     timeout_ms: u64 = 120_000,
+    /// What the operator has already answered, and for how long.
+    ///
+    /// The library's, shared with Plaza's signer so the two cannot drift on what
+    /// a permission means. Until this, Notary prompted for every request
+    /// forever: there was no way to say "always allow this app to post notes"
+    /// and no way to say "stop asking", which is the prompt fatigue that teaches
+    /// people to approve without reading.
+    permissions: nip46.Permissions = .{},
 
     fn acquire(self: *Broker) void {
         while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -113,7 +124,18 @@ pub const Broker = struct {
     /// Submits `info` and blocks until the GUI resolves it or the timeout denies
     /// it. Runs on a relay thread; `io.sleep` paces the poll.
     pub fn submit(self: *Broker, io: std.Io, info: Pending) Decision {
-        const idx = self.claim(info) orelse return .reject;
+        return self.submitRemembering(io, info).decision;
+    }
+
+    /// What the operator said, and for how long, and whether they said anything
+    /// at all. The last one matters: a timeout is not an answer.
+    /// A decision and how long it stands. A request nobody answered comes back
+    /// `.reject` with `.once`, and `.once` is never stored: only what a person
+    /// actually said is remembered.
+    pub const Answered = struct { decision: Decision, remember: nip46.Remember };
+
+    pub fn submitRemembering(self: *Broker, io: std.Io, info: Pending) Answered {
+        const idx = self.claim(info) orelse return .{ .decision = .reject, .remember = .once };
 
         // Poll the decision slot, pacing with io.sleep (as the reconnect loop
         // does). Elapsed time is counted in sleep steps, no wall clock needed.
@@ -129,10 +151,12 @@ pub const Broker = struct {
         // Honor a last-moment resolve that raced the timeout; else deny.
         self.acquire();
         const final = self.slots[idx].decision.load(.acquire);
+        const how_long = self.slots[idx].remember;
         self.slots[idx].in_use = false;
         self.release();
         _ = self.version.fetchAdd(1, .monotonic);
-        return if (final != .pending) final else .reject;
+        if (final == .pending) return .{ .decision = .reject, .remember = .once };
+        return .{ .decision = final, .remember = how_long };
     }
 
     fn claim(self: *Broker, info: Pending) ?usize {
@@ -186,11 +210,19 @@ pub const Broker = struct {
     /// Applies the GUI's decision to pending entry `id`. Returns true if it was
     /// found and still pending.
     pub fn resolve(self: *Broker, id: u64, decision: Decision) bool {
+        return self.resolveFor(id, decision, .once);
+    }
+
+    /// The same, with how long the answer should last.
+    pub fn resolveFor(self: *Broker, id: u64, decision: Decision, how_long: nip46.Remember) bool {
         if (decision == .pending) return false;
         self.acquire();
         var found = false;
         for (&self.slots) |*slot| {
             if (slot.in_use and slot.info.id == id and slot.decision.load(.monotonic) == .pending) {
+                // The duration first, so a thread waking on the decision cannot
+                // read a remember value that has not been written yet.
+                slot.remember = how_long;
                 slot.decision.store(decision, .release);
                 found = true;
                 break;
@@ -250,6 +282,20 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     // Only a request that uses the key is worth waking somebody up for.
     if (!touchesKey(request.method)) return .approve;
 
+    // Already answered, and the answer has not lapsed. This is what stops
+    // Notary asking about the same thing forever: the operator says "always" or
+    // "for a day" once, and the queue stays for the things they have not
+    // decided yet.
+    const method = nip46.Method.fromString(request.method) orelse return .reject;
+    // The library's reader, not a second one. Unreadable is -1, which the
+    // store treats as a question of its own rather than letting it ride on a
+    // permission granted for some other kind.
+    const kind: i32 = if (nostr.nip46.signEventKind(self.gpa, request)) |k| @intCast(k) else -1;
+    const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+    if (self.broker.permissions.remembered(client, method, kind, now_ms)) |allowed| {
+        return if (allowed) .approve else .reject;
+    }
+
     var info = Pending{};
     const mlen = @min(request.method.len, info.method_buf.len);
     @memcpy(info.method_buf[0..mlen], request.method[0..mlen]);
@@ -259,14 +305,18 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     // left the person to guess both.
     _ = std.fmt.bufPrint(&info.client_buf, "{x}", .{client}) catch {};
     info.client_len = 64;
-    if (nip46.Method.fromString(request.method)) |method| {
-        if (method == .sign_event) {
-            if (nostr.nip46.signEventKind(self.gpa, request)) |k| info.kind = k;
-            info.preview_len = signEventPreview(self.gpa, request, &info.preview_buf);
-        }
+    // Both already read above, for the permission lookup.
+    info.kind = kind;
+    if (method == .sign_event) {
+        info.preview_len = signEventPreview(self.gpa, request, &info.preview_buf);
     }
 
-    return switch (self.broker.submit(self.io, info)) {
+    const answered = self.broker.submitRemembering(self.io, info);
+    // `.once` is never written down, which is how a timeout leaves the question
+    // open: an operator who walked away from the machine said nothing, and
+    // storing silence as a denial would lock a client out over an absence.
+    self.broker.permissions.remember(client, method, kind, answered.decision == .approve, answered.remember, now_ms);
+    return switch (answered.decision) {
         .approve => .approve,
         else => .reject,
     };
@@ -280,6 +330,18 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
 const testing = std.testing;
 
 /// Stand-in for the GUI: waits for one pending entry, then resolves it.
+fn resolveFirstFor(broker: *Broker, decision: Decision, how_long: nip46.Remember) void {
+    var buf: [4]Pending = undefined;
+    var tries: usize = 0;
+    while (tries < 1_000_000) : (tries += 1) {
+        if (broker.snapshot(&buf) > 0) {
+            _ = broker.resolveFor(buf[0].id, decision, how_long);
+            return;
+        }
+        std.Thread.yield() catch {};
+    }
+}
+
 fn resolveFirst(broker: *Broker, decision: Decision) void {
     var buf: [4]Pending = undefined;
     var tries: usize = 0;
@@ -400,4 +462,123 @@ test "resetting the broker rejects what was waiting rather than dropping it" {
     broker.slots[2] = .{ .in_use = true, .info = .{ .id = 3 }, .decision = std.atomic.Value(Decision).init(.approve) };
     broker.reset();
     try std.testing.expectEqual(Decision.approve, broker.slots[2].decision.load(.monotonic));
+}
+
+test "an answer the operator asked to remember is not asked again" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // Nothing resolves the second request, and the timeout is short. Anything
+    // that escalates parks for the whole timeout and comes back .reject, so an
+    // immediate .approve is the assertion: it was answered from memory.
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+
+    const client = [_]u8{7} ** 32;
+    const tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+
+    {
+        const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.approve, nip46.Remember.always });
+        defer t.join();
+        try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
+    }
+    const asked = broker.version.load(.monotonic);
+
+    // The same client, method and kind: answered without a prompt.
+    try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
+    try testing.expectEqual(asked, broker.version.load(.monotonic));
+
+    // A different kind is a separate question, so it escalates and times out.
+    const other = "{\"kind\":30023,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const other_req = nip46.Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{other} };
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&other_req, client));
+    try testing.expect(broker.version.load(.monotonic) > asked);
+
+    // So is the same kind from a different client.
+    var stranger = Broker{ .timeout_ms = 400 };
+    const inter2 = Interactive{ .broker = &stranger, .config = &cfg, .io = io, .gpa = testing.allocator };
+    stranger.permissions = broker.permissions;
+    try testing.expectEqual(nip46.Decision.reject, inter2.asPolicy().decide(&req, [_]u8{9} ** 32));
+}
+
+test "a denial is remembered too, so a refused app cannot pester" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+
+    const client = [_]u8{3} ** 32;
+    const tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+
+    {
+        const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.reject, nip46.Remember.hour });
+        defer t.join();
+        try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+    }
+    const asked = broker.version.load(.monotonic);
+
+    // Refused again without waking anyone. A timed-out escalation would also
+    // read .reject, so the version is what separates the two.
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+    try testing.expectEqual(asked, broker.version.load(.monotonic));
+}
+
+test "an answer given once is asked again the next time" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+
+    const client = [_]u8{5} ** 32;
+    const tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+
+    {
+        const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.approve, nip46.Remember.once });
+        defer t.join();
+        try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
+    }
+    const asked = broker.version.load(.monotonic);
+
+    // Nothing is resolving now, so a second ask parks and times out. If "once"
+    // had been stored this would come back .approve at once.
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+    try testing.expect(broker.version.load(.monotonic) > asked);
+}
+
+test "walking away is not an answer, so a timeout is not remembered as a denial" {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker{ .timeout_ms = 300 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+
+    const client = [_]u8{11} ** 32;
+    const tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+
+    // Nobody is at the machine: this one times out.
+    try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+
+    // They come back and approve. If the timeout had been written down as a
+    // denial, this would be refused from memory without ever reaching them.
+    const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.approve, nip46.Remember.once });
+    defer t.join();
+    try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
 }

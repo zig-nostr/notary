@@ -25,7 +25,7 @@ The signer is split into two processes on purpose:
 
 - The **daemon** ([`daemon/`](../daemon))
   holds the secret key, connects to your relays, and does all Nostr work. In
-  GUI mode it holds each request for approval and serves a **loopback-only**
+  GUI mode it holds each unanswered request for approval and serves a **loopback-only**
   HTTP API.
 - **This app** is a separate process that polls that API, shows each pending
   request, and sends back your approve/deny decision.
@@ -66,8 +66,8 @@ SIGNER_APPROVAL_TOKEN_FILE="$HOME/.zig-nostr-signer.token" \
 ```
 
 The app polls the queue (a long-poll chain, so it updates within a second of
-a change), renders each pending request, and sends your decision back over
-`POST /decision`. The bearer token authenticates every call; the secret key
+a change), renders each pending request, and sends your decision, with how long
+it stands, back over `POST /decision`. The bearer token authenticates every call; the secret key
 stays in the daemon.
 
 ### First-run key setup

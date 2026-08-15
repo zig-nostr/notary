@@ -393,7 +393,7 @@ fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const 
 }
 
 fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
-    const Body = struct { id: u64, decision: []const u8 };
+    const Body = struct { id: u64, decision: []const u8, remember: []const u8 = "once" };
     const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
         return respond(w, 400, bad_request);
     defer parsed.deinit();
@@ -405,7 +405,18 @@ fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
     else
         return respond(w, 400, bad_request);
 
-    const ok = self.broker.resolve(parsed.value.id, decision);
+    // An unrecognised duration is `once`, the shortest. A typo must not silently
+    // grant something forever.
+    const how_long: nostr.nip46.Remember = if (eql(parsed.value.remember, "hour"))
+        .hour
+    else if (eql(parsed.value.remember, "day"))
+        .day
+    else if (eql(parsed.value.remember, "always"))
+        .always
+    else
+        .once;
+
+    const ok = self.broker.resolveFor(parsed.value.id, decision, how_long);
     var out: [32]u8 = undefined;
     const j = std.fmt.bufPrint(&out, "{{\"ok\":{s}}}", .{if (ok) "true" else "false"}) catch unreachable;
     return respond(w, 200, j);
@@ -849,4 +860,35 @@ test "forgetting a key needs the exact confirmation phrase" {
     try testing.expect(!eql(forget_confirmation, "Delete my key"));
     try testing.expect(!eql(forget_confirmation, "delete my key "));
     try testing.expect(!eql(forget_confirmation, "yes"));
+}
+
+test "POST /decision carries how long the answer lasts, and a bad duration is the shortest" {
+    const gpa = testing.allocator;
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    var broker: Broker = .{};
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    const cases = [_]struct { body: []const u8, want: nostr.nip46.Remember }{
+        .{ .body = "{\"id\":1,\"decision\":\"approve\",\"remember\":\"always\"}", .want = .always },
+        .{ .body = "{\"id\":1,\"decision\":\"approve\",\"remember\":\"day\"}", .want = .day },
+        .{ .body = "{\"id\":1,\"decision\":\"reject\",\"remember\":\"hour\"}", .want = .hour },
+        // No duration at all, and a name the daemon does not know, both mean
+        // "once". A typo must never quietly grant something forever.
+        .{ .body = "{\"id\":1,\"decision\":\"approve\"}", .want = .once },
+        .{ .body = "{\"id\":1,\"decision\":\"approve\",\"remember\":\"forever and ever\"}", .want = .once },
+    };
+
+    for (cases) |c| {
+        broker = .{};
+        broker.slots[0] = .{ .in_use = true, .info = .{ .id = 1 }, .decision = .init(.pending) };
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleDecision(&server, &out.writer, c.body);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"ok\":true") != null);
+        try testing.expectEqual(c.want, broker.slots[0].remember);
+    }
 }

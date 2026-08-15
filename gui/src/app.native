@@ -110,9 +110,11 @@
                 <text wrap="true">{r.preview}</text>
               </if>
               <row gap="8">
-                <button variant="primary" grow="1" on-press="approve:{r.id}">Approve</button>
-                <button variant="destructive" grow="1" on-press="reject:{r.id}">Deny</button>
+                <button variant="primary" grow="1" on-press="approve:{r.id}">Allow once</button>
+                <button grow="1" on-press="approve_day:{r.id}">For a day</button>
+                <button grow="1" on-press="approve_always:{r.id}">Always</button>
               </row>
+              <button variant="destructive" on-press="reject:{r.id}">Deny</button>
             </column>
           </card>
         </for>
