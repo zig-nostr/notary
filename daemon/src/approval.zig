@@ -165,6 +165,24 @@ pub const Broker = struct {
         return n;
     }
 
+    /// Denies everything still waiting and frees the slots.
+    ///
+    /// For signing out: a request that was queued against the key being removed
+    /// must not sit there and be approved against whatever key comes next.
+    /// REJECTED rather than dropped, because a relay thread is blocked waiting on
+    /// each of these and dropping the slot would leave it waiting for a decision
+    /// that can no longer arrive.
+    pub fn reset(self: *Broker) void {
+        self.acquire();
+        for (&self.slots) |*slot| {
+            if (slot.in_use and slot.decision.load(.monotonic) == .pending) {
+                slot.decision.store(.reject, .release);
+            }
+        }
+        self.release();
+        _ = self.version.fetchAdd(1, .monotonic);
+    }
+
     /// Applies the GUI's decision to pending entry `id`. Returns true if it was
     /// found and still pending.
     pub fn resolve(self: *Broker, id: u64, decision: Decision) bool {
@@ -363,4 +381,23 @@ test "housekeeping never reaches the human, so a stranger cannot park the relay 
     // An unrecognised name is not waved through.
     const odd = nip46.Request{ .id = "2", .method = "nip04_decrypt", .params = &.{} };
     try testing.expectEqual(nip46.Decision.reject, p.decide(&odd, [_]u8{0} ** 32));
+}
+
+test "resetting the broker rejects what was waiting rather than dropping it" {
+    var broker = Broker{};
+    broker.slots[0] = .{ .in_use = true, .info = .{ .id = 1 }, .decision = std.atomic.Value(Decision).init(.pending) };
+    broker.slots[1] = .{ .in_use = true, .info = .{ .id = 2 }, .decision = std.atomic.Value(Decision).init(.pending) };
+
+    broker.reset();
+
+    // REJECTED, not cleared. A relay thread is parked waiting on each of these,
+    // and freeing the slot would leave it waiting for an answer that can never
+    // arrive. Signing out has to unblock them, not strand them.
+    try std.testing.expectEqual(Decision.reject, broker.slots[0].decision.load(.monotonic));
+    try std.testing.expectEqual(Decision.reject, broker.slots[1].decision.load(.monotonic));
+
+    // A request already decided keeps its answer.
+    broker.slots[2] = .{ .in_use = true, .info = .{ .id = 3 }, .decision = std.atomic.Value(Decision).init(.approve) };
+    broker.reset();
+    try std.testing.expectEqual(Decision.approve, broker.slots[2].decision.load(.monotonic));
 }

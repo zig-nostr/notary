@@ -440,3 +440,24 @@ test "a refused nostrconnect link says which thing went wrong" {
     try testing.expect(!m.has_nostrconnect_error());
     try testing.expectEqualStrings("", m.nostrconnect());
 }
+
+test "the destructive key removal is inert until the phrase matches exactly" {
+    var m = main.Model{};
+    // Disabled by default, so the press that removes somebody's only copy of an
+    // identity on this Mac cannot be a mis-click.
+    try testing.expect(m.forget_disabled());
+
+    m.forget_buf.set("yes");
+    try testing.expect(m.forget_disabled());
+    m.forget_buf.set("Delete my key");
+    try testing.expect(m.forget_disabled());
+    m.forget_buf.set("delete my key ");
+    try testing.expect(m.forget_disabled());
+
+    m.forget_buf.set("delete my key");
+    try testing.expect(!m.forget_disabled());
+
+    // A refusal from the daemon is reported rather than swallowed.
+    main.update(&m, main.Msg{ .forget_done = .{ .key = 12, .outcome = .ok, .status = 400, .body = "" } }, undefined);
+    try testing.expect(m.has_forget_error());
+}
