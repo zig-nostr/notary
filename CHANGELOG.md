@@ -7,6 +7,57 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-15
+
+### Added
+- **`nostrconnect://`.** Notary could only be connected one way round: copy its
+  `bunker://` URL and paste it into a client. The other direction is what most
+  clients actually offer, a link they show and wait on. Paste one in and Notary
+  adopts that client.
+
+  The reply carries the link's own secret as its result, in place of `"ack"`,
+  which is how the client knows the signer that answered is the one it invited.
+  Answering `"ack"` is ignored by every client and the connection never
+  completes, with nothing to see on either side.
+
+  The answer goes to the relays the client named, which are not necessarily
+  ours, so this is the one place the daemon dials an address it did not choose:
+  `wss://` only, no control characters, and at most four relays tried.
+
+- **Signing out, and using another key.** Two things, deliberately separate.
+  Signing out locks the signer and is a restart, which is the honest
+  implementation: the relay threads were handed the key by value when serving
+  began, so nothing short of ending the process takes it back. Using another key
+  removes the key file, sits behind a typed phrase matched exactly, and ends the
+  process, because the relay threads still hold the key that was just deleted.
+
+  Sessions do not outlive the key they were granted against, and anything
+  waiting for a decision is rejected rather than dropped: a relay thread is
+  parked on each of those and freeing the slot would strand it.
+
+### Changed
+- **Three relays by default, not one.** The GUI served on `wss://relay.damus.io`
+  and nothing else. A signer on a single relay stops signing when that relay
+  does, and from the client's side the failure is silent: the request is
+  published, nothing answers, and the app sits there. The three are Amber's
+  verbatim, three separate operators. Deliberately not `relay.nsec.app`, which
+  is the obvious pick and belongs to a project that looks unmaintained.
+
+- Serving several relays was already possible and was not correct. One intent
+  arrives as the same event id on every relay thread, and two things were held
+  per thread that had to be shared: the record of answered requests, so each
+  relay answered its own copy (two approval prompts, two signatures for one
+  intent), and the set of connected clients, so a client that connected over one
+  relay and asked over another was told "not connected". Both are now created
+  once and shared. Takes nostr v0.11.0, which is what changed those signatures.
+
+### Fixed
+- The release workflow went from build straight to package to publish, running
+  **no tests at all**, on the one artifact nobody gets to re-check. Both suites
+  gate it now, the publish step is idempotent so a re-run is not a red X on work
+  that succeeded, and the tag has to agree with `gui/app.zon` so a release
+  cannot tell people they are running the previous version.
+
 ## [0.4.0] - 2026-08-12
 
 ### Fixed
