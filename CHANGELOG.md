@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-16
+
 ### Added
 - **Answers that last.** Every request was asked fresh, so a client that signs
   in a loop asked in a loop, and a queue that never empties is a queue nobody
