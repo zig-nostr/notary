@@ -406,3 +406,37 @@ test "the unlock screen renders and dispatches submit_unlock" {
         else => return error.WrongMessage,
     }
 }
+
+test "a refused nostrconnect link says which thing went wrong" {
+    var m = main.Model{};
+    // Nothing typed: the button is inert rather than sending an empty link.
+    try testing.expect(m.nostrconnect_disabled());
+    try testing.expect(!m.has_nostrconnect_error());
+
+    m.nostrconnect_buf.set("nostrconnect://abc?relay=wss%3A%2F%2Fr.example&secret=s");
+    try testing.expect(!m.nostrconnect_disabled());
+
+    // Each status the daemon can answer with maps to a sentence a person can
+    // act on. "Could not connect" for all of them would be true and useless:
+    // locking, a bad link and an unreachable relay need different things done.
+    const cases = [_]struct { status: u16, needle: []const u8 }{
+        .{ .status = 400, .needle = "nostrconnect link" },
+        .{ .status = 409, .needle = "Unlock" },
+        .{ .status = 502, .needle = "relay" },
+        .{ .status = 503, .needle = "not serving" },
+    };
+    for (cases) |c| {
+        m.nostrconnect_sending = true;
+        main.update(&m, main.Msg{ .nostrconnect_done = .{ .key = 11, .outcome = .ok, .status = c.status, .body = "" } }, undefined);
+        try testing.expect(!m.nostrconnect_sending);
+        try testing.expect(m.has_nostrconnect_error());
+        try testing.expect(std.mem.indexOf(u8, m.nostrconnect_error(), c.needle) != null);
+    }
+
+    // And success clears the field, because the link is single use: the client
+    // has its answer and is not waiting any more.
+    m.nostrconnect_sending = true;
+    main.update(&m, main.Msg{ .nostrconnect_done = .{ .key = 11, .outcome = .ok, .status = 200, .body = "" } }, undefined);
+    try testing.expect(!m.has_nostrconnect_error());
+    try testing.expectEqualStrings("", m.nostrconnect());
+}

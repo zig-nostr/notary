@@ -55,6 +55,11 @@ pub const Info = struct {
 pub const Server = struct {
     gpa: std.mem.Allocator,
     broker: *Broker,
+    /// The clients that have completed a connect, shared with every relay
+    /// thread. `/nostrconnect` adds to it: adopting a client that invited us is
+    /// authorizing it, and doing that here rather than on the relay threads is
+    /// the whole point of the flow (nobody sends us a request first).
+    clients: ?*nip46.AuthorizedClients = null,
     /// Key-onboarding gate: reports its state on /info and is driven by /setup
     /// and /unlock. The key it guards is created/decrypted in the daemon and
     /// never crosses this API.
@@ -311,6 +316,8 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handleInfo(self, w);
     if (eql(method, "POST") and eql(path, "/setup"))
         return handleSetup(self, io, w, body);
+    if (eql(method, "POST") and eql(path, "/nostrconnect"))
+        return handleNostrConnect(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/unlock"))
         return handleUnlock(self, io, w, body);
     if (eql(method, "GET") and std.mem.startsWith(u8, path, "/pending"))
@@ -459,6 +466,80 @@ fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !
         else => respond(w, 500, "{\"error\":\"could not create the key\"}"),
     };
     return respondPubkey(self, w);
+}
+
+/// Whether a relay URL from a `nostrconnect://` URI is one to dial.
+///
+/// The link is handed in by a person, but its contents are written by whatever
+/// asked to connect, and this is the one place this daemon makes an OUTBOUND
+/// connection to an address it did not choose. `wss://` only: a `ws://` would
+/// carry the acceptance in the clear, and anything else is not a relay.
+pub fn dialableRelay(url: []const u8) bool {
+    if (!std.mem.startsWith(u8, url, "wss://")) return false;
+    if (url.len <= "wss://".len) return false;
+    // A control character in a URL is something being smuggled, not a typo.
+    for (url) |c| {
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+/// How many of a link's relays are worth trying. The client names where it is
+/// listening, and one reachable relay is enough for it to adopt us; this bounds
+/// what a hostile link can make this daemon dial.
+pub const max_nostrconnect_relays = 4;
+
+/// POST /nostrconnect, adopt a client that advertised itself.
+///
+/// The other direction of NIP-46: instead of the reader pasting our `bunker://`
+/// token into a client, the client shows a `nostrconnect://` token and waits.
+/// The answer carries the link's own secret as its result, which is how the
+/// client knows the signer that replied is the one it invited.
+fn handleNostrConnect(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { uri: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respond(w, 400, bad_request);
+    defer parsed.deinit();
+
+    if (self.gate.current() != .unlocked)
+        return respond(w, 409, "{\"error\":\"the key is locked\"}");
+    const clients = self.clients orelse
+        return respond(w, 503, "{\"error\":\"not serving yet\"}");
+
+    var uri = nip46.parseNostrConnectUri(self.gpa, parsed.value.uri) catch
+        return respond(w, 400, "{\"error\":\"that is not a nostrconnect link\"}");
+    defer uri.deinit();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(self.gate.secret_key) catch
+        return respond(w, 500, "{\"error\":\"could not load the key\"}");
+
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    var sealed = nip46.acceptNostrConnect(self.gpa, io, signer, kp, uri.value, "notary-nostrconnect", now) catch
+        return respond(w, 500, "{\"error\":\"could not build the reply\"}");
+    defer sealed.deinit();
+
+    // Published to the relays the CLIENT named, which are not necessarily ours:
+    // it is listening there and nowhere else.
+    var delivered = false;
+    var tried: usize = 0;
+    for (uri.value.relays) |url| {
+        if (tried >= max_nostrconnect_relays) break;
+        if (!dialableRelay(url)) continue;
+        tried += 1;
+        var relay = nostr.relay.dial(self.gpa, io, url) catch continue;
+        defer relay.deinit();
+        relay.publish(sealed.event) catch continue;
+        delivered = true;
+    }
+    if (!delivered)
+        return respond(w, 502, "{\"error\":\"could not reach any relay the link named\"}");
+
+    // AFTER it is out, not before. Authorizing a client we failed to answer
+    // leaves a grant standing for a connection that never happened.
+    clients.authorize(uri.value.client_pubkey);
+    return respond(w, 200, "{\"ok\":true}");
 }
 
 /// POST /unlock, decrypt an existing key file. Body: `{"passphrase":".."}`.
@@ -685,4 +766,36 @@ test "GET /info reports live per-relay connection status" {
 
     try testing.expect(std.mem.indexOf(u8, body.items, "{\"url\":\"wss://a.example\",\"status\":\"connected\"}") != null);
     try testing.expect(std.mem.indexOf(u8, body.items, "{\"url\":\"wss://b.example\",\"status\":\"disconnected\"}") != null);
+}
+
+test "only a wss relay named by a nostrconnect link is dialled" {
+    // This is the one place the daemon opens an outbound connection to an
+    // address it did not choose: the link is pasted by a person, but its
+    // contents are written by whatever wants to connect.
+    try testing.expect(dialableRelay("wss://relay.example.com"));
+    try testing.expect(dialableRelay("wss://relay.example.com/nostr"));
+
+    // Plaintext would carry the acceptance, and the acceptance carries the
+    // secret that proves which signer answered.
+    try testing.expect(!dialableRelay("ws://relay.example.com"));
+
+    // Not relays at all. The last two are the ones worth naming: a link is a
+    // string from a stranger, and these are what "just dial what it says" turns
+    // into.
+    try testing.expect(!dialableRelay("http://example.com"));
+    try testing.expect(!dialableRelay("file:///etc/passwd"));
+    try testing.expect(!dialableRelay(""));
+    try testing.expect(!dialableRelay("wss://"));
+
+    // A control character in a URL is something being smuggled.
+    try testing.expect(!dialableRelay("wss://evil.example\r\nHOST: x"));
+    try testing.expect(!dialableRelay("wss://evil.example\x00"));
+}
+
+test "a nostrconnect link cannot make the daemon dial without limit" {
+    // A link may name any number of relays. One reachable one is enough for the
+    // client to adopt us, so the rest is only a way to spend this daemon's
+    // sockets on somebody else's list.
+    try testing.expect(max_nostrconnect_relays > 0);
+    try testing.expect(max_nostrconnect_relays <= 8);
 }

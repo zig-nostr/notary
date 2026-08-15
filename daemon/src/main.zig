@@ -44,6 +44,17 @@ const default_key_file = ".zig-nostr-signer.key";
 // Deliberately NOT relay.nsec.app, which is the obvious pick and the wrong one:
 // it belongs to a signer project that looks unmaintained, and a default should
 // not point at infrastructure whose owner has moved on.
+/// The two pieces of state every relay thread shares, and the approval server
+/// reaches as well.
+///
+/// Process-lived rather than owned by `runRelays`, because they outlive nothing
+/// and two other things need them: `/nostrconnect` authorizes a client from the
+/// HTTP thread, which is constructed before serving starts, and signing out has
+/// to clear the same set. `runRelays` never returns, so the lifetime was always
+/// the process; this only says so where both callers can see it.
+var g_seen_requests: nostr.signer.SeenRequests = .{};
+var g_authorized_clients: nip46.AuthorizedClients = .{};
+
 const default_gui_relays = "wss://nostr.oxtr.dev,wss://theforest.nostr1.com,wss://relay.primal.net";
 
 const usage =
@@ -170,6 +181,7 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .gate = &gate,
         .token = token_hex,
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
+        .clients = &g_authorized_clients,
         .host = hp.host,
         .port = hp.port,
     };
@@ -277,13 +289,10 @@ fn runRelays(
     //
     // Both now live out here for the life of the process. This is exactly what
     // nostr v0.10.0 changed its two signatures for.
-    var seen_requests: nostr.signer.SeenRequests = .{};
-    var authorized_clients: nip46.AuthorizedClients = .{};
-
     var threads: std.ArrayList(std.Thread) = .empty;
     for (relays, 0..) |url, i| {
         const slot: ?*std.atomic.Value(u8) = if (relay_status) |rs| &rs[i] else null;
-        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot, keeper, i, &seen_requests, &authorized_clients }) catch |err| {
+        const t = std.Thread.spawn(.{}, serveRelayForever, .{ gpa, url, secret_key, conn_secret, policy_config, broker, slot, keeper, i, &g_seen_requests, &g_authorized_clients }) catch |err| {
             std.debug.print("signer: [{s}] could not start: {s}\n", .{ url, @errorName(err) });
             if (slot) |s| s.store(@intFromEnum(approval_http.RelayStatus.disconnected), .monotonic);
             continue;
