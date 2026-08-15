@@ -12,7 +12,7 @@ native clients over a relay, the secret key never reaches the client.
 > `get_public_key`, `sign_event`, `ping`, and NIP-44 encrypt/decrypt, behind the
 > connection secret and an optional method/event-kind allowlist. It works
 > against relays that require NIP-42 authentication. It can also run in **GUI
-> mode**: it holds each request for interactive approval over a loopback API,
+> mode**: it holds each unanswered request for interactive approval over a loopback API,
 > and can create or unlock the key on first run from that same API, the key
 > never leaves the daemon. The native approval app ships with it: one download
 > brings up both.
@@ -80,8 +80,10 @@ Denied requests are answered with a NIP-46 error and logged.
 By default a request that passes the allowlist is answered immediately. Set
 `SIGNER_APPROVAL_HTTP` to instead hold each one for interactive approval: the
 daemon serves a small **loopback-only** HTTP API that a separate GUI connects
-to, so you approve or deny each request on screen. The key never leaves the
-daemon, the GUI only ever sees request metadata and sends back a yes/no.
+to, so you approve or deny on screen. An answer can stand for one request, for
+an hour, for a day, or for the rest of the session. The key never leaves the
+daemon, the GUI only ever sees request metadata and sends back a yes/no and how
+long it holds.
 
 In GUI mode the daemon can also boot **without a key** and let the GUI set one
 up on first run, so a freshly downloaded app is turnkey. It reports its key
@@ -107,8 +109,11 @@ the daemon boots straight to `unlocked`.
 The API is bound to loopback and every request must carry the bearer token
 written (mode `0600`) to `SIGNER_APPROVAL_TOKEN_FILE`. Endpoints: `GET /info`,
 `POST /setup`, `POST /unlock`, `GET /pending` (long-poll), `POST /decision`. A
-request left unanswered past the timeout is denied, and the allowlist still
-applies first, so disallowed requests are rejected without ever prompting.
+decision carries `remember`: `once` (the default), `hour`, `day` or `always`,
+and a name the daemon does not know reads as `once`, so a typo cannot quietly
+grant something forever. A request left unanswered past the timeout is denied
+and nothing is written down, and the allowlist still applies first, so
+disallowed requests are rejected without ever prompting.
 
 ## Roadmap
 

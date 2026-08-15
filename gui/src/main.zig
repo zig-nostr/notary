@@ -628,7 +628,12 @@ pub const Msg = union(enum) {
     pending: native_sdk.EffectResponse,
     decided: native_sdk.EffectResponse,
     tick: native_sdk.EffectTimer,
+    // Four answers rather than two, Amber's shape: "not now", "for a while"
+    // and "stop asking" are each one press, because a prompt with only yes and
+    // no is one people learn to hit yes on.
     approve: u64,
+    approve_day: u64,
+    approve_always: u64,
     reject: u64,
     restart,
 
@@ -753,11 +758,11 @@ fn pollPending(model: *Model, fx: *Effects) void {
     });
 }
 
-fn sendDecision(model: *Model, fx: *Effects, id: u64, approve: bool) void {
+fn sendDecision(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const u8) void {
     var url_buf: [128]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}/decision", .{model.baseUrl()}) catch return;
-    var body_buf: [64]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"decision\":\"{s}\"}}", .{ id, if (approve) "approve" else "reject" }) catch return;
+    var body_buf: [96]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"id\":{d},\"decision\":\"{s}\",\"remember\":\"{s}\"}}", .{ id, if (approve) "approve" else "reject", remember }) catch return;
     const headers = [_]std.http.Header{
         .{ .name = "authorization", .value = model.auth() },
         .{ .name = "content-type", .value = "application/json" },
@@ -1009,11 +1014,21 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         .approve => |id| {
-            sendDecision(model, fx, id, true);
+            sendDecision(model, fx, id, true, "once");
             model.removeRow(id); // optimistic; a poll re-adds it if the send failed
         },
+        .approve_day => |id| {
+            sendDecision(model, fx, id, true, "day");
+            model.removeRow(id);
+        },
+        .approve_always => |id| {
+            sendDecision(model, fx, id, true, "always");
+            model.removeRow(id);
+        },
         .reject => |id| {
-            sendDecision(model, fx, id, false);
+            // A denial lasts an hour: long enough that a rejected app cannot
+            // pester, short enough that a misclick is not permanent.
+            sendDecision(model, fx, id, false, "hour");
             model.removeRow(id);
         },
 

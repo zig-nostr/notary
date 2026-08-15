@@ -238,10 +238,24 @@ test "a populated view renders rows and dispatches typed approve/deny" {
     _ = try expectByText(tree.root, .text, "sign_event · kind 1");
     _ = try expectByText(tree.root, .status_bar, "1 pending");
 
-    // The Approve/Deny bindings carry the row id in the typed message.
-    const approve = try expectByText(tree.root, .button, "Approve");
-    switch (tree.msgForPointer(approve.id, .up).?) {
+    // Every answer carries the row id in its typed message, and each duration
+    // is its own press: no second screen between wanting to allow for a day
+    // and having done it.
+    const once = try expectByText(tree.root, .button, "Allow once");
+    switch (tree.msgForPointer(once.id, .up).?) {
         .approve => |id| try testing.expectEqual(@as(u64, 42), id),
+        else => return error.WrongMessage,
+    }
+
+    const day = try expectByText(tree.root, .button, "For a day");
+    switch (tree.msgForPointer(day.id, .up).?) {
+        .approve_day => |id| try testing.expectEqual(@as(u64, 42), id),
+        else => return error.WrongMessage,
+    }
+
+    const always = try expectByText(tree.root, .button, "Always");
+    switch (tree.msgForPointer(always.id, .up).?) {
+        .approve_always => |id| try testing.expectEqual(@as(u64, 42), id),
         else => return error.WrongMessage,
     }
 

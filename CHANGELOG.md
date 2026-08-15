@@ -7,6 +7,23 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+### Added
+- **Answers that last.** Every request was asked fresh, so a client that signs
+  in a loop asked in a loop, and a queue that never empties is a queue nobody
+  reads. An answer can now stand for the rest of the session,
+  or for a day, or just for this one request: "Allow once", "For a day", "Always" and "Deny" are each one press,
+  rather than a yes/no prompt with the durations behind a second screen.
+
+  An answer covers one client, one method and one event kind. A different kind
+  from the same client is a separate question. A denial stands for an hour, long
+  enough that a refused client cannot pester and short enough that a misclick is
+  not permanent. A request nobody answers is not written down at all: walking
+  away from the machine is not a decision, and storing silence as a refusal
+  would lock a client out over an absence.
+
+  The record lives in memory, so it lasts as long as the signer is serving and
+  is gone when it stops.
+
 ## [0.5.0] - 2026-08-15
 
 ### Added

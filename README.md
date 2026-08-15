@@ -20,7 +20,7 @@ Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
 
 | | | |
 | --- | --- | --- |
-| ![The key never arrives: it is created and held by the signer, and this window only forwards your passphrase](docs/shots/panel-setup.jpg) | ![One URL, any client: paste the bunker link into any Nostr app and you are connected](docs/shots/panel-serving.jpg) | ![Nothing signs quietly: every request names itself, and waits, before anything is signed](docs/shots/panel-request.jpg) |
+| ![The key never arrives: it is created and held by the signer, and this window only forwards your passphrase](docs/shots/panel-setup.jpg) | ![One URL, any client: paste the bunker link into any Nostr app and you are connected](docs/shots/panel-serving.jpg) | ![Nothing signs quietly: a request names itself and waits, and you say how long your answer stands](docs/shots/panel-request.jpg) |
 
 <sub>Real windows, photographed from the running app. Every pixel inside the
 window is the app's own, so nothing here shows a screen the app cannot draw. The
