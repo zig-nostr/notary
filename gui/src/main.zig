@@ -72,6 +72,7 @@ const info_key: u64 = 3;
 const pending_key: u64 = 4;
 const setup_key: u64 = 5;
 const unlock_key: u64 = 6;
+const nostrconnect_key: u64 = 11;
 const clipboard_key: u64 = 7;
 const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
 const decision_key_base: u64 = 8;
@@ -278,6 +279,12 @@ pub const Model = struct {
     /// screens. They transit this process once to reach `/setup` or `/unlock`
     /// and are cleared right after a successful send.
     passphrase_buf: canvas.TextBuffer(128) = .{},
+    /// A `nostrconnect://` link pasted in from a client that is waiting to be
+    /// adopted. Long, because it carries relays, a secret and app metadata.
+    nostrconnect_buf: canvas.TextBuffer(512) = .{},
+    nostrconnect_sending: bool = false,
+    nostrconnect_error_buf: [96]u8 = [_]u8{0} ** 96,
+    nostrconnect_error_len: usize = 0,
     secret_buf: canvas.TextBuffer(200) = .{},
     /// false: generate a fresh key; true: import an existing `nsec1…`/hex.
     import_mode: bool = false,
@@ -377,6 +384,22 @@ pub const Model = struct {
     }
 
     // -- onboarding view bindings --
+
+    pub fn nostrconnect(self: *const Model) []const u8 {
+        return self.nostrconnect_buf.text();
+    }
+    pub fn nostrconnect_disabled(self: *const Model) bool {
+        return self.nostrconnect_sending or self.nostrconnect_buf.text().len == 0;
+    }
+    pub fn nostrconnect_label(self: *const Model) []const u8 {
+        return if (self.nostrconnect_sending) "Connecting…" else "Connect";
+    }
+    pub fn nostrconnect_error(self: *const Model) []const u8 {
+        return self.nostrconnect_error_buf[0..self.nostrconnect_error_len];
+    }
+    pub fn has_nostrconnect_error(self: *const Model) bool {
+        return self.nostrconnect_error_len > 0;
+    }
 
     pub fn passphrase(self: *const Model) []const u8 {
         return self.passphrase_buf.text();
@@ -592,6 +615,11 @@ pub const Msg = union(enum) {
     // clears the transient "Copied!" confirmation.
     copy_bunker,
     bunker_copied: native_sdk.EffectClipboardResult,
+
+    // Adopting a client that showed a nostrconnect:// link.
+    nostrconnect_edit: canvas.TextInputEvent,
+    submit_nostrconnect,
+    nostrconnect_done: native_sdk.EffectResponse,
     copy_reset: native_sdk.EffectTimer,
 
     // Periodic /info re-poll (keeps the live relay status fresh) and its response.
@@ -739,6 +767,29 @@ fn sendSetup(model: *Model, fx: *Effects) void {
     };
     fx.fetch(.{ .key = setup_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.setup_done) });
     std.crypto.secureZero(u8, &body_buf);
+}
+
+/// POST /nostrconnect, adopt a client that showed a `nostrconnect://` link.
+///
+/// The link goes to the daemon whole and is parsed there, because the daemon is
+/// what holds the key and what will publish the answer. The GUI does not read
+/// it: a link is a stranger's string, and there is nothing this window could
+/// usefully decide about one that the signer does not decide better.
+fn sendNostrConnect(model: *Model, fx: *Effects) void {
+    const link = model.nostrconnect_buf.text();
+    if (link.len == 0 or model.nostrconnect_sending) return;
+    model.nostrconnect_sending = true;
+    model.nostrconnect_error_len = 0;
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}/nostrconnect", .{model.baseUrl()}) catch return;
+    var body_buf: [768]u8 = undefined;
+    const Body = struct { uri: []const u8 };
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .uri = link }, .{})}) catch return;
+    const headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = model.auth() },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    fx.fetch(.{ .key = nostrconnect_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.nostrconnect_done) });
 }
 
 /// POST /unlock, decrypt the key file with the entered passphrase.
@@ -969,6 +1020,31 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
         // -- onboarding --
         .passphrase_edit => |e| model.passphrase_buf.apply(e),
+        .nostrconnect_edit => |e| {
+            model.nostrconnect_buf.apply(e);
+            model.nostrconnect_error_len = 0;
+        },
+        .submit_nostrconnect => sendNostrConnect(model, fx),
+        .nostrconnect_done => |response| {
+            model.nostrconnect_sending = false;
+            if (response.outcome == .ok and response.status == 200) {
+                // Adopted. The field is cleared because the link is single use:
+                // the client has its answer and is not waiting any more.
+                model.nostrconnect_buf.set("");
+                model.nostrconnect_error_len = 0;
+                return;
+            }
+            const text = switch (response.status) {
+                400 => "That does not look like a nostrconnect link.",
+                409 => "Unlock your signer first.",
+                502 => "Could not reach any relay that link named.",
+                503 => "The signer is not serving yet.",
+                else => "Could not connect to that client.",
+            };
+            const n = @min(text.len, model.nostrconnect_error_buf.len);
+            @memcpy(model.nostrconnect_error_buf[0..n], text[0..n]);
+            model.nostrconnect_error_len = n;
+        },
         .secret_edit => |e| model.secret_buf.apply(e),
         .choose_create => {
             model.import_mode = false;

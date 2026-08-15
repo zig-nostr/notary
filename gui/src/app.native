@@ -19,6 +19,14 @@
           <button variant="secondary" on-press="copy_bunker">{copy_label}</button>
         </column>
       </card>
+      <text foreground="text_muted">Or paste a nostrconnect:// link a client showed you</text>
+      <row gap="8">
+        <text-field text="{nostrconnect}" placeholder="nostrconnect://…" on-input="nostrconnect_edit" on-submit="submit_nostrconnect" grow="1"/>
+        <button variant="secondary" on-press="submit_nostrconnect" disabled="{nostrconnect_disabled}">{nostrconnect_label}</button>
+      </row>
+      <if test="{has_nostrconnect_error}">
+        <text foreground="destructive">{nostrconnect_error}</text>
+      </if>
     </column>
     <separator/>
   </if>
