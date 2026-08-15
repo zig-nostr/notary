@@ -316,6 +316,8 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handleInfo(self, w);
     if (eql(method, "POST") and eql(path, "/setup"))
         return handleSetup(self, io, w, body);
+    if (eql(method, "POST") and eql(path, "/forget"))
+        return handleForget(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/nostrconnect"))
         return handleNostrConnect(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/unlock"))
@@ -466,6 +468,44 @@ fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !
         else => respond(w, 500, "{\"error\":\"could not create the key\"}"),
     };
     return respondPubkey(self, w);
+}
+
+/// What `/forget` requires in its body before it will delete anything. Typed by
+/// the reader, not clicked: this removes the only copy of a key on this Mac.
+pub const forget_confirmation = "delete my key";
+
+/// POST /forget, remove the key file so another account can be set up.
+///
+/// The destructive half of switching accounts, and the reason it is its own
+/// endpoint rather than part of signing out: signing out is reversible and this
+/// is not. The key file is the only copy of that identity here.
+///
+/// It ends the process on success, and that is not tidiness. The relay threads
+/// were handed the key by value when serving began and still hold it, so
+/// deleting the file alone would leave a signer that has lost its key on disk
+/// and is still happily signing with it in memory. Exiting is what retracts it;
+/// the GUI spawns the daemon again and it comes up with nothing to serve.
+fn handleForget(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { confirm: []const u8 = "" };
+    const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respond(w, 400, bad_request);
+    defer parsed.deinit();
+
+    if (!eql(parsed.value.confirm, forget_confirmation))
+        return respond(w, 400, "{\"error\":\"confirmation phrase does not match\"}");
+
+    // Sessions granted against the key being removed must not outlive it. A
+    // client still holding an authorization is one that would be recognised by
+    // whatever key is set up next.
+    if (self.clients) |c| c.clear();
+    self.broker.reset();
+    self.gate.forget(io);
+
+    // Answered before exiting, so the GUI is told rather than seeing its
+    // connection drop and guessing why.
+    respond(w, 200, "{\"ok\":true}") catch {};
+    w.flush() catch {};
+    std.process.exit(0);
 }
 
 /// Whether a relay URL from a `nostrconnect://` URI is one to dial.
@@ -798,4 +838,15 @@ test "a nostrconnect link cannot make the daemon dial without limit" {
     // sockets on somebody else's list.
     try testing.expect(max_nostrconnect_relays > 0);
     try testing.expect(max_nostrconnect_relays <= 8);
+}
+
+test "forgetting a key needs the exact confirmation phrase" {
+    // Typed, not clicked. This deletes the only copy of an identity on this
+    // Mac, and there is nothing on the other side of it that can undo it, so
+    // the check is an exact match rather than a truthy flag.
+    try testing.expect(eql(forget_confirmation, "delete my key"));
+    try testing.expect(!eql(forget_confirmation, ""));
+    try testing.expect(!eql(forget_confirmation, "Delete my key"));
+    try testing.expect(!eql(forget_confirmation, "delete my key "));
+    try testing.expect(!eql(forget_confirmation, "yes"));
 }

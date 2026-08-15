@@ -73,6 +73,7 @@ const pending_key: u64 = 4;
 const setup_key: u64 = 5;
 const unlock_key: u64 = 6;
 const nostrconnect_key: u64 = 11;
+const forget_key: u64 = 12;
 const clipboard_key: u64 = 7;
 const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
 const decision_key_base: u64 = 8;
@@ -285,6 +286,11 @@ pub const Model = struct {
     nostrconnect_sending: bool = false,
     nostrconnect_error_buf: [96]u8 = [_]u8{0} ** 96,
     nostrconnect_error_len: usize = 0,
+    /// Typed confirmation for removing the key file. A phrase rather than a
+    /// checkbox, because this is the one control here that destroys something.
+    forget_buf: canvas.TextBuffer(32) = .{},
+    forget_error_buf: [96]u8 = [_]u8{0} ** 96,
+    forget_error_len: usize = 0,
     secret_buf: canvas.TextBuffer(200) = .{},
     /// false: generate a fresh key; true: import an existing `nsec1…`/hex.
     import_mode: bool = false,
@@ -384,6 +390,21 @@ pub const Model = struct {
     }
 
     // -- onboarding view bindings --
+
+    pub fn forget_confirm(self: *const Model) []const u8 {
+        return self.forget_buf.text();
+    }
+    pub fn forget_disabled(self: *const Model) bool {
+        // The button is inert until the phrase matches exactly, so the
+        // destructive press cannot be a mis-click.
+        return !std.mem.eql(u8, self.forget_buf.text(), "delete my key");
+    }
+    pub fn forget_error(self: *const Model) []const u8 {
+        return self.forget_error_buf[0..self.forget_error_len];
+    }
+    pub fn has_forget_error(self: *const Model) bool {
+        return self.forget_error_len > 0;
+    }
 
     pub fn nostrconnect(self: *const Model) []const u8 {
         return self.nostrconnect_buf.text();
@@ -620,6 +641,12 @@ pub const Msg = union(enum) {
     nostrconnect_edit: canvas.TextInputEvent,
     submit_nostrconnect,
     nostrconnect_done: native_sdk.EffectResponse,
+
+    // Signing out (lock, reversible) and removing the key (not reversible).
+    sign_out,
+    forget_edit: canvas.TextInputEvent,
+    submit_forget,
+    forget_done: native_sdk.EffectResponse,
     copy_reset: native_sdk.EffectTimer,
 
     // Periodic /info re-poll (keeps the live relay status fresh) and its response.
@@ -767,6 +794,25 @@ fn sendSetup(model: *Model, fx: *Effects) void {
     };
     fx.fetch(.{ .key = setup_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.setup_done) });
     std.crypto.secureZero(u8, &body_buf);
+}
+
+/// POST /forget, remove the key file so another account can be set up.
+///
+/// The daemon answers and then exits, because its relay threads still hold the
+/// key it just deleted. The response handler spawns it again.
+fn sendForget(model: *Model, fx: *Effects) void {
+    if (model.forget_disabled()) return;
+    model.forget_error_len = 0;
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}/forget", .{model.baseUrl()}) catch return;
+    var body_buf: [128]u8 = undefined;
+    const Body = struct { confirm: []const u8 };
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .confirm = model.forget_buf.text() }, .{})}) catch return;
+    const headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = model.auth() },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    fx.fetch(.{ .key = forget_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.forget_done) });
 }
 
 /// POST /nostrconnect, adopt a client that showed a `nostrconnect://` link.
@@ -1025,6 +1071,49 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.nostrconnect_error_len = 0;
         },
         .submit_nostrconnect => sendNostrConnect(model, fx),
+
+        .sign_out => {
+            // A restart IS the sign out. The relay threads were handed the key
+            // by value when serving began, so nothing short of ending the
+            // process takes it back; the daemon then comes up locked and asks
+            // for the passphrase. Doing it any other way would leave a signer
+            // that reports itself signed out and still signs.
+            if (!model.managed) return;
+            model.setAuth("");
+            model.clearRows();
+            model.clearSecrets();
+            model.clearOnboardError();
+            model.submitting = false;
+            spawnDaemon(model, fx);
+            attemptConnect(model, fx);
+        },
+        .forget_edit => |e| {
+            model.forget_buf.apply(e);
+            model.forget_error_len = 0;
+        },
+        .submit_forget => sendForget(model, fx),
+        .forget_done => |response| {
+            if (response.outcome == .ok and response.status == 200) {
+                // The daemon deletes the key and exits, so what follows is a
+                // fresh one with nothing to serve: it will come up asking to
+                // create or import.
+                model.forget_buf.set("");
+                model.forget_error_len = 0;
+                model.setAuth("");
+                model.clearRows();
+                model.clearSecrets();
+                spawnDaemon(model, fx);
+                attemptConnect(model, fx);
+                return;
+            }
+            const text = if (response.status == 400)
+                "Type the phrase exactly to confirm."
+            else
+                "Could not remove the key.";
+            const n = @min(text.len, model.forget_error_buf.len);
+            @memcpy(model.forget_error_buf[0..n], text[0..n]);
+            model.forget_error_len = n;
+        },
         .nostrconnect_done => |response| {
             model.nostrconnect_sending = false;
             if (response.outcome == .ok and response.status == 200) {

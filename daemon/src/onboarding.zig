@@ -148,6 +148,25 @@ pub const Gate = struct {
         return self.secret_key;
     }
 
+    /// Removes the key file and returns to `uninitialized`, so the next boot
+    /// onboards a fresh key.
+    ///
+    /// This is the destructive half of switching accounts, and the key file is
+    /// the only copy of that identity on this Mac. Callers must have said so to
+    /// the reader FIRST; nothing here can un-delete it.
+    ///
+    /// The in-memory key is zeroed too, but that is not the whole story and the
+    /// caller has to finish it: the relay threads were handed the key by value
+    /// when serving started and still hold it. Ending the process is what
+    /// actually retracts it, which is why the endpoint that calls this exits.
+    pub fn forget(self: *Gate, io: std.Io) void {
+        self.dir.deleteFile(io, self.key_file) catch {};
+        std.crypto.secureZero(u8, &self.secret_key);
+        self.pubkey_bytes = [_]u8{0} ** 32;
+        self.pubkey_len = 0;
+        self.state.store(@intFromEnum(State.uninitialized), .release);
+    }
+
     fn publish(self: *Gate, kp: keys.KeyPair) void {
         self.secret_key = kp.secret_key;
         self.pubkey_bytes = kp.public_key;

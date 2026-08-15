@@ -27,6 +27,10 @@
       <if test="{has_nostrconnect_error}">
         <text foreground="destructive">{nostrconnect_error}</text>
       </if>
+      <row gap="8">
+        <button variant="secondary" on-press="sign_out">Sign out</button>
+        <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this Mac and needs its passphrase again.</text>
+      </row>
     </column>
     <separator/>
   </if>
@@ -78,6 +82,15 @@
         <text foreground="destructive">{onboard_error}</text>
       </if>
       <button variant="primary" on-press="submit_unlock" disabled="{submit_disabled}">{unlock_label}</button>
+      <separator/>
+      <text foreground="text_muted" wrap="true">Signing in as somebody else removes this key from this Mac. It is the only copy here, so make sure you have its nsec written down first. Type "delete my key" to confirm.</text>
+      <row gap="8">
+        <text-field text="{forget_confirm}" placeholder="delete my key" on-input="forget_edit" grow="1"/>
+        <button variant="destructive" on-press="submit_forget" disabled="{forget_disabled}">Use another key</button>
+      </row>
+      <if test="{has_forget_error}">
+        <text foreground="destructive">{forget_error}</text>
+      </if>
     </column>
   </if>
   <if test="{show_empty}">
