@@ -72,6 +72,10 @@ const usage =
     \\                         (default: any kind)
     \\  SIGNER_INIT            if set, create/import an encrypted key file and exit
     \\
+    \\Subcommands:
+    \\  import                 paste an existing nsec, read from the terminal
+    \\                         with echo off, and store it encrypted at rest
+    \\
     \\Provide the key either as an encrypted file (SIGNER_KEY_FILE +
     \\SIGNER_PASSPHRASE, recommended) or as SIGNER_SECRET_KEY (dev only). To create
     \\an encrypted file, run once with SIGNER_INIT set plus SIGNER_KEY_FILE and
@@ -85,6 +89,19 @@ const usage =
 
 pub fn main(init: std.process.Init) !void {
     const gpa = std.heap.page_allocator;
+
+    // `signer import`: the strongest way in, and the reason it is a subcommand
+    // rather than another environment variable. `SIGNER_INIT` below takes the
+    // key from `SIGNER_SECRET_KEY`, which means it sits in the environment, in
+    // shell history, and in `ps` output for anyone on the machine to read.
+    // This reads it from the terminal with echo off instead.
+    {
+        var sub_args = std.process.Args.Iterator.init(init.minimal.args);
+        _ = sub_args.skip(); // argv[0]
+        if (sub_args.next()) |sub| {
+            if (std.mem.eql(u8, sub, "import")) runImport(gpa);
+        }
+    }
 
     // `SIGNER_INIT` bootstraps an encrypted key file at rest, then exits.
     if (getEnv("SIGNER_INIT") != null) runInit(gpa);
@@ -476,6 +493,106 @@ fn loadSecretKey(gpa: std.mem.Allocator) [32]u8 {
 /// Creates the encrypted-at-rest key file and exits. Imports `SIGNER_SECRET_KEY`
 /// if present (marked known-insecure, since it was plaintext in the environment),
 /// otherwise generates a fresh key. Refuses to overwrite an existing file.
+// ---------------------------------------------------------------- import CLI
+//
+// `signer import`: paste an existing nsec and Notary takes it over, encrypted
+// at rest like any key it made itself.
+//
+// The key is read from the terminal with echo off (or from stdin when piped),
+// so it never reaches an argument, the environment, the clipboard or the
+// screen. A key given as an argument would be in shell history and visible in
+// `ps` to every process on the machine, which is why this refuses to take one
+// that way at all.
+//
+// If Notary is already running, the key is handed to it over the loopback API
+// so it picks it up live; otherwise it is written for the next launch to find.
+
+fn runImport(gpa: std.mem.Allocator) noreturn {
+    var startup = std.Io.Threaded.init(gpa, .{});
+    defer startup.deinit();
+    const io = startup.io();
+
+    var input_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &input_buf);
+    const input = readSecretLine("Paste your nsec (input hidden): ", &input_buf) orelse fail("no key read");
+    if (input.len == 0) fail("nothing pasted");
+    if (!std.mem.startsWith(u8, input, "nsec1") and input.len != 64) {
+        fail("paste an nsec1... key, or 64 hex characters");
+    }
+
+    // Notary encrypts at rest, always, so the passphrase is not optional the
+    // way it is for an app that keeps a raw key. Asked twice because a typo
+    // here is not recoverable: the file it encrypts cannot be opened again.
+    var pass_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &pass_buf);
+    const passphrase = readSecretLine("Passphrase to encrypt it with: ", &pass_buf) orelse fail("no passphrase");
+    if (passphrase.len == 0) fail("a passphrase is required");
+
+    var again_buf: [256]u8 = undefined;
+    defer std.crypto.secureZero(u8, &again_buf);
+    const again = readSecretLine("Again: ", &again_buf) orelse fail("no passphrase");
+    if (!std.mem.eql(u8, passphrase, again)) fail("the two passphrases do not match");
+
+    const key_file = getEnv("SIGNER_KEY_FILE") orelse resolveHome(gpa, default_key_file);
+
+    // Written for the next launch, never handed to a running Notary, and that
+    // is deliberate rather than a shortcut. The daemon binds an EPHEMERAL port
+    // and tells only the GUI that spawned it which one, so that another process
+    // running as this user cannot find the control channel by guessing. A CLI
+    // that could reach it would need that port published somewhere readable,
+    // which is exactly the property being protected. So this writes the file
+    // and the reader restarts Notary, which costs a relaunch and gives up
+    // nothing.
+    const initial: onboarding.State = if (fileExists(io, key_file)) .locked else .uninitialized;
+    var gate = onboarding.Gate.init(gpa, std.Io.Dir.cwd(), key_file, initial);
+    gate.setup(io, passphrase, input) catch |err| switch (err) {
+        error.AlreadyInitialized => fail("a key is already set up (remove it in Notary first)"),
+        error.InvalidSecretKey => fail("that is not a valid nostr secret key"),
+        else => failFmt("could not store the key: {s}", .{@errorName(err)}),
+    };
+    std.debug.print("Imported. Start Notary (or restart it) to use it.\n", .{});
+    std.process.exit(0);
+}
+
+/// Reads ONE secret line. On a terminal echo is off, so nothing is shown; when
+/// stdin is a pipe it takes exactly one line and leaves the rest. The slice
+/// points into `buf`, which the caller zeroes.
+///
+/// A byte at a time, because this is asked three times in a row and a plain
+/// `read` into a big buffer takes whatever the pipe has: the first call would
+/// swallow the key AND both passphrases, and the second would find nothing
+/// left. A terminal hides that (canonical mode hands over one line per read),
+/// so it only shows up when the input is piped, which is exactly how a script
+/// would drive this.
+fn readSecretLine(prompt: []const u8, buf: []u8) ?[]const u8 {
+    const stdin_fd: std.posix.fd_t = 0;
+    // tcgetattr succeeds only on a terminal, and a pipe returns an error: that
+    // is how this tells interactive from piped without a separate isatty.
+    const restore: ?std.posix.termios = std.posix.tcgetattr(stdin_fd) catch null;
+    if (restore) |base| {
+        std.debug.print("{s}", .{prompt});
+        var quiet = base;
+        quiet.lflag.ECHO = false;
+        std.posix.tcsetattr(stdin_fd, .NOW, quiet) catch {};
+    }
+    defer if (restore) |base| {
+        std.posix.tcsetattr(stdin_fd, .NOW, base) catch {};
+        std.debug.print("\n", .{});
+    };
+
+    var len: usize = 0;
+    while (len < buf.len) {
+        var one: [1]u8 = undefined;
+        const n = std.posix.read(stdin_fd, &one) catch return null;
+        if (n == 0) break; // end of input: whatever was read is the line
+        if (one[0] == '\n') break;
+        buf[len] = one[0];
+        len += 1;
+    }
+    if (len == 0) return null;
+    return std.mem.trim(u8, buf[0..len], " \t\r");
+}
+
 fn runInit(gpa: std.mem.Allocator) noreturn {
     const path = getEnv("SIGNER_KEY_FILE") orelse
         fail("SIGNER_INIT requires SIGNER_KEY_FILE (path to write the encrypted key to)");

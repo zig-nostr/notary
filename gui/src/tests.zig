@@ -475,3 +475,43 @@ test "the destructive key removal is inert until the phrase matches exactly" {
     main.update(&m, main.Msg{ .forget_done = .{ .key = 12, .outcome = .ok, .status = 400, .body = "" } }, undefined);
     try testing.expect(m.has_forget_error());
 }
+
+test "the way out of a key is folded away until it is asked for" {
+    // The opening screen used to lead with a box telling the reader to type
+    // "delete my key", which is a strange first thing to show somebody who
+    // only wants to unlock their signer.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.phase = .needs_unlock;
+
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        // One red button, and none of the machinery behind it.
+        const opener = try expectByText(tree.root, .button, "Use another key");
+        switch (tree.msgForPointer(opener.id, .up).?) {
+            .reveal_forget => {},
+            else => return error.WrongMessage,
+        }
+        try testing.expect(findByText(tree.root, .button, "Remove this key") == null);
+    }
+
+    // Asked for: the warning, the phrase to type, and a way back out.
+    model.forget_showing = true;
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        _ = try expectByText(tree.root, .button, "Remove this key");
+        const cancel = try expectByText(tree.root, .button, "Cancel");
+        switch (tree.msgForPointer(cancel.id, .up).?) {
+            .cancel_forget => {},
+            else => return error.WrongMessage,
+        }
+    }
+
+    // The button stays inert until the phrase is exact, revealed or not:
+    // folding it away is the first of two guards, not a replacement for one.
+    try testing.expect(model.forget_disabled());
+    model.forget_buf.set("delete my key");
+    try testing.expect(!model.forget_disabled());
+}
