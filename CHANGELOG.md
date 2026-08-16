@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-08-16
+
 ### Added
 - **The terminal import is offered in the window.** `signer import` shipped last
   release and nothing in the app mentioned it, so the only way in that anybody
