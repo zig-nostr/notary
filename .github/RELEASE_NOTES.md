@@ -1,16 +1,18 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.6.0
+### What's new in v0.7.0
 
-**Notary remembers what you said.** It used to ask about every single request, forever. A client that signs in a loop asked in a loop, and a queue that never empties is a queue you stop reading, which is the opposite of what an approval screen is for.
+**You can hand Notary a key from the terminal.** Until now the only way in was the setup screen, which means your nsec goes through a window and usually the clipboard on its way. There is a command now:
 
-An answer now lasts as long as you say: **Allow once**, **For a day**, **Always**, or **Deny**. Four buttons, one press each, rather than a yes/no prompt with the durations hidden somewhere else. A prompt that only offers yes and no is one people learn to hit yes on.
+```sh
+/Applications/Notary.app/Contents/MacOS/signer import
+```
 
-**What an answer covers.** One app, one thing it asked for, one kind of note. Saying "always" to an app posting notes does not let it encrypt your messages, and it does not carry over to a different app. Deny lasts an hour: long enough that a refused app cannot sit there pestering you, short enough that a wrong tap is not permanent.
+It asks for your nsec and a passphrase without showing what you type, and stores the key encrypted exactly as it stores one it generated itself. It will not take a key as an argument, on purpose: a key on a command line ends up in your shell history and is visible to every other program running as you.
 
-**A question you never answered is not an answer.** If you were away from the machine and a request timed out, the app is refused for that request and nothing is written down. Walking away is not a decision, and storing it as a refusal would lock an app out over an absence.
+It writes the key for the next launch rather than handing it to a running Notary, so import first and then open it. That is not a shortcut. Notary's approval channel listens on a port that only the app itself knows, and a command able to reach it would need that port published somewhere anything could read.
 
-Notary holds all this in memory, so it lasts as long as the signer is running and is gone when you quit.
+**Opening Notary no longer leads with "delete my key".** The unlock screen showed a box asking you to type that phrase, every time, under the passphrase field. It is behind a red **Use another key** button now. Typing the phrase is still required once you get there, and cancelling clears what you typed.
 
 ### Install
 

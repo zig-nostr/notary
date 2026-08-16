@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-08-16
+
 ### Added
 - **`signer import`.** A key could only come in through the app's own setup
   screen, which means it goes through the window before it reaches the signer.
