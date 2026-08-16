@@ -289,6 +289,9 @@ pub const Model = struct {
     /// Typed confirmation for removing the key file. A phrase rather than a
     /// checkbox, because this is the one control here that destroys something.
     forget_buf: canvas.TextBuffer(32) = .{},
+    /// Whether the reader has asked to see the way out of this key. Folded away
+    /// on every launch: this is not a thing to be one keystroke from.
+    forget_showing: bool = false,
     forget_error_buf: [96]u8 = [_]u8{0} ** 96,
     forget_error_len: usize = 0,
     secret_buf: canvas.TextBuffer(200) = .{},
@@ -393,6 +396,18 @@ pub const Model = struct {
 
     pub fn forget_confirm(self: *const Model) []const u8 {
         return self.forget_buf.text();
+    }
+    /// Whether the unlock screen is showing the way OUT of this key.
+    ///
+    /// Folded away by default. It used to sit open under the passphrase field,
+    /// so the first thing anybody saw on opening Notary was a box telling them
+    /// to type "delete my key", which is a strange thing for an app to lead
+    /// with when all the reader wants is to unlock it.
+    pub fn forget_open(self: *const Model) bool {
+        return self.forget_showing;
+    }
+    pub fn forget_closed(self: *const Model) bool {
+        return !self.forget_showing;
     }
     pub fn forget_disabled(self: *const Model) bool {
         // The button is inert until the phrase matches exactly, so the
@@ -650,6 +665,8 @@ pub const Msg = union(enum) {
     // Signing out (lock, reversible) and removing the key (not reversible).
     sign_out,
     forget_edit: canvas.TextInputEvent,
+    reveal_forget,
+    cancel_forget,
     submit_forget,
     forget_done: native_sdk.EffectResponse,
     copy_reset: native_sdk.EffectTimer,
@@ -1104,6 +1121,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
         .forget_edit => |e| {
             model.forget_buf.apply(e);
+            model.forget_error_len = 0;
+        },
+        .reveal_forget => model.forget_showing = true,
+        .cancel_forget => {
+            // Anything half-typed goes with it, so re-opening starts from the
+            // beginning rather than one keystroke from removing the key.
+            model.forget_showing = false;
+            model.forget_buf.set("");
             model.forget_error_len = 0;
         },
         .submit_forget => sendForget(model, fx),

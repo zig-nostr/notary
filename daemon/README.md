@@ -102,6 +102,23 @@ SIGNER_APPROVAL_HTTP="127.0.0.1:8787" \
   zig build run
 ```
 
+### Importing a key you already have
+
+```sh
+signer import
+```
+
+It asks for your nsec and a passphrase, with echo off, and writes the key
+encrypted at rest (NIP-49, mode 0600). Nothing is taken as an argument: a key on
+a command line is in your shell history and visible in `ps` to every process on
+the machine.
+
+It writes the file for the next launch rather than handing the key to a running
+Notary. The daemon binds an ephemeral port and tells only the app that spawned
+it which one, so there is nothing for a separate command to connect to, and
+publishing that port for the sake of this would give up the property that
+protects the control channel. So: import, then start (or restart) Notary.
+
 You can still preconfigure the key instead of onboarding it, set
 `SIGNER_KEY_FILE` + `SIGNER_PASSPHRASE` (or the dev-only `SIGNER_SECRET_KEY`) and
 the daemon boots straight to `unlocked`.

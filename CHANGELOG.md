@@ -7,6 +7,27 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+### Added
+- **`signer import`.** A key could only come in through the app's own setup
+  screen, which means it goes through the window before it reaches the signer.
+  Pasting it into a terminal instead keeps it out of the app: echo is off, and
+  it is never an argument, so it is not in shell history and not visible in `ps`
+  to anything else running as you. Notary stores it encrypted at rest like a key
+  it generated itself.
+
+  It writes the file for the next launch rather than handing the key to a
+  running Notary. The daemon binds an ephemeral port and tells only the app that
+  spawned it which one; a command that could reach it would need that port
+  published somewhere readable, which is exactly what keeps another process on
+  the machine away from the control channel.
+
+### Changed
+- **The way out of a key is folded away.** Opening Notary to unlock it led with
+  a box telling you to type "delete my key", which is a strange first thing to
+  show somebody who only wants their passphrase field. It is behind a red "Use
+  another key" button now. The typed confirmation is unchanged and still exact:
+  folding it away is one guard, not a replacement for the other.
+
 ## [0.6.0] - 2026-08-16
 
 ### Added

@@ -83,13 +83,19 @@
       </if>
       <button variant="primary" on-press="submit_unlock" disabled="{submit_disabled}">{unlock_label}</button>
       <separator/>
-      <text foreground="text_muted" wrap="true">Signing in as somebody else removes this key from this Mac. It is the only copy here, so make sure you have its nsec written down first. Type "delete my key" to confirm.</text>
-      <row gap="8">
-        <text-field text="{forget_confirm}" placeholder="delete my key" on-input="forget_edit" grow="1"/>
-        <button variant="destructive" on-press="submit_forget" disabled="{forget_disabled}">Use another key</button>
-      </row>
-      <if test="{has_forget_error}">
-        <text foreground="destructive">{forget_error}</text>
+      <if test="{forget_closed}">
+        <button variant="destructive" on-press="reveal_forget">Use another key</button>
+      </if>
+      <if test="{forget_open}">
+        <text foreground="text_muted" wrap="true">Signing in as somebody else removes this key from this Mac. It is the only copy here, so make sure you have its nsec written down first. Type "delete my key" to confirm.</text>
+        <row><text-field text="{forget_confirm}" placeholder="delete my key" on-input="forget_edit" grow="1"/></row>
+        <row gap="8">
+          <button grow="1" on-press="cancel_forget">Cancel</button>
+          <button variant="destructive" grow="1" on-press="submit_forget" disabled="{forget_disabled}">Remove this key</button>
+        </row>
+        <if test="{has_forget_error}">
+          <text foreground="destructive">{forget_error}</text>
+        </if>
       </if>
     </column>
   </if>
