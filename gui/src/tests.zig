@@ -180,9 +180,12 @@ test "the empty view shows the connection status and a zero count" {
     var model = main.initialModel(); // .connecting, empty queue
     const tree = try buildTree(arena_state.allocator(), &model);
 
-    _ = try expectByText(tree.root, .text, "Notary");
-    _ = try expectByText(tree.root, .text, "Connecting to the signer…");
-    _ = try expectByText(tree.root, .status_bar, "0 pending");
+    // ONE status line, and it is the status bar. The header block that used to
+    // repeat the app's name above the phase above the key is gone: four lines
+    // of chrome in a small window, three of them saying nothing after the first
+    // second, and the name was already in the title bar.
+    _ = try expectByText(tree.root, .status_bar, "Connecting to the signer…");
+    try testing.expect(findByText(tree.root, .text, "Notary") == null);
 }
 
 test "an approval row says who is asking and what would be signed" {
@@ -318,7 +321,7 @@ test "the daemon-stopped view offers a restart" {
     model.phase = .daemon_exited; // as set when the daemon child exits
     const tree = try buildTree(arena_state.allocator(), &model);
 
-    _ = try expectByText(tree.root, .text, "Signer stopped");
+    _ = try expectByText(tree.root, .status_bar, "Signer stopped");
     _ = try expectByText(tree.root, .text, "The signer process stopped.");
 
     const restart = try expectByText(tree.root, .button, "Restart signer");
@@ -514,4 +517,62 @@ test "the way out of a key is folded away until it is asked for" {
     try testing.expect(model.forget_disabled());
     model.forget_buf.set("delete my key");
     try testing.expect(!model.forget_disabled());
+}
+
+test "the terminal path is offered beside the paste field, not instead of it" {
+    // The nsec goes through this window and the clipboard when it is pasted
+    // here. The terminal takes it without either, so the command is offered
+    // rather than hidden, exactly as Plaza's own key window offers it.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.phase = .needs_setup;
+
+    // Creating a key has nothing to bring in, so the card stays away.
+    model.import_mode = false;
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        try testing.expect(findByText(tree.root, .button, "Copy") == null);
+    }
+
+    model.import_mode = true;
+    {
+        const tree = try buildTree(arena_state.allocator(), &model);
+        const copy = try expectByText(tree.root, .button, "Copy");
+        switch (tree.msgForPointer(copy.id, .up).?) {
+            .copy_command => {},
+            else => return error.WrongMessage,
+        }
+        // The command names the INSTALLED binary. A path derived from argv[0]
+        // would be right in development and wrong for everybody else.
+        _ = try expectByText(tree.root, .text, "/Applications/Notary.app/Contents/MacOS/signer import");
+        // And it says to reopen, because the import writes the key for the next
+        // launch rather than handing it to a daemon it cannot reach.
+        _ = try expectByText(tree.root, .text, "Run it, then reopen Notary to pick the key up.");
+    }
+}
+
+test "one status line, and it says the phase before there is a queue to count" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Onboarding: the phase is the whole story, and there is no queue.
+    var m = Model{};
+    m.phase = .needs_unlock;
+    try testing.expectEqualStrings("Locked", m.footer(arena));
+
+    // Serving: the key and the count, on one line rather than three.
+    m.phase = .connected;
+    main.parseInfo(&m, "{\"state\":\"unlocked\",\"pubkey\":\"aabbccddeeff00112233445566778899\"}");
+    const line = m.footer(arena);
+    try testing.expect(std.mem.startsWith(u8, line, "signer "));
+    try testing.expect(std.mem.endsWith(u8, line, "0 pending"));
+
+    // Serving before the daemon has said who it is: the count alone, never
+    // "signer not connected" sitting beside a live queue.
+    var fresh = Model{};
+    fresh.phase = .connected;
+    try testing.expectEqualStrings("0 pending", fresh.footer(arena));
 }

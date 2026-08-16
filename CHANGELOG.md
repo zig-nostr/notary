@@ -7,6 +7,24 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+### Added
+- **The terminal import is offered in the window.** `signer import` shipped last
+  release and nothing in the app mentioned it, so the only way in that anybody
+  could see was the one that puts an nsec through a text field and usually the
+  clipboard. The setup screen now shows the command beside the paste field, with
+  a button to copy it, the same way Plaza's key window has always offered it.
+
+### Changed
+- **One status line instead of four.** The window opened with its own name above
+  the phase above the key, and then counted the queue again at the bottom. That
+  is four lines of chrome in a small window, three of which said nothing after
+  the first second, and the app's name was already in the title bar. The body
+  starts at the top now and there is a single status line at the bottom: the
+  phase while onboarding, the key and the queue count once serving.
+
+  The setup screen also scrolls, so a taller state cannot paint underneath the
+  status bar the way the import branch did.
+
 ## [0.7.0] - 2026-08-16
 
 ### Added

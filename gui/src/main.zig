@@ -56,6 +56,14 @@ const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
 // ------------------------------------------------------------- config
 
 const default_address = "127.0.0.1:8787";
+
+/// The command that takes a key without it passing through this window.
+///
+/// The installed path, not one derived from argv[0]: a reader looking at this
+/// is going to retype or paste it into a terminal, and the answer has to be
+/// right for the app they installed rather than for wherever this binary
+/// happens to be running from during development.
+const import_command = "/Applications/Notary.app/Contents/MacOS/signer import";
 const default_token_file = ".zig-nostr-signer.token";
 
 // Effect keys. Fetch/spawn/file effects share one key space and 16 slots; the
@@ -75,6 +83,9 @@ const unlock_key: u64 = 6;
 const nostrconnect_key: u64 = 11;
 const forget_key: u64 = 12;
 const clipboard_key: u64 = 7;
+/// Its own effect key: two clipboard writes under one key would have the second
+/// rejected while the first is still in flight.
+const command_clipboard_key: u64 = 17;
 const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
 const decision_key_base: u64 = 8;
 const decision_key_slots: u64 = 8;
@@ -297,6 +308,10 @@ pub const Model = struct {
     secret_buf: canvas.TextBuffer(200) = .{},
     /// false: generate a fresh key; true: import an existing `nsec1…`/hex.
     import_mode: bool = false,
+    /// Whether the terminal command is on the clipboard, for the button's own
+    /// confirmation. Separate from `copied`, which belongs to the bunker URL:
+    /// one flag for two buttons would light both.
+    command_copied: bool = false,
     /// Managed mode: whether the daemon has told us which port it bound.
     ///
     /// It binds port 0 and reports what the kernel gave it, because a fixed
@@ -387,12 +402,42 @@ pub const Model = struct {
     }
 
     /// Footer text: the pending count while serving, nothing during onboarding.
+    /// The app's ONE status line.
+    ///
+    /// There used to be a header block carrying the name, the phase and the key
+    /// on three separate lines, above a status bar counting the queue. Four
+    /// lines of chrome in a 460x560 window, three of which said nothing after
+    /// the first second, and the app's own name told the reader nothing the
+    /// title bar had not already said. Now there is one line, at the bottom,
+    /// and the body starts at the top of the window.
     pub fn footer(self: *const Model, arena: std.mem.Allocator) []const u8 {
-        if (self.onboarding_body()) return "";
-        return std.fmt.allocPrint(arena, "{d} pending", .{self.rows_len}) catch "";
+        // While onboarding, the phase IS the whole story and there is no queue
+        // to count: the screen already says what it wants.
+        if (self.onboarding_body()) return self.status();
+        if (self.phase != .connected) return self.status();
+        // No key yet means the daemon has not answered /info; the count alone
+        // is the honest line, rather than "signer not connected" beside a queue.
+        if (self.pubkey_len == 0) return std.fmt.allocPrint(arena, "{d} pending", .{self.rows_len}) catch "";
+        const key = self.pubkey_short(arena);
+        return std.fmt.allocPrint(arena, "signer {s} · {d} pending", .{ key, self.rows_len }) catch "";
     }
 
     // -- onboarding view bindings --
+
+    pub fn import_command_text(self: *const Model) []const u8 {
+        _ = self;
+        return import_command;
+    }
+    /// "Copy", or the confirmation, on the terminal card's own button.
+    pub fn command_copy_label(self: *const Model) []const u8 {
+        return if (self.command_copied) "Copied!" else "Copy";
+    }
+    /// The card belongs to the import branch of setup, not to creating a key:
+    /// there is nothing to bring in from a terminal when the signer is about to
+    /// mint one.
+    pub fn show_terminal_import(self: *const Model) bool {
+        return self.phase == .needs_setup and self.import_mode;
+    }
 
     pub fn forget_confirm(self: *const Model) []const u8 {
         return self.forget_buf.text();
@@ -655,6 +700,8 @@ pub const Msg = union(enum) {
     // Copy the bunker:// URI to the clipboard, its result, and the timer that
     // clears the transient "Copied!" confirmation.
     copy_bunker,
+    copy_command,
+    command_copied_result: native_sdk.EffectClipboardResult,
     bunker_copied: native_sdk.EffectClipboardResult,
 
     // Adopting a client that showed a nostrconnect:// link.
@@ -1060,6 +1107,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             attemptConnect(model, fx);
         },
 
+        .copy_command => fx.writeClipboard(.{
+            .key = command_clipboard_key,
+            .text = import_command,
+            .on_result = Effects.clipboardMsg(.command_copied_result),
+        }),
+        .command_copied_result => |result| {
+            if (result.outcome != .ok) return;
+            model.command_copied = true;
+        },
         .copy_bunker => {
             const uri = model.bunker();
             if (uri.len == 0) return;

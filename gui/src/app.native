@@ -1,15 +1,9 @@
-<!-- Notary, the live view. The header shows the connection state
-     and which key you are approving for; the body is one of several mutually
-     exclusive states (signer stopped / first-run setup / unlock / no requests /
-     the request queue); the status bar counts the queue. Logic is in
-     src/main.zig. Validate with: native check -->
+<!-- Notary, the live view. The body is one of several mutually exclusive
+     states (signer stopped / first-run setup / unlock / no requests / the
+     request queue) and starts at the top of the window; the ONE status line
+     lives in the status bar and carries the phase, or the key and the queue
+     count once serving. Logic is in src/main.zig. Validate with: native check -->
 <column gap="0">
-  <column gap="4" padding="16">
-    <text size="heading">Notary</text>
-    <text>{status}</text>
-    <text>signer {pubkey_short}</text>
-  </column>
-  <separator/>
   <if test="{show_bunker}">
     <column gap="6" padding="16">
       <text foreground="text_muted">Bunker URL: paste into your Nostr client to connect</text>
@@ -56,6 +50,11 @@
     </column>
   </if>
   <if test="{needs_setup}">
+    <!-- Scrolls, because the import branch is taller than the create branch and
+         a column that overflows still lays its children out and still paints
+         them: the terminal card's last line went under the footer band. Height
+         is not something to keep measuring by hand. -->
+    <scroll grow="1">
     <column gap="12" grow="1" padding="20">
       <text size="heading">Set up your signer</text>
       <text wrap="true">Create a new key, or import one you already have. The key is generated and stored by the signer itself. This app only sends the passphrase.</text>
@@ -71,7 +70,20 @@
         <text foreground="destructive">{onboard_error}</text>
       </if>
       <button variant="primary" on-press="submit_setup" disabled="{submit_disabled}">{setup_label}</button>
+      <if test="{show_terminal_import}">
+        <card padding="12">
+          <column gap="8">
+            <row gap="8" cross="center">
+              <text foreground="text_muted" grow="1" wrap="true">Prefer the terminal? Nothing is pasted anywhere:</text>
+              <button variant="secondary" on-press="copy_command">{command_copy_label}</button>
+            </row>
+            <text wrap="true">{import_command_text}</text>
+            <text foreground="text_muted" wrap="true">Run it, then reopen Notary to pick the key up.</text>
+          </column>
+        </card>
+      </if>
     </column>
+    </scroll>
   </if>
   <if test="{needs_unlock}">
     <column gap="12" grow="1" padding="20">
