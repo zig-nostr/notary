@@ -8,7 +8,10 @@ signs for your apps over
 never leaves the signer, and nothing gets signed quietly: you see what a client
 is asking for before it happens.
 
-Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr).
+Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr), and the signer
+behind [Plaza](https://github.com/zig-nostr/plaza), the native client in the same
+ecosystem. Nothing here is tied to it: the `bunker://` URL works in any NIP-46
+client, and Notary neither knows nor cares which one is asking.
 
 > **Status: early / work in progress.** The signer works end-to-end over public
 > relays, including those that require NIP-42 authentication. Downloads are
