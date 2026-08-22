@@ -57,7 +57,7 @@
     <scroll grow="1">
     <column gap="12" grow="1" padding="20">
       <text size="heading">Set up your signer</text>
-      <text wrap="true">Create a new key, or import one you already have. The key is generated and stored by the signer itself. This app only sends the passphrase.</text>
+      <text wrap="true">Create a new key, or import one you already have. The key is generated and stored by the signer itself. Creating one sends only your passphrase; importing sends the key you paste.</text>
       <row gap="8">
         <toggle-button selected="{create_selected}" on-press="choose_create" grow="1">Create new</toggle-button>
         <toggle-button selected="{import_selected}" on-press="choose_import" grow="1">Import existing</toggle-button>

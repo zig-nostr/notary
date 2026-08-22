@@ -576,3 +576,22 @@ test "one status line, and it says the phase before there is a queue to count" {
     fresh.phase = .connected;
     try testing.expectEqualStrings("0 pending", fresh.footer(arena));
 }
+
+test "the app declares the filesystem permission it needs to read the token" {
+    // Regression guard. SDK 0.9.1 began confining raw file effects to the app's
+    // own directories unless `filesystem` is declared. The GUI reads the
+    // daemon's bearer token from $HOME, which is outside every one of them, so
+    // without this permission `fx.readFile` is REJECTED SILENTLY: `.token_read`
+    // arrives as `.rejected`, the retry arms, the phase never leaves
+    // `.connecting`, and the app sits on "Connecting to the signer…" forever
+    // looking exactly like a network fault. It shipped working only because the
+    // release pinned an older CLI, and nothing here caught it, because every
+    // check passes on an app that cannot reach its own daemon.
+    //
+    // `native check`, `native test` and `native build` all pass without it, so
+    // this test is the only thing standing between that bug and a release.
+    try testing.expect(native_sdk.security.hasPermission(
+        &main.app_permissions,
+        native_sdk.security.permission_filesystem,
+    ));
+}

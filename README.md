@@ -25,7 +25,7 @@ client, and Notary neither knows nor cares which one is asking.
 
 | | | |
 | --- | --- | --- |
-| ![Your key is created and held by the signer: this window forwards a passphrase, or the nsec you choose to import](docs/shots/panel-setup.jpg) | ![One URL, any client: paste the bunker link into any Nostr app and you are connected](docs/shots/panel-serving.jpg) | ![Nothing signs quietly: a request names itself and waits, and you say how long your answer stands](docs/shots/panel-request.jpg) |
+| ![Your key is created and held by the signer: this window forwards a passphrase, or the nsec you choose to import](docs/shots/panel-setup.jpg) | ![One URL, any client: paste the bunker link into any Nostr app and you are connected](docs/shots/panel-serving.jpg) | ![Nothing signs unseen: a request names who is asking and what it would sign, and waits for allow once, for a day, always, or deny](docs/shots/panel-request.jpg) |
 
 <sub>Real windows, photographed from the running app. Every pixel inside the
 window is the app's own, so nothing here shows a screen the app cannot draw. The

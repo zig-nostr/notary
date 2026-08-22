@@ -39,7 +39,14 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 460;
 const window_height: f32 = 560;
 
-const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard };
+// `filesystem` is what lets the GUI read the daemon's bearer token. SDK 0.9.1
+// confines raw file effects to the app's own directories unless this is
+// declared, and the token lives at $HOME/.zig-nostr-signer.token, which is
+// outside every one of them. Without it `fx.readFile` is rejected SILENTLY:
+// `.token_read` arrives as `.rejected`, every non-ok outcome arms a retry,
+// the phase never advances, and the app sits at "Connecting to the signer…"
+// forever looking exactly like a network fault.
+pub const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_filesystem };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
