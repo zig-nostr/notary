@@ -67,6 +67,9 @@ jobs:
       - name: Check markup and manifest
         run: native check
 
+      # Load-bearing beyond the usual: this is where the permission-declaration
+      # test runs. Nothing else here launches the GUI, so `check` and `build`
+      # both pass on an app that cannot reach its own daemon. That shipped once.
       - name: Test
         run: native test
 

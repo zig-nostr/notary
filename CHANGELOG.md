@@ -7,6 +7,33 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-08-22
+
+### Fixed
+- **The window could not reach its own signer.** Native SDK 0.9.1 began
+  confining raw file effects to an app's own directories unless the app declares
+  the new `filesystem` permission. The window reads the daemon's bearer token
+  from `$HOME`, which is outside every one of them, so the read was rejected and
+  nothing said so: the token never arrived, the phase never advanced, and the
+  app sat on "Connecting to the signer…" forever, looking exactly like a network
+  fault. It is declared now.
+
+  The released 0.8.0 was never affected. It was built against an older CLI, and
+  the pin moved the day after that release, so the break lived only on `main`.
+  Nothing caught it because `check`, `test` and `build` all pass on an app that
+  cannot reach its daemon, and none of them launches it. There is now a test that
+  fails if the permission is ever dropped again.
+
+- **The setup screen overclaimed.** It said the app "only sends the passphrase".
+  That is true when you create a key and false when you import one, which is the
+  one moment the secret does pass through the window. It now says which is which.
+
+### Changed
+- The screenshots are retaken from the current app. The approval card shows the
+  four answers it actually offers (allow once, for a day, always, deny) along
+  with who is asking and what would be signed, where the old picture showed two
+  buttons and neither.
+
 ## [0.8.0] - 2026-08-16
 
 ### Added
