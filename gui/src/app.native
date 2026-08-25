@@ -4,6 +4,14 @@
      lives in the status bar and carries the phase, or the key and the queue
      count once serving. Logic is in src/main.zig. Validate with: native check -->
 <column gap="0">
+  <!-- ONE scroll for the whole serving view: the bunker link, the relays and the
+       queue's empty line. They used to be siblings that each grew, so with a key
+       revealed the scroll and the empty state split the window between them, the
+       scroll's viewport was squeezed to about half, and the backup's own buttons
+       were clipped out of a column that had plenty of room on paper. Two things
+       that both want the leftover space is one thing too many. -->
+  <scroll grow="1">
+  <column gap="0">
   <if test="{show_bunker}">
     <column gap="6" padding="16">
       <text foreground="text_muted">Bunker URL: paste into your Nostr client to connect</text>
@@ -77,6 +85,13 @@
     </column>
     <separator/>
   </if>
+  <if test="{show_empty}">
+    <column gap="12" main="center" cross="center" padding="24">
+      <text>{empty_text}</text>
+    </column>
+  </if>
+  </column>
+  </scroll>
   <if test="{daemon_down}">
     <column gap="12" main="center" cross="center" grow="1" padding="24">
       <text>{exit_note}</text>
@@ -143,11 +158,6 @@
           <text foreground="destructive">{forget_error}</text>
         </if>
       </if>
-    </column>
-  </if>
-  <if test="{show_empty}">
-    <column gap="12" main="center" cross="center" grow="1" padding="24">
-      <text>{empty_text}</text>
     </column>
   </if>
   <if test="{show_queue}">
