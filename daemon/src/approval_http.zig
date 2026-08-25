@@ -318,6 +318,8 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handleSetup(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/forget"))
         return handleForget(self, io, w, body);
+    if (eql(method, "POST") and eql(path, "/lock"))
+        return handleLock(self, w);
     if (eql(method, "POST") and eql(path, "/nostrconnect"))
         return handleNostrConnect(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/unlock"))
@@ -511,6 +513,28 @@ fn handleForget(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     if (self.clients) |c| c.clear();
     self.broker.reset();
     self.gate.forget(io);
+
+    // Answered before exiting, so the GUI is told rather than seeing its
+    // connection drop and guessing why.
+    respond(w, 200, "{\"ok\":true}") catch {};
+    w.flush() catch {};
+    std.process.exit(0);
+}
+
+/// Sign out: end the process, keeping the key.
+///
+/// Ending it is the whole point rather than an implementation detail. The relay
+/// threads were handed the key by value when serving began, so nothing short of
+/// exiting takes it back, and a signer that reports itself signed out while it
+/// can still sign is worse than one that never offered.
+///
+/// The key stays where it is, encrypted, so the next daemon comes up locked and
+/// asks for the passphrase. `/forget` is the one that removes it.
+fn handleLock(self: *Server, w: *std.Io.Writer) !void {
+    // Sessions granted before signing out must not outlive it: a client still
+    // holding an authorization would be recognised by the daemon that follows.
+    if (self.clients) |c| c.clear();
+    self.broker.reset();
 
     // Answered before exiting, so the GUI is told rather than seeing its
     // connection drop and guessing why.
