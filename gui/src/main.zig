@@ -642,6 +642,15 @@ pub const Model = struct {
         return self.bunker_buf[0..self.bunker_len];
     }
     /// Show the connection card only while serving with a URI in hand.
+    /// Whether the serving screen has anything on it.
+    ///
+    /// The scroll around it is `grow`, so it must not exist when this screen is
+    /// not the one showing: an empty one still takes its share of the window,
+    /// and on the unlock screen it pushed the heading half way down.
+    pub fn show_serving(self: *const Model) bool {
+        return self.show_bunker() or self.show_relays() or self.show_empty();
+    }
+
     pub fn show_bunker(self: *const Model) bool {
         return self.phase == .connected and self.bunker_len > 0;
     }

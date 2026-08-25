@@ -10,6 +10,7 @@
        scroll's viewport was squeezed to about half, and the backup's own buttons
        were clipped out of a column that had plenty of room on paper. Two things
        that both want the leftover space is one thing too many. -->
+  <if test="{show_serving}">
   <scroll grow="1">
   <column gap="0">
   <if test="{show_bunker}">
@@ -92,6 +93,7 @@
   </if>
   </column>
   </scroll>
+  </if>
   <if test="{daemon_down}">
     <column gap="12" main="center" cross="center" grow="1" padding="24">
       <text>{exit_note}</text>
@@ -135,7 +137,12 @@
     </scroll>
   </if>
   <if test="{needs_unlock}">
-    <column gap="12" grow="1" padding="20">
+    <!-- Scrolls for the same reason the setup branch does: opening "use another
+         key" adds a warning, a confirm field and two buttons under a screen that
+         already filled the window, and the confirm field went off the bottom
+         edge with no way to reach it. -->
+    <scroll grow="1">
+    <column gap="12" padding="20">
       <text size="heading">Unlock your signer</text>
       <text>Enter your passphrase to unlock the signing key.</text>
       <row><text-field text="{passphrase}" placeholder="Passphrase" on-input="passphrase_edit" on-submit="submit_unlock" autofocus="true" grow="1"/></row>
@@ -159,6 +166,7 @@
         </if>
       </if>
     </column>
+    </scroll>
   </if>
   <if test="{show_queue}">
     <scroll grow="1">
