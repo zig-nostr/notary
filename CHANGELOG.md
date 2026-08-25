@@ -7,6 +7,37 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-26
+
+### Added
+- **Back up your key.** There was no way to get the key out of this app: not the
+  nsec, not the encrypted file, and no instructions either. The screen that
+  removes a key even told you to make sure you had its nsec written down first,
+  with nothing anywhere that would give you one. A nostr key cannot be replaced,
+  so a key that cannot leave the Mac holding it is an identity that dies with the
+  Mac.
+
+  Two forms, and the difference is the point. The encrypted one is the NIP-49
+  `ncryptsec1…` exactly as it sits on disk, still useless without the passphrase,
+  which is the one to keep. The other is the key in the clear and says so in red.
+
+  The passphrase is required for both, including the encrypted form that does not
+  strictly need it: an unlocked signer is the normal state, and whoever is at the
+  keyboard then is not necessarily the person who set it up. Nothing is kept
+  afterwards.
+- `POST /lock` and `POST /export` on the daemon's loopback API.
+
+### Fixed
+- **Sign out stopped hanging.** It spawned a second daemon without ending the
+  first, which still owned the loopback port, so the new process could not bind
+  and never printed the port line the window waits for. The app parked at
+  "Starting the signer…" until it was restarted, with the old daemon still
+  serving and still holding the key. `/lock` ends the process and keeps the key,
+  so the one that follows comes up locked and asks for the passphrase.
+- **The serving screen and the lock screen scroll.** Revealing a key, or opening
+  "use another key", adds enough to a full column that the bottom of it went
+  under the status bar with no way to reach it.
+
 ## [0.8.1] - 2026-08-22
 
 ### Fixed
