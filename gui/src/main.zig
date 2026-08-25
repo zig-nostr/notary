@@ -89,6 +89,7 @@ const setup_key: u64 = 5;
 const unlock_key: u64 = 6;
 const nostrconnect_key: u64 = 11;
 const forget_key: u64 = 12;
+const lock_key: u64 = 18;
 const clipboard_key: u64 = 7;
 /// Its own effect key: two clipboard writes under one key would have the second
 /// rejected while the first is still in flight.
@@ -718,6 +719,8 @@ pub const Msg = union(enum) {
 
     // Signing out (lock, reversible) and removing the key (not reversible).
     sign_out,
+    /// The daemon answered the sign-out before exiting.
+    lock_done: native_sdk.EffectResponse,
     forget_edit: canvas.TextInputEvent,
     reveal_forget,
     cancel_forget,
@@ -889,6 +892,20 @@ fn sendForget(model: *Model, fx: *Effects) void {
         .{ .name = "content-type", .value = "application/json" },
     };
     fx.fetch(.{ .key = forget_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.forget_done) });
+}
+
+/// POST /lock, the sign out.
+///
+/// Asking the daemon to end itself rather than starting a second one beside it.
+/// A restart IS the sign out (the relay threads hold the key by value), and the
+/// old daemon owns the loopback port until it goes, so spawning over the top of
+/// a live one left the new process unable to bind and the window waiting on a
+/// port line that never came.
+fn sendLock(model: *Model, fx: *Effects) void {
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}/lock", .{model.baseUrl()}) catch return;
+    const headers = [_]std.http.Header{.{ .name = "authorization", .value = model.auth() }};
+    fx.fetch(.{ .key = lock_key, .method = .POST, .url = url, .headers = &headers, .timeout_ms = 10_000, .on_response = Effects.responseMsg(.lock_done) });
 }
 
 /// POST /nostrconnect, adopt a client that showed a `nostrconnect://` link.
@@ -1173,12 +1190,28 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // process takes it back; the daemon then comes up locked and asks
             // for the passphrase. Doing it any other way would leave a signer
             // that reports itself signed out and still signs.
+            //
+            // Ask the daemon to end itself and wait for the answer, rather than
+            // spawning a second one over the top of it. The running daemon owns
+            // the loopback port until it exits, so the new process could not
+            // bind and never printed the port line the window waits for: the
+            // sign out parked at "Starting the signer…" until the app was
+            // restarted. `/lock` keeps the key; `/forget` is the one that
+            // removes it.
             if (!model.managed) return;
-            model.setAuth("");
-            model.clearRows();
-            model.clearSecrets();
             model.clearOnboardError();
             model.submitting = false;
+            sendLock(model, fx);
+        },
+        .lock_done => |response| {
+            // Whatever it answered, the daemon is on its way out or already
+            // gone, so what this window knew about it is stale either way.
+            _ = response;
+            model.setAuth("");
+            model.clearRows();
+            model.clearBunker();
+            model.clearRelays();
+            model.clearSecrets();
             spawnDaemon(model, fx);
             attemptConnect(model, fx);
         },
