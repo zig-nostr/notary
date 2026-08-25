@@ -1,10 +1,16 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.8.0
+### What's new in v0.9.0
 
-**The terminal way in is now visible.** v0.7.0 added a command that takes your nsec from a terminal without it passing through the window or the clipboard, and then nothing in the app told you it existed. The setup screen shows it now, beside the paste field, with a button to copy it. Both ways work; one of them keeps your key out of more places.
+**You can take a copy of your key.** There was no way to get it out of this app before: not the nsec, not the encrypted file, and no instructions either. The screen that removes a key even told you to make sure you had its nsec written down first, with nothing anywhere that would give you one. A nostr key cannot be replaced, so a key that cannot leave the Mac holding it is an identity that dies with the Mac.
 
-**One status line instead of four.** Notary used to open with its own name above the current phase above your key, and then count the queue again at the bottom. That is a lot of the window spent telling you things you knew, in an app whose whole job is to show you one question at a time. The screen starts with the actual content now, and there is a single line at the bottom.
+Press **Back up your key**, give it the passphrase, and pick one of two forms. The encrypted one is the file as it sits on disk, still useless to anyone without that passphrase, so it is safe to keep in a password manager or on paper. The other is the key itself, and says so in red, because anyone who reads it becomes you and there is no taking it back.
+
+The passphrase is asked for either way, including the encrypted form that does not strictly need it: an unlocked signer is the normal state, and whoever is at the keyboard then is not necessarily the person who set it up.
+
+**Sign out no longer hangs.** It started a second signer without stopping the first, and the first still owned the port, so the new one could never answer. The app sat at "Starting the signer…" until you quit and reopened it, with the old signer still running and still holding your key. Signing out now ends that process and keeps the key, so what comes back asks for your passphrase, which is what signing out was supposed to mean.
+
+**Two screens scroll that did not.** Revealing a key, or opening "use another key" on the lock screen, adds enough to an already-full column that the bottom of it went under the status bar with no way to reach it.
 
 ### Install
 
