@@ -90,6 +90,7 @@ const unlock_key: u64 = 6;
 const nostrconnect_key: u64 = 11;
 const forget_key: u64 = 12;
 const lock_key: u64 = 18;
+const export_key: u64 = 19;
 const clipboard_key: u64 = 7;
 /// Its own effect key: two clipboard writes under one key would have the second
 /// rejected while the first is still in flight.
@@ -313,6 +314,21 @@ pub const Model = struct {
     forget_showing: bool = false,
     forget_error_buf: [96]u8 = [_]u8{0} ** 96,
     forget_error_len: usize = 0,
+    /// Backing up the key. Folded away on every launch for the same reason the
+    /// way out is: the passphrase field for it should not be sitting open.
+    backup_showing: bool = false,
+    backup_pass: canvas.TextBuffer(128) = .{},
+    /// The exported key, held only until the reader copies it or closes the
+    /// panel. An `ncryptsec1…` unless they asked for the key in the clear.
+    backup_key_buf: [256]u8 = [_]u8{0} ** 256,
+    backup_key_len: usize = 0,
+    /// Whether what is held is the key in the clear rather than the encrypted
+    /// form, which decides what the panel warns about.
+    backup_is_raw: bool = false,
+    backup_sending: bool = false,
+    backup_error_buf: [96]u8 = [_]u8{0} ** 96,
+    backup_error_len: usize = 0,
+    backup_copied: bool = false,
     secret_buf: canvas.TextBuffer(200) = .{},
     /// false: generate a fresh key; true: import an existing `nsec1…`/hex.
     import_mode: bool = false,
@@ -467,6 +483,60 @@ pub const Model = struct {
         // destructive press cannot be a mis-click.
         return !std.mem.eql(u8, self.forget_buf.text(), "delete my key");
     }
+    pub fn backup_open(self: *const Model) bool {
+        return self.backup_showing;
+    }
+    pub fn backup_closed(self: *const Model) bool {
+        return !self.backup_showing;
+    }
+    pub fn backup_passphrase(self: *const Model) []const u8 {
+        return self.backup_pass.text();
+    }
+    pub fn backup_disabled(self: *const Model) bool {
+        return self.backup_sending or self.backup_pass.text().len == 0;
+    }
+    pub fn backup_key(self: *const Model) []const u8 {
+        return self.backup_key_buf[0..self.backup_key_len];
+    }
+    pub fn has_backup_key(self: *const Model) bool {
+        return self.backup_key_len > 0;
+    }
+    pub fn backup_is_encrypted(self: *const Model) bool {
+        return self.backup_key_len > 0 and !self.backup_is_raw;
+    }
+    pub fn backup_is_secret(self: *const Model) bool {
+        return self.backup_key_len > 0 and self.backup_is_raw;
+    }
+    pub fn backup_error(self: *const Model) []const u8 {
+        return self.backup_error_buf[0..self.backup_error_len];
+    }
+    pub fn has_backup_error(self: *const Model) bool {
+        return self.backup_error_len > 0;
+    }
+    pub fn backup_copy_label(self: *const Model) []const u8 {
+        return if (self.backup_copied) "Copied" else "Copy";
+    }
+
+    /// Everything the backup panel was holding, gone. Called when it closes,
+    /// when the account changes, and when the daemon does: a key sitting in a
+    /// window nobody is looking at is the thing this whole app exists to avoid.
+    fn setBackupError(self: *Model, text: []const u8) void {
+        const n = @min(text.len, self.backup_error_buf.len);
+        @memcpy(self.backup_error_buf[0..n], text[0..n]);
+        self.backup_error_len = n;
+    }
+
+    pub fn clearBackup(self: *Model) void {
+        self.backup_showing = false;
+        self.backup_pass.set("");
+        std.crypto.secureZero(u8, &self.backup_key_buf);
+        self.backup_key_len = 0;
+        self.backup_is_raw = false;
+        self.backup_sending = false;
+        self.backup_error_len = 0;
+        self.backup_copied = false;
+    }
+
     pub fn forget_error(self: *const Model) []const u8 {
         return self.forget_error_buf[0..self.forget_error_len];
     }
@@ -572,6 +642,15 @@ pub const Model = struct {
         return self.bunker_buf[0..self.bunker_len];
     }
     /// Show the connection card only while serving with a URI in hand.
+    /// Whether the serving screen has anything on it.
+    ///
+    /// The scroll around it is `grow`, so it must not exist when this screen is
+    /// not the one showing: an empty one still takes its share of the window,
+    /// and on the unlock screen it pushed the heading half way down.
+    pub fn show_serving(self: *const Model) bool {
+        return self.show_bunker() or self.show_relays() or self.show_empty();
+    }
+
     pub fn show_bunker(self: *const Model) bool {
         return self.phase == .connected and self.bunker_len > 0;
     }
@@ -721,6 +800,16 @@ pub const Msg = union(enum) {
     sign_out,
     /// The daemon answered the sign-out before exiting.
     lock_done: native_sdk.EffectResponse,
+    reveal_backup,
+    cancel_backup,
+    backup_pass_edit: canvas.TextInputEvent,
+    /// Ask for the encrypted key: still behind the passphrase, safe to keep.
+    export_encrypted,
+    /// Ask for the key in the clear, which is the one that can be stolen.
+    export_secret,
+    backup_done: native_sdk.EffectResponse,
+    copy_backup,
+    backup_copied: native_sdk.EffectClipboardResult,
     forget_edit: canvas.TextInputEvent,
     reveal_forget,
     cancel_forget,
@@ -892,6 +981,32 @@ fn sendForget(model: *Model, fx: *Effects) void {
         .{ .name = "content-type", .value = "application/json" },
     };
     fx.fetch(.{ .key = forget_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.forget_done) });
+}
+
+/// POST /export, the backup.
+///
+/// The passphrase goes with every request, including for the encrypted form
+/// that does not strictly need it: an unlocked daemon is the normal state, and
+/// whoever is at the keyboard then is not necessarily the person who set it up.
+fn sendExport(model: *Model, fx: *Effects, raw: bool) void {
+    if (model.backup_disabled()) return;
+    model.backup_sending = true;
+    model.backup_error_len = 0;
+    model.backup_copied = false;
+    model.backup_is_raw = raw;
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}/export", .{model.baseUrl()}) catch return;
+    var body_buf: [320]u8 = undefined;
+    const Body = struct { passphrase: []const u8, form: []const u8 };
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{
+        .passphrase = model.backup_pass.text(),
+        .form = if (raw) "nsec" else "ncryptsec",
+    }, .{})}) catch return;
+    const headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = model.auth() },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    fx.fetch(.{ .key = export_key, .method = .POST, .url = url, .headers = &headers, .body = body, .timeout_ms = 20_000, .on_response = Effects.responseMsg(.backup_done) });
 }
 
 /// POST /lock, the sign out.
@@ -1139,6 +1254,51 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .command_copied_result => |result| {
             if (result.outcome != .ok) return;
             model.command_copied = true;
+        },
+        .reveal_backup => model.backup_showing = true,
+        .cancel_backup => model.clearBackup(),
+        .backup_pass_edit => |e| {
+            model.backup_pass.apply(e);
+            model.backup_error_len = 0;
+        },
+        .export_encrypted => sendExport(model, fx, false),
+        .export_secret => sendExport(model, fx, true),
+        .backup_done => |response| {
+            model.backup_sending = false;
+            if (response.outcome == .ok and response.status == 200) {
+                var buf: [512]u8 = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&buf);
+                const Body = struct { key: []const u8 = "" };
+                const parsed = std.json.parseFromSliceLeaky(Body, fba.allocator(), response.body, .{ .ignore_unknown_fields = true }) catch {
+                    model.setBackupError("Could not read the answer.");
+                    return;
+                };
+                const key = parsed.key;
+                const n = @min(key.len, model.backup_key_buf.len);
+                @memcpy(model.backup_key_buf[0..n], key[0..n]);
+                model.backup_key_len = n;
+                // The passphrase has done its job. Holding it after the answer
+                // arrives buys nothing and leaves it in a window.
+                model.backup_pass.set("");
+                return;
+            }
+            model.setBackupError(if (response.status == 401)
+                "That passphrase does not match."
+            else
+                "Could not read the key.");
+        },
+        .copy_backup => {
+            const key = model.backup_key();
+            if (key.len == 0) return;
+            fx.writeClipboard(.{
+                .key = clipboard_key,
+                .text = key,
+                .on_result = Effects.clipboardMsg(.backup_copied),
+            });
+        },
+        .backup_copied => |result| {
+            if (result.outcome != .ok) return;
+            model.backup_copied = true;
         },
         .copy_bunker => {
             const uri = model.bunker();

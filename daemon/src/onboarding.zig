@@ -159,6 +159,33 @@ pub const Gate = struct {
     /// caller has to finish it: the relay threads were handed the key by value
     /// when serving started and still hold it. Ending the process is what
     /// actually retracts it, which is why the endpoint that calls this exits.
+    pub const ExportError = error{ BadPassphrase, NotInitialized, ReadFailed, OutOfMemory };
+
+    /// The key itself, handed back to the person who owns it.
+    ///
+    /// `raw` chooses the form: false gives the NIP-49 `ncryptsec1…` exactly as
+    /// it sits on disk, which is safe to write down because it is still behind
+    /// the passphrase; true gives the `nsec1…`, which is the key in the clear.
+    ///
+    /// The passphrase is checked by decrypting whichever form is asked for,
+    /// including the encrypted one that does not strictly need it. Being
+    /// unlocked already is not enough to hand out a key: an unlocked daemon is
+    /// the normal state, and whoever is at the keyboard then is not necessarily
+    /// the person who set it up.
+    pub fn exportKey(self: *Gate, io: std.Io, gpa: std.mem.Allocator, passphrase: []const u8, raw: bool) ExportError![]u8 {
+        if (self.current() == .uninitialized) return error.NotInitialized;
+        if (passphrase.len == 0) return error.BadPassphrase;
+
+        const ncryptsec = keystore.readKeyFile(gpa, io, self.dir, self.key_file) catch return error.ReadFailed;
+        defer gpa.free(ncryptsec);
+
+        var secret = keystore.decryptKey(gpa, ncryptsec, passphrase) catch return error.BadPassphrase;
+        defer std.crypto.secureZero(u8, &secret);
+
+        if (!raw) return gpa.dupe(u8, ncryptsec) catch return error.OutOfMemory;
+        return nip19.encodeNsec(gpa, secret) catch return error.OutOfMemory;
+    }
+
     pub fn forget(self: *Gate, io: std.Io) void {
         self.dir.deleteFile(io, self.key_file) catch {};
         std.crypto.secureZero(u8, &self.secret_key);

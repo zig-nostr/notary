@@ -5,10 +5,10 @@ window: Zig throughout, drawn by the toolkit itself, with no Electron and no
 WebView anywhere. Notary keeps your secret key on a machine you control and
 signs for your apps over
 [NIP-46](https://github.com/nostr-protocol/nips/blob/master/46.md). The key
-never leaves the signer, and nothing signs on your behalf until you have said
-so: a request shows which client is asking and what it would sign, and your
-answer stands for that one request, for a day, or always for that client and
-that kind.
+never leaves the signer unless you ask for it, and nothing signs on your behalf
+until you have said so: a request shows which client is asking and what it would
+sign, and your answer stands for that one request, for a day, or always for that
+client and that kind.
 
 Built on [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr), and the signer
 behind [Plaza](https://github.com/zig-nostr/plaza), the native client in the same
@@ -31,6 +31,25 @@ client, and Notary neither knows nor cares which one is asking.
 window is the app's own, so nothing here shows a screen the app cannot draw. The
 signer pubkey and `bunker://` URL come from a stub daemon; no real key appears in
 any of them.</sub>
+
+## Your key is yours to take
+
+A nostr key cannot be replaced. If the only copy is on one Mac, losing the Mac
+loses the account, so Notary will hand the key back to you: **Back up your key**,
+then the passphrase, then one of two forms.
+
+The **encrypted key** is the NIP-49 `ncryptsec1…` exactly as it sits on disk. It
+is still behind your passphrase, so it is safe to keep in a password manager or
+on paper. Keep the passphrase somewhere else.
+
+The **secret key** is the `nsec1…` itself. Anyone who reads it becomes you, for
+good, so it is there for the case where you need it and says as much when it
+appears.
+
+The passphrase is required for both, including the encrypted form that does not
+strictly need it: an unlocked signer is the normal state, and whoever is at the
+keyboard then is not necessarily the person who set it up. Nothing is kept
+afterwards, and closing the panel takes the key off the screen with it.
 
 ## Install
 

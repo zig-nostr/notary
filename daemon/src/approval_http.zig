@@ -7,6 +7,8 @@
 //!   GET  /info              {"state":..,"pubkey":..,"bunker":..,"relays":[{"url":..,"status":..}],"timeout_ms":N}
 //!   POST /setup             {"passphrase":..,"secret":..?} → create/import a key
 //!   POST /unlock            {"passphrase":..} → decrypt the key file
+//!   POST /lock              → clear sessions and exit, keeping the key
+//!   POST /export            {"passphrase":..,"form":"ncryptsec"|"nsec"} → the key
 //!   GET  /pending?since=N   long-poll (~1s) → {"version":N,"pending":[...]}
 //!   POST /decision          {"id":N,"decision":"approve"|"reject"} → {"ok":bool}
 //!
@@ -320,6 +322,8 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handleForget(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/lock"))
         return handleLock(self, w);
+    if (eql(method, "POST") and eql(path, "/export"))
+        return handleExport(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/nostrconnect"))
         return handleNostrConnect(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/unlock"))
@@ -519,6 +523,43 @@ fn handleForget(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     respond(w, 200, "{\"ok\":true}") catch {};
     w.flush() catch {};
     std.process.exit(0);
+}
+
+/// Hand the key back to the person who owns it.
+///
+/// A key that cannot leave is not the reader's key, whatever the copy says, and
+/// a Nostr key cannot be rotated: one trapped in one app on one machine is an
+/// identity that dies with the machine. So this exists, and it is deliberately
+/// awkward: the passphrase every time, and the caller has to name which form it
+/// wants.
+///
+/// `form` is "ncryptsec" (the default, still encrypted, safe to write down) or
+/// "nsec" (the key in the clear). The answer is not logged and the daemon keeps
+/// no copy of what it returned.
+fn handleExport(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { passphrase: []const u8 = "", form: []const u8 = "ncryptsec" };
+    const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respond(w, 400, bad_request);
+    defer parsed.deinit();
+
+    const raw = eql(parsed.value.form, "nsec");
+    if (!raw and !eql(parsed.value.form, "ncryptsec"))
+        return respond(w, 400, "{\"error\":\"form must be ncryptsec or nsec\"}");
+
+    const key = self.gate.exportKey(io, self.gpa, parsed.value.passphrase, raw) catch |err| return switch (err) {
+        error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
+        error.NotInitialized => respond(w, 409, "{\"error\":\"no key\"}"),
+        else => respond(w, 500, "{\"error\":\"could not read the key\"}"),
+    };
+    defer {
+        std.crypto.secureZero(u8, key);
+        self.gpa.free(key);
+    }
+
+    var out: [512]u8 = undefined;
+    const j = std.fmt.bufPrint(&out, "{{\"ok\":true,\"key\":\"{s}\"}}", .{key}) catch
+        return respond(w, 500, "{\"error\":\"could not read the key\"}");
+    return respond(w, 200, j);
 }
 
 /// Sign out: end the process, keeping the key.

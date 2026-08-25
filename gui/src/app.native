@@ -4,6 +4,15 @@
      lives in the status bar and carries the phase, or the key and the queue
      count once serving. Logic is in src/main.zig. Validate with: native check -->
 <column gap="0">
+  <!-- ONE scroll for the whole serving view: the bunker link, the relays and the
+       queue's empty line. They used to be siblings that each grew, so with a key
+       revealed the scroll and the empty state split the window between them, the
+       scroll's viewport was squeezed to about half, and the backup's own buttons
+       were clipped out of a column that had plenty of room on paper. Two things
+       that both want the leftover space is one thing too many. -->
+  <if test="{show_serving}">
+  <scroll grow="1">
+  <column gap="0">
   <if test="{show_bunker}">
     <column gap="6" padding="16">
       <text foreground="text_muted">Bunker URL: paste into your Nostr client to connect</text>
@@ -25,6 +34,40 @@
         <button variant="secondary" on-press="sign_out">Sign out</button>
         <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this Mac and needs its passphrase again.</text>
       </row>
+      <separator/>
+      <if test="{backup_closed}">
+        <row gap="8">
+          <button variant="secondary" on-press="reveal_backup">Back up your key</button>
+          <text grow="1" foreground="text_muted" wrap="true">This Mac holds the only copy. Without a backup, losing it loses the identity: a nostr key cannot be replaced.</text>
+        </row>
+      </if>
+      <if test="{backup_open}">
+        <column gap="10">
+          <text>Back up your key</text>
+          <text foreground="text_muted" wrap="true">Two forms. The encrypted one still needs this passphrase to use, so it is safe to keep in a password manager or on paper. The secret one is the key itself: anyone who reads it becomes you, for good.</text>
+          <row><text-field text="{backup_passphrase}" placeholder="Passphrase" on-input="backup_pass_edit" grow="1"/></row>
+          <row gap="8">
+            <button variant="primary" grow="1" on-press="export_encrypted" disabled="{backup_disabled}">Encrypted key</button>
+            <button variant="destructive" grow="1" on-press="export_secret" disabled="{backup_disabled}">Secret key</button>
+            <button on-press="cancel_backup">Close</button>
+          </row>
+          <if test="{has_backup_error}">
+            <text foreground="destructive">{backup_error}</text>
+          </if>
+          <if test="{backup_is_encrypted}">
+            <text foreground="text_muted" wrap="true">Encrypted, and useless without the passphrase. Keep both, apart.</text>
+          </if>
+          <if test="{backup_is_secret}">
+            <text foreground="destructive" wrap="true">This is the key in the clear. Anyone who sees it can sign as you and you cannot take it back. Close this when you are done.</text>
+          </if>
+          <if test="{has_backup_key}">
+            <row gap="8" cross="center">
+              <text grow="1" wrap="true">{backup_key}</text>
+              <button variant="secondary" on-press="copy_backup">{backup_copy_label}</button>
+            </row>
+          </if>
+        </column>
+      </if>
     </column>
     <separator/>
   </if>
@@ -42,6 +85,14 @@
       </for>
     </column>
     <separator/>
+  </if>
+  <if test="{show_empty}">
+    <column gap="12" main="center" cross="center" padding="24">
+      <text>{empty_text}</text>
+    </column>
+  </if>
+  </column>
+  </scroll>
   </if>
   <if test="{daemon_down}">
     <column gap="12" main="center" cross="center" grow="1" padding="24">
@@ -86,7 +137,12 @@
     </scroll>
   </if>
   <if test="{needs_unlock}">
-    <column gap="12" grow="1" padding="20">
+    <!-- Scrolls for the same reason the setup branch does: opening "use another
+         key" adds a warning, a confirm field and two buttons under a screen that
+         already filled the window, and the confirm field went off the bottom
+         edge with no way to reach it. -->
+    <scroll grow="1">
+    <column gap="12" padding="20">
       <text size="heading">Unlock your signer</text>
       <text>Enter your passphrase to unlock the signing key.</text>
       <row><text-field text="{passphrase}" placeholder="Passphrase" on-input="passphrase_edit" on-submit="submit_unlock" autofocus="true" grow="1"/></row>
@@ -110,11 +166,7 @@
         </if>
       </if>
     </column>
-  </if>
-  <if test="{show_empty}">
-    <column gap="12" main="center" cross="center" grow="1" padding="24">
-      <text>{empty_text}</text>
-    </column>
+    </scroll>
   </if>
   <if test="{show_queue}">
     <scroll grow="1">
