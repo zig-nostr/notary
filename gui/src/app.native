@@ -25,6 +25,40 @@
         <button variant="secondary" on-press="sign_out">Sign out</button>
         <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this Mac and needs its passphrase again.</text>
       </row>
+      <separator/>
+      <if test="{backup_closed}">
+        <row gap="8">
+          <button variant="secondary" on-press="reveal_backup">Back up your key</button>
+          <text grow="1" foreground="text_muted" wrap="true">This Mac holds the only copy. Without a backup, losing it loses the identity: a nostr key cannot be replaced.</text>
+        </row>
+      </if>
+      <if test="{backup_open}">
+        <column gap="10">
+          <text>Back up your key</text>
+          <text foreground="text_muted" wrap="true">Two forms. The encrypted one still needs this passphrase to use, so it is safe to keep in a password manager or on paper. The secret one is the key itself: anyone who reads it becomes you, for good.</text>
+          <row><text-field text="{backup_passphrase}" placeholder="Passphrase" on-input="backup_pass_edit" grow="1"/></row>
+          <row gap="8">
+            <button variant="primary" grow="1" on-press="export_encrypted" disabled="{backup_disabled}">Encrypted key</button>
+            <button variant="destructive" grow="1" on-press="export_secret" disabled="{backup_disabled}">Secret key</button>
+            <button on-press="cancel_backup">Close</button>
+          </row>
+          <if test="{has_backup_error}">
+            <text foreground="destructive">{backup_error}</text>
+          </if>
+          <if test="{backup_is_encrypted}">
+            <text foreground="text_muted" wrap="true">Encrypted, and useless without the passphrase. Keep both, apart.</text>
+          </if>
+          <if test="{backup_is_secret}">
+            <text foreground="destructive" wrap="true">This is the key in the clear. Anyone who sees it can sign as you and you cannot take it back. Close this when you are done.</text>
+          </if>
+          <if test="{has_backup_key}">
+            <row gap="8" cross="center">
+              <text grow="1" wrap="true">{backup_key}</text>
+              <button variant="secondary" on-press="copy_backup">{backup_copy_label}</button>
+            </row>
+          </if>
+        </column>
+      </if>
     </column>
     <separator/>
   </if>
