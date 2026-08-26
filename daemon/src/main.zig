@@ -504,8 +504,10 @@ fn loadSecretKey(gpa: std.mem.Allocator) [32]u8 {
 // `ps` to every process on the machine, which is why this refuses to take one
 // that way at all.
 //
-// If Notary is already running, the key is handed to it over the loopback API
-// so it picks it up live; otherwise it is written for the next launch to find.
+// The key is written for Notary to find, never handed to a running one: the
+// reason is at the write itself. A Notary that is already open notices the file
+// on its next /info poll and asks for the passphrase, so importing no longer
+// costs a relaunch.
 
 fn runImport(gpa: std.mem.Allocator) noreturn {
     var startup = std.Io.Threaded.init(gpa, .{});
@@ -540,9 +542,10 @@ fn runImport(gpa: std.mem.Allocator) noreturn {
     // and tells only the GUI that spawned it which one, so that another process
     // running as this user cannot find the control channel by guessing. A CLI
     // that could reach it would need that port published somewhere readable,
-    // which is exactly the property being protected. So this writes the file
-    // and the reader restarts Notary, which costs a relaunch and gives up
-    // nothing.
+    // which is exactly the property being protected. So this writes the file and
+    // says nothing to anyone. A running Notary finds it on its next /info poll
+    // (`Gate.rescan`) and asks for the passphrase, so the property is kept and
+    // the relaunch it used to cost is not.
     const initial: onboarding.State = if (fileExists(io, key_file)) .locked else .uninitialized;
     var gate = onboarding.Gate.init(gpa, std.Io.Dir.cwd(), key_file, initial);
     gate.setup(io, passphrase, input) catch |err| switch (err) {
@@ -550,7 +553,7 @@ fn runImport(gpa: std.mem.Allocator) noreturn {
         error.InvalidSecretKey => fail("that is not a valid nostr secret key"),
         else => failFmt("could not store the key: {s}", .{@errorName(err)}),
     };
-    std.debug.print("Imported. Start Notary (or restart it) to use it.\n", .{});
+    std.debug.print("Imported. Notary picks it up and asks for this passphrase.\n", .{});
     std.process.exit(0);
 }
 

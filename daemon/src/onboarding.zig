@@ -131,6 +131,35 @@ pub const Gate = struct {
         self.publish(kp);
     }
 
+    /// Re-checks the disk for a key file that appeared since boot.
+    ///
+    /// The state is decided once, at startup, from whether the key file is
+    /// there. `signer import` writes that file from a terminal and deliberately
+    /// never speaks to a running daemon: the control port is ephemeral and told
+    /// only to the window that spawned it, precisely so no other process on the
+    /// machine can find it. The cost was that a key imported while Notary was
+    /// open stayed invisible to it until the app was restarted, which is a
+    /// strange thing to ask of somebody who just typed their nsec.
+    ///
+    /// Only ever `uninitialized` -> `locked`. The file is encrypted and the
+    /// passphrase that opens it is not something this can learn, so `locked` is
+    /// the honest destination: the window asks for the passphrase, which is one
+    /// step instead of a relaunch.
+    ///
+    /// Compare-exchange rather than a store, so it can never step on a `setup`
+    /// or an `unlock` publishing a key at the same moment: those move to
+    /// `unlocked`, and this only ever moves away from `uninitialized`.
+    pub fn rescan(self: *Gate, io: std.Io) void {
+        if (self.current() != .uninitialized) return;
+        self.dir.access(io, self.key_file, .{}) catch return;
+        _ = self.state.cmpxchgStrong(
+            @intFromEnum(State.uninitialized),
+            @intFromEnum(State.locked),
+            .release,
+            .monotonic,
+        );
+    }
+
     /// Marks the gate `unlocked` with a key loaded outside the API, used in GUI
     /// mode when the operator preconfigured a key in the environment, so the GUI
     /// skips onboarding. `kp` must already be validated.
@@ -304,4 +333,55 @@ test "unlock decrypts a locked file and rejects a wrong passphrase" {
     try gate.unlock(io, "hunter2");
     try testing.expectEqual(State.unlocked, gate.current());
     try testing.expectEqualSlices(u8, &created_key, &gate.secret_key);
+}
+
+test "rescan notices a key file written while the daemon was running" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A daemon that booted with no key: this is the window sitting on first-run
+    // setup. Nothing has told it anything since.
+    var gate = Gate.init(gpa, tmp.dir, key_name, .uninitialized);
+    gate.rescan(io);
+    try testing.expectEqual(State.uninitialized, gate.current()); // invents nothing
+
+    // `signer import` in a terminal, which writes the file and by design cannot
+    // reach this process to announce it.
+    var terminal = Gate.init(gpa, tmp.dir, key_name, .uninitialized);
+    try terminal.setup(io, "hunter2", "");
+
+    // The next /info poll is what finds it.
+    gate.rescan(io);
+    try testing.expectEqual(State.locked, gate.current());
+
+    // And the passphrase typed in the terminal opens it, with no restart.
+    try gate.unlock(io, "hunter2");
+    try testing.expectEqual(State.unlocked, gate.current());
+    try testing.expectEqualSlices(u8, &terminal.secret_key, &gate.secret_key);
+}
+
+test "rescan never moves a gate that already holds a key" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // The dangerous direction, and the reason this is a compare-exchange from
+    // `uninitialized` rather than a store: /info is polled while serving too,
+    // and a rescan that could reach an unlocked gate would lock a running
+    // signer out of its own key on a routine status poll.
+    var gate = Gate.init(gpa, tmp.dir, key_name, .uninitialized);
+    try gate.setup(io, "pw", "");
+    try testing.expectEqual(State.unlocked, gate.current());
+
+    gate.rescan(io); // the file it just wrote is right there
+    try testing.expectEqual(State.unlocked, gate.current());
+
+    // A locked gate is left alone too: it is already where a rescan would put
+    // it, and moving it would drop a wrong-passphrase retry back to the start.
+    var locked = Gate.init(gpa, tmp.dir, key_name, .locked);
+    locked.rescan(io);
+    try testing.expectEqual(State.locked, locked.current());
 }

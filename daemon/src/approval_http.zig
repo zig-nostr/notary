@@ -315,7 +315,7 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     }
 
     if (eql(method, "GET") and eql(path, "/info"))
-        return handleInfo(self, w);
+        return handleInfo(self, io, w);
     if (eql(method, "POST") and eql(path, "/setup"))
         return handleSetup(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/forget"))
@@ -428,7 +428,12 @@ fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
     return respond(w, 200, j);
 }
 
-fn handleInfo(self: *Server, w: *std.Io.Writer) !void {
+fn handleInfo(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
+    // Ask the disk before answering. This is the poll the window sits on while
+    // it is waiting to be set up or unlocked, so it is the one place that can
+    // notice a key written by `signer import` in a terminal, which by design
+    // cannot reach this process to announce itself.
+    self.gate.rescan(io);
     const state = self.gate.current();
     const state_str = switch (state) {
         .uninitialized => "uninitialized",
@@ -817,9 +822,12 @@ test "GET /info reports the bunker URI once unlocked" {
         .port = 0,
     };
 
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try handleInfo(&server, &out.writer);
+    try handleInfo(&server, threaded.io(), &out.writer);
     var body = out.toArrayList();
     defer body.deinit(gpa);
 
@@ -844,9 +852,12 @@ test "GET /info omits the bunker URI until the key is unlocked" {
         .port = 0,
     };
 
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try handleInfo(&server, &out.writer);
+    try handleInfo(&server, threaded.io(), &out.writer);
     var body = out.toArrayList();
     defer body.deinit(gpa);
 
@@ -874,9 +885,12 @@ test "GET /info reports live per-relay connection status" {
         .port = 0,
     };
 
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try handleInfo(&server, &out.writer);
+    try handleInfo(&server, threaded.io(), &out.writer);
     var body = out.toArrayList();
     defer body.deinit(gpa);
 
