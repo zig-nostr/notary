@@ -1325,10 +1325,26 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         .refresh_tick => |t| {
-            // Re-poll /info only while serving and authenticated; otherwise the
-            // connect/retry flow owns /info.
-            if (t.outcome == .fired and model.phase == .connected and model.hasToken())
+            if (t.outcome != .fired or !model.hasToken()) return;
+            // Serving: the live relay status, on the poll that never touches the
+            // phase.
+            if (model.phase == .connected) {
                 refreshInfo(model, fx);
+                return;
+            }
+            // Waiting to be set up or unlocked, and this is the only thing that
+            // ever notices a key arriving from somewhere else. `signer import`
+            // writes the key file from a terminal and deliberately cannot reach
+            // this daemon to announce it, so without asking again the window
+            // sits on "First-run setup" until the app is restarted.
+            //
+            // Through `fetchInfo` rather than `refreshInfo`: the `.info` handler
+            // is the one that picks the screen from the daemon's state, which is
+            // exactly what has to happen here. Not while a passphrase is in
+            // flight, because that response owns the same effect key next.
+            if (model.submitting) return;
+            if (model.phase == .needs_setup or model.phase == .needs_unlock)
+                fetchInfo(model, fx);
         },
         .info_refresh => |r| {
             // Live-status refresh only: update relay status (and bunker); never
