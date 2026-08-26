@@ -7,6 +7,32 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-08-27
+
+### Fixed
+- **A key imported from a terminal no longer needs a restart.** `signer import`
+  takes an nsec from a terminal and writes it encrypted, and a Notary that was
+  already open never found out: the window sat on "Set up your signer" until the
+  app was quit and reopened, which is a strange thing to ask of somebody who has
+  just typed their nsec and chosen a passphrase for it.
+
+  Both halves were blind. The daemon decided its state once, at boot, from
+  whether the key file existed; `Gate.rescan` asks the disk again, and `/info`
+  calls it before answering, because that is the poll the window sits on while it
+  waits. Only ever uninitialized to locked, by compare-exchange: `/info` is polled
+  while serving too, and a rescan that could reach an unlocked gate would lock a
+  running signer out of its own key on a routine status poll. The window, for its
+  part, only re-polled `/info` while already serving, so the two screens that most
+  needed it never asked again.
+
+  The import still refuses to speak to a running daemon, and that stays
+  deliberate: the control port is ephemeral and told only to the window that
+  spawned it, so a CLI able to reach it would need that port published somewhere
+  readable, which is the property being protected. The key goes to disk and the
+  daemon finds it there. So this lands on the unlock screen rather than straight
+  into serving, which is one passphrase instead of a relaunch, and the passphrase
+  was chosen seconds earlier in the same terminal.
+
 ## [0.9.0] - 2026-08-26
 
 ### Added
