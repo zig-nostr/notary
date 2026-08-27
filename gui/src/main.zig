@@ -1071,11 +1071,16 @@ fn sendSetup(model: *Model, fx: *Effects) void {
     var url_buf: [128]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}/setup", .{model.baseUrl()}) catch return;
     var body_buf: [768]u8 = undefined;
-    const Body = struct { passphrase: []const u8, secret: []const u8 };
+    const Body = struct { method: []const u8, passphrase: []const u8, secret: []const u8 };
     // Trim whitespace so a stray space or newline (the key field is a wrapping
     // textarea) can't corrupt a pasted nsec/hex secret.
     const secret = if (model.import_mode) std.mem.trim(u8, model.secret(), " \t\r\n") else "";
-    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .passphrase = model.passphrase(), .secret = secret }, .{})}) catch return;
+    // Which one the reader chose, SAID rather than left to be guessed from an
+    // empty secret. The daemon used to read "no secret" as "make me a new key",
+    // so an import whose paste trimmed to nothing minted a fresh identity
+    // instead of failing. It refuses now, and this is the half that tells it.
+    const method = if (model.import_mode) "import" else "create";
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .method = method, .passphrase = model.passphrase(), .secret = secret }, .{})}) catch return;
     const headers = [_]std.http.Header{
         .{ .name = "authorization", .value = model.auth() },
         .{ .name = "content-type", .value = "application/json" },

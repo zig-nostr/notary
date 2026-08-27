@@ -490,11 +490,30 @@ fn handleInfo(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
 /// A non-empty `secret` (an `nsec1…` or 64-char hex) imports an existing key;
 /// absent/empty generates a fresh one. The key is created and encrypted in the
 /// daemon; only the derived public key is returned.
+/// POST /setup: mint a key, or take one the reader pasted.
+///
+/// The method is STATED, never inferred. This used to read "an empty secret
+/// means create", which is the same sentence as "a client that meant to import
+/// and sent nothing gets a brand new identity instead". That is one trimmed
+/// whitespace-only paste away, it destroys nothing the daemon can see, and the
+/// reader finds out later when their account is not theirs. A nostr key cannot
+/// be replaced, so this asks rather than guesses, and refuses when the answer
+/// does not make sense.
 fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
-    const Body = struct { passphrase: []const u8 = "", secret: []const u8 = "" };
+    const Body = struct { method: []const u8 = "", passphrase: []const u8 = "", secret: []const u8 = "" };
     const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
         return respond(w, 400, bad_request);
     defer parsed.deinit();
+
+    const importing = eql(parsed.value.method, ipc.Setup.method_import);
+    if (!importing and !eql(parsed.value.method, ipc.Setup.method_create))
+        return respond(w, 400, "{\"error\":\"method must be create or import\"}");
+    // An import with nothing to import is the dangerous one: it used to fall
+    // through to minting a key. Refusing is the whole point of asking.
+    if (importing and parsed.value.secret.len == 0)
+        return respond(w, 400, "{\"error\":\"import needs a secret\"}");
+    if (!importing and parsed.value.secret.len != 0)
+        return respond(w, 400, "{\"error\":\"create takes no secret\"}");
 
     self.gate.setup(io, parsed.value.passphrase, parsed.value.secret) catch |err| return switch (err) {
         error.AlreadyInitialized => respond(w, 409, "{\"error\":\"already initialized\"}"),
@@ -1222,6 +1241,45 @@ test "a nostrconnect link cannot make the daemon dial without limit" {
     // sockets on somebody else's list.
     try testing.expect(max_nostrconnect_relays > 0);
     try testing.expect(max_nostrconnect_relays <= 8);
+}
+
+test "an import with nothing to import is refused, not turned into a new key" {
+    // The dangerous shape this replaced: "an empty secret means create". That
+    // is the same sentence as "a client that meant to import and sent nothing
+    // gets a brand new identity", which is one whitespace-only paste away and
+    // is only discovered later, when the account turns out not to be theirs.
+    // A nostr key cannot be replaced, so the method is stated and a request
+    // that does not make sense is refused rather than guessed at.
+    const gpa = testing.allocator;
+    var broker: Broker = .{};
+
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+
+    const Case = struct { body: []const u8, want: []const u8 };
+    for ([_]Case{
+        // The one that used to mint a key.
+        .{ .body = "{\"method\":\"import\",\"passphrase\":\"pw\",\"secret\":\"\"}", .want = "400" },
+        // No method at all: the old clients' shape, now refused rather than
+        // silently read as a create.
+        .{ .body = "{\"passphrase\":\"pw\",\"secret\":\"\"}", .want = "400" },
+        .{ .body = "{\"method\":\"\",\"passphrase\":\"pw\"}", .want = "400" },
+        // A create that carries a secret is a confused client, not a create.
+        .{ .body = "{\"method\":\"create\",\"passphrase\":\"pw\",\"secret\":\"nsec1x\"}", .want = "400" },
+        // Nonsense method.
+        .{ .body = "{\"method\":\"replace\",\"passphrase\":\"pw\"}", .want = "400" },
+    }) |c| {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSetup(&server, threaded.io(), &out.writer, c.body);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, c.want) != null);
+        // Whatever went wrong, no key was made.
+        try testing.expectEqual(onboarding.State.uninitialized, gate.current());
+    }
 }
 
 test "forgetting a key needs the exact confirmation phrase" {
