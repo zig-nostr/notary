@@ -44,6 +44,23 @@ fn expectByText(widget: canvas.Widget, kind: canvas.WidgetKind, text: []const u8
     };
 }
 
+/// The same lookup for an icon-only control, which carries no text: its
+/// accessible label is the only name it has.
+fn findByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8) ?canvas.Widget {
+    if (widget.kind == kind and std.mem.eql(u8, widget.semantics.label, label)) return widget;
+    for (widget.children) |child| {
+        if (findByLabel(child, kind, label)) |found| return found;
+    }
+    return null;
+}
+
+fn expectByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const u8) !canvas.Widget {
+    return findByLabel(widget, kind, label) orelse {
+        std.debug.print("no {t} labelled \"{s}\" in the view - if you changed app.native, update this test to match\n", .{ kind, label });
+        return error.WidgetNotFound;
+    };
+}
+
 // ------------------------------------------------------------- parsing
 
 test "parseInfo fills the header fields" {
@@ -374,6 +391,139 @@ test "submit is disabled until a passphrase is typed, and while in flight" {
 
     m.submitting = true; // a request in flight re-disables it
     try testing.expect(m.submit_disabled());
+}
+
+test "the passphrase field draws stars, and the daemon still gets the passphrase" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = Model{};
+    model.phase = .needs_unlock;
+    model.passphrase_buf.apply(.{ .insert_text = "hunter2" });
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+
+    // The characters are not on the glass anywhere in the view: not in the
+    // field, not in a stray label built from the same binding.
+    try testing.expect(findByText(tree.root, .text_field, "hunter2") == null);
+    _ = try expectByText(tree.root, .text_field, "*******");
+
+    // What gets sent is untouched. This is the half that would break silently
+    // if the mask were ever applied to the buffer instead of to the drawing.
+    try testing.expectEqualStrings("hunter2", model.passphrase());
+}
+
+test "the reveal toggle shows the characters, and starts off" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = Model{};
+    model.phase = .needs_unlock;
+    model.passphrase_buf.apply(.{ .insert_text = "hunter2" });
+
+    // A fresh model hides. Nothing has to be pressed to get there.
+    try testing.expect(!model.passphrase_showing);
+    try testing.expectEqualStrings("*******", model.shown_passphrase());
+    try testing.expectEqualStrings("Show the passphrase", model.passphrase_toggle_label());
+
+    const hidden = try buildTree(arena_state.allocator(), &model);
+    const eye = try expectByLabel(hidden.root, .toggle_button, "Show the passphrase");
+    switch (hidden.msgForPointer(eye.id, .up).?) {
+        .toggle_passphrase => {},
+        else => return error.WrongMessage,
+    }
+
+    model.passphrase_showing = true;
+    try testing.expectEqualStrings("hunter2", model.shown_passphrase());
+    try testing.expectEqualStrings("Hide the passphrase", model.passphrase_toggle_label());
+
+    const shown = try buildTree(arena_state.allocator(), &model);
+    _ = try expectByText(shown.root, .text_field, "hunter2");
+}
+
+test "the mask is exactly as long as what it covers" {
+    // Not cosmetic. The runtime stamps caret and selection offsets into the
+    // string it DREW, and those offsets are replayed onto the buffer holding
+    // the real text. They only line up while the two are the same length, so a
+    // three-byte bullet in place of the star would put every click on the wrong
+    // character. Multibyte input is the case that proves the rule.
+    var m = Model{};
+    m.passphrase_buf.apply(.{ .insert_text = "hüntér2" });
+    try testing.expectEqual(m.passphrase().len, m.shown_passphrase().len);
+
+    m.backup_pass.apply(.{ .insert_text = "hüntér2" });
+    try testing.expectEqual(m.backup_passphrase().len, m.shown_backup_passphrase().len);
+}
+
+test "typing into a hidden field leaves the caret where the field draws it" {
+    // The runtime edits its OWN copy of what it drew. Once that copy is stars
+    // and this one is characters, an insert makes them disagree and the runtime
+    // puts the drawn caret back at the end of the line. If this buffer kept its
+    // own idea of where it was, the next keystroke would land somewhere the
+    // reader is not looking - and with every character a star, the only symptom
+    // would be the daemon refusing a passphrase they typed correctly.
+    var m = Model{};
+    m.passphrase_buf.apply(.{ .insert_text = "abcdef" });
+    m.passphrase_buf.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+
+    main.update(&m, Msg{ .passphrase_edit = .{ .insert_text = "Z" } }, undefined);
+    try testing.expectEqualStrings("abcZdef", m.passphrase());
+    try testing.expectEqual(@as(usize, 7), m.passphrase_buf.selection.focus);
+    try testing.expectEqual(@as(usize, 7), m.passphrase_buf.selection.anchor);
+
+    // Revealed, the drawn text IS this text, so the runtime keeps the caret and
+    // this buffer must keep it too: ordinary mid-string editing comes back.
+    m.passphrase_showing = true;
+    m.passphrase_buf.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+    main.update(&m, Msg{ .passphrase_edit = .{ .insert_text = "Y" } }, undefined);
+    try testing.expectEqualStrings("abcYZdef", m.passphrase());
+    try testing.expectEqual(@as(usize, 4), m.passphrase_buf.selection.focus);
+
+    // Deleting never re-seeds: both sides lose one glyph, so the caret stays.
+    m.passphrase_showing = false;
+    m.passphrase_buf.apply(.{ .set_selection = .{ .anchor = 3, .focus = 3 } });
+    main.update(&m, Msg{ .passphrase_edit = .delete_backward }, undefined);
+    try testing.expectEqualStrings("abYZdef", m.passphrase());
+    try testing.expectEqual(@as(usize, 2), m.passphrase_buf.selection.focus);
+}
+
+test "a revealed passphrase does not survive the send, or the panel closing" {
+    var m = Model{};
+    m.passphrase_buf.apply(.{ .insert_text = "hunter2" });
+    m.passphrase_showing = true;
+    m.clearSecrets();
+    try testing.expect(!m.passphrase_showing);
+    try testing.expectEqualStrings("", m.shown_passphrase());
+
+    m.backup_pass.apply(.{ .insert_text = "hunter2" });
+    m.backup_pass_showing = true;
+    m.clearBackup();
+    try testing.expect(!m.backup_pass_showing);
+    try testing.expectEqualStrings("", m.shown_backup_passphrase());
+}
+
+test "the backup panel hides its passphrase too" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = Model{};
+    model.phase = .connected;
+    // The panel lives inside the serving view, so give the model a bunker URI
+    // to be serving with.
+    main.parseInfo(&model, "{\"state\":\"unlocked\",\"bunker\":\"bunker://aabb?relay=wss%3A%2F%2Fr.example\"}");
+    model.backup_showing = true;
+    model.backup_pass.apply(.{ .insert_text = "hunter2" });
+
+    const tree = try buildTree(arena_state.allocator(), &model);
+    try testing.expect(findByText(tree.root, .text_field, "hunter2") == null);
+    _ = try expectByText(tree.root, .text_field, "*******");
+
+    const eye = try expectByLabel(tree.root, .toggle_button, "Show the passphrase");
+    switch (tree.msgForPointer(eye.id, .up).?) {
+        .toggle_backup_passphrase => {},
+        else => return error.WrongMessage,
+    }
+    try testing.expectEqualStrings("hunter2", model.backup_passphrase());
 }
 
 test "the setup screen renders create/import and dispatches submit_setup" {

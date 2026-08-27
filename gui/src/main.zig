@@ -73,6 +73,44 @@ const default_address = "127.0.0.1:8787";
 const import_command = "/Applications/Notary.app/Contents/MacOS/signer import";
 const default_token_file = ".zig-nostr-signer.token";
 
+/// What a hidden passphrase field renders instead of its characters.
+///
+/// One star per BYTE, so the mask is exactly as long as the text it stands
+/// for. That is what keeps the caret honest: every offset the runtime stamps
+/// into an edit event is an offset into the string it drew, and a mask of the
+/// same length maps those straight through to the real buffer. A prettier
+/// bullet would be three bytes wide and every click would land elsewhere.
+const passphrase_stars = [_]u8{'*'} ** 128;
+
+/// The mask for a secret `len` bytes long.
+fn stars(len: usize) []const u8 {
+    return passphrase_stars[0..@min(len, passphrase_stars.len)];
+}
+
+/// Apply one edit to a passphrase buffer, and leave the caret where the field
+/// is actually drawing it.
+///
+/// The runtime keeps its own copy of the text it is editing. A masked field
+/// hands it stars while the real characters go in here, so the two disagree the
+/// moment anything is typed, and the runtime answers that by re-seeding the
+/// drawn caret at the end of the line. Left alone this buffer would keep
+/// inserting where the reader last clicked while the caret they can SEE sits at
+/// the end, so the next keystroke lands somewhere they are not looking. Every
+/// character is a star, so nothing about it looks wrong until the daemon says
+/// the passphrase does not match. Deletions stay in step on their own (both
+/// sides lose one glyph and neither re-seeds), so it is only insertions that
+/// have to follow the caret home.
+fn applyMaskedEdit(buf: *canvas.TextBuffer(128), event: canvas.TextInputEvent, masked: bool) void {
+    buf.apply(event);
+    if (!masked) return;
+    switch (event) {
+        .insert_text, .set_composition, .commit_composition => {
+            buf.selection = canvas.TextSelection.collapsed(buf.text().len);
+        },
+        else => {},
+    }
+}
+
 // Effect keys. Fetch/spawn/file effects share one key space and 16 slots; the
 // long-lived daemon spawn holds one slot for the process's lifetime. Timer
 // keys are their own namespace. Decisions use a small pool so several can be
@@ -300,6 +338,10 @@ pub const Model = struct {
     /// screens. They transit this process once to reach `/setup` or `/unlock`
     /// and are cleared right after a successful send.
     passphrase_buf: canvas.TextBuffer(128) = .{},
+    /// Whether the passphrase field is showing its characters. Off on every
+    /// launch and again after every send: a revealed passphrase is a thing to
+    /// ask for, not a state to be left in.
+    passphrase_showing: bool = false,
     /// A `nostrconnect://` link pasted in from a client that is waiting to be
     /// adopted. Long, because it carries relays, a secret and app metadata.
     nostrconnect_buf: canvas.TextBuffer(512) = .{},
@@ -318,6 +360,8 @@ pub const Model = struct {
     /// way out is: the passphrase field for it should not be sitting open.
     backup_showing: bool = false,
     backup_pass: canvas.TextBuffer(128) = .{},
+    /// The same reveal for the backup panel's passphrase field.
+    backup_pass_showing: bool = false,
     /// The exported key, held only until the reader copies it or closes the
     /// panel. An `ncryptsec1…` unless they asked for the key in the clear.
     backup_key_buf: [256]u8 = [_]u8{0} ** 256,
@@ -492,6 +536,13 @@ pub const Model = struct {
     pub fn backup_passphrase(self: *const Model) []const u8 {
         return self.backup_pass.text();
     }
+    pub fn shown_backup_passphrase(self: *const Model) []const u8 {
+        if (self.backup_pass_showing) return self.backup_pass.text();
+        return stars(self.backup_pass.text().len);
+    }
+    pub fn backup_pass_toggle_label(self: *const Model) []const u8 {
+        return if (self.backup_pass_showing) "Hide the passphrase" else "Show the passphrase";
+    }
     pub fn backup_disabled(self: *const Model) bool {
         return self.backup_sending or self.backup_pass.text().len == 0;
     }
@@ -529,6 +580,7 @@ pub const Model = struct {
     pub fn clearBackup(self: *Model) void {
         self.backup_showing = false;
         self.backup_pass.set("");
+        self.backup_pass_showing = false;
         std.crypto.secureZero(u8, &self.backup_key_buf);
         self.backup_key_len = 0;
         self.backup_is_raw = false;
@@ -560,8 +612,26 @@ pub const Model = struct {
         return self.nostrconnect_error_len > 0;
     }
 
+    /// The two fns that hand out a passphrase in the clear. They fill a
+    /// request body on its way to the daemon and nothing else; the fields draw
+    /// `shown_passphrase` and `shown_backup_passphrase`, which are stars until
+    /// the reader asks to see the characters. Declaring them here is how the
+    /// markup checker is told that going unbound is the point, rather than
+    /// something someone forgot to wire up.
+    pub const view_unbound = .{ "passphrase", "backup_passphrase" };
+
     pub fn passphrase(self: *const Model) []const u8 {
         return self.passphrase_buf.text();
+    }
+    /// What the passphrase FIELD draws. `passphrase` above is what gets sent;
+    /// these two are deliberately separate, so a change to the mask can never
+    /// reach the daemon and a change to the request can never reach the glass.
+    pub fn shown_passphrase(self: *const Model) []const u8 {
+        if (self.passphrase_showing) return self.passphrase_buf.text();
+        return stars(self.passphrase_buf.text().len);
+    }
+    pub fn passphrase_toggle_label(self: *const Model) []const u8 {
+        return if (self.passphrase_showing) "Hide the passphrase" else "Show the passphrase";
     }
     pub fn secret(self: *const Model) []const u8 {
         return self.secret_buf.text();
@@ -747,9 +817,10 @@ pub const Model = struct {
     }
     /// Wipes the passphrase and secret buffers (after a successful send, or when
     /// the daemon goes away).
-    fn clearSecrets(self: *Model) void {
+    pub fn clearSecrets(self: *Model) void {
         self.passphrase_buf.clear();
         self.secret_buf.clear();
+        self.passphrase_showing = false;
     }
 
     pub fn removeRow(self: *Model, id: u64) void {
@@ -803,6 +874,7 @@ pub const Msg = union(enum) {
     reveal_backup,
     cancel_backup,
     backup_pass_edit: canvas.TextInputEvent,
+    toggle_backup_passphrase,
     /// Ask for the encrypted key: still behind the passphrase, safe to keep.
     export_encrypted,
     /// Ask for the key in the clear, which is the one that can be stolen.
@@ -823,6 +895,8 @@ pub const Msg = union(enum) {
 
     // Onboarding (first-run key setup / unlock).
     passphrase_edit: canvas.TextInputEvent,
+    /// Show or hide the passphrase characters.
+    toggle_passphrase,
     secret_edit: canvas.TextInputEvent,
     choose_create,
     choose_import,
@@ -1258,9 +1332,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .reveal_backup => model.backup_showing = true,
         .cancel_backup => model.clearBackup(),
         .backup_pass_edit => |e| {
-            model.backup_pass.apply(e);
+            applyMaskedEdit(&model.backup_pass, e, !model.backup_pass_showing);
             model.backup_error_len = 0;
         },
+        .toggle_backup_passphrase => model.backup_pass_showing = !model.backup_pass_showing,
         .export_encrypted => sendExport(model, fx, false),
         .export_secret => sendExport(model, fx, true),
         .backup_done => |response| {
@@ -1353,7 +1428,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         // -- onboarding --
-        .passphrase_edit => |e| model.passphrase_buf.apply(e),
+        .passphrase_edit => |e| applyMaskedEdit(&model.passphrase_buf, e, !model.passphrase_showing),
+        .toggle_passphrase => model.passphrase_showing = !model.passphrase_showing,
         .nostrconnect_edit => |e| {
             model.nostrconnect_buf.apply(e);
             model.nostrconnect_error_len = 0;
