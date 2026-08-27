@@ -392,6 +392,10 @@ pub const Model = struct {
     /// Attached mode sets it at boot: the address came from the environment and
     /// is the operator's business.
     port_known: bool = false,
+    /// Whether this window has already started a daemon. Not the same question
+    /// as "is one running": another app may have started the one we are talking
+    /// to, and that is the ordinary case rather than a fallback.
+    spawned: bool = false,
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -935,10 +939,35 @@ const Effects = NotaryApp.Effects;
 /// fails and the daemon says so.
 const managed_bind_address = "127.0.0.1:8787";
 
+/// Whether this window may start a daemon of its own, on a retry tick.
+///
+/// Split out because it is the rule the shared daemon turns on, and a rule
+/// worth being able to state without an event loop around it. Three ways to
+/// answer no, and each is a different mistake avoided:
+///
+///   - not managed: this window was pointed at somebody else's daemon on
+///     purpose, and starting a competing one is not ours to do;
+///   - already spawned: a second would race the first onto a port the first
+///     holds exclusively, and the loser exits while this window waits for it;
+///   - connected: something is already serving, which is the ordinary case now
+///     rather than a fallback. Another app may have started it, or the reader
+///     may have opened Notary before Plaza.
+fn shouldStartDaemon(managed: bool, spawned: bool, phase: Phase) bool {
+    if (!managed or spawned) return false;
+    return phase != .connected;
+}
+
+pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, phase: Phase) bool {
+    return shouldStartDaemon(managed, spawned, phase);
+}
+
 fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.phase = .starting;
-    // A restarted daemon gets a different port, so anything we knew is stale.
-    model.port_known = false;
+    // Recorded so the retry tick starts at most one daemon per window: a second
+    // would race the first onto a port the first holds exclusively, and the
+    // loser exits while this window waits for it. It gates only the AUTOMATIC
+    // spawn; Restart and the sign-out paths call this directly and are meant to.
+    model.spawned = true;
     fx.spawn(.{
         .key = daemon_key,
         .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address },
@@ -1187,11 +1216,18 @@ fn onUnauthorized(model: *Model, fx: *Effects) void {
 
 /// Boot command: in managed mode spawn the daemon; either way begin connecting.
 pub fn boot(model: *Model, fx: *Effects) void {
-    if (model.managed) {
-        spawnDaemon(model, fx);
-    } else {
-        model.phase = .connecting;
-    }
+    // Look before starting one. The daemon is shared now: it outlives the
+    // window that spawned it (only `/lock` ends it), another app on this
+    // machine may have started it, and the reader may have opened that app
+    // first. Spawning unconditionally would put a second daemon on a port the
+    // first one holds exclusively, and the loser would exit while this window
+    // waited for it.
+    //
+    // So connect first and let the retry path start one only if nothing
+    // answers. Attaching to a daemon somebody else started is the normal case,
+    // not a fallback: the alternative is signing the reader out of whatever was
+    // already using it.
+    model.phase = .connecting;
     attemptConnect(model, fx);
     // Keep the live relay status fresh while serving (the initial /info is a
     // one-shot; the pending poll doesn't carry relay state).
@@ -1303,6 +1339,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome != .fired) return;
             if (model.phase == .daemon_exited) return; // wait for the Restart button
+            // Nothing answered on the well-known address, so there is no daemon
+            // to attach to and this window may start one. Only in managed mode,
+            // and only once: attached mode was pointed at somebody else's
+            // daemon on purpose, and a second spawn would race the first.
+            if (shouldStartDaemon(model.managed, model.spawned, model.phase))
+                spawnDaemon(model, fx);
             // A full reconnect attempt: re-read the token, then poll.
             attemptConnect(model, fx);
         },
@@ -1698,9 +1740,14 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
         model.setDaemonBin(bin);
         model.managed = true;
     }
-    // Attached mode talks to whatever the operator pointed us at, so the
-    // address above is already the answer. Managed mode waits to be told.
-    model.port_known = !model.managed;
+    // The address is known in BOTH modes now. Attached mode talks to whatever
+    // the operator pointed us at; managed mode used to wait to be told, because
+    // the daemon was given a kernel-chosen port and printed it back. A
+    // well-known port removes that wait, and removing it is what lets this
+    // window look for a daemon that is ALREADY running before starting one of
+    // its own.
+    model.port_known = true;
+    if (model.managed) model.setBaseUrl(managed_bind_address);
 
     if (environ.get("SIGNER_APPROVAL_TOKEN_FILE")) |path| {
         model.setTokenPath(path);

@@ -63,6 +63,31 @@ fn expectByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const 
 
 // ------------------------------------------------------------- parsing
 
+test "a window looks for a daemon before starting one" {
+    // The daemon is shared. It outlives the window that spawned it (only
+    // `/lock` ends it), another app on this machine may have started it, and
+    // the reader may have opened that app first. A window that spawned
+    // unconditionally would put a second daemon on a port the first holds
+    // exclusively: the loser exits, and this window waits for something that is
+    // never coming while a perfectly good daemon is already serving.
+
+    // Nothing is answering and this window has started nothing: its turn.
+    try testing.expect(main.shouldStartDaemonForTest(true, false, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, .disconnected));
+
+    // Something IS answering. Attaching to a daemon somebody else started is
+    // the ordinary case, not a fallback.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, .connected));
+
+    // Already started one. A second races the first onto a port held
+    // exclusively, and the loser exits.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, .connecting));
+
+    // Attached mode was pointed at somebody else's daemon on purpose.
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, .disconnected));
+}
+
 test "parseInfo fills the header fields" {
     var m = Model{};
     main.parseInfo(&m, "{\"pubkey\":\"aabbccddeeff00112233\",\"timeout_ms\":120000}");
