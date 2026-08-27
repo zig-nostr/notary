@@ -52,6 +52,14 @@ pub const Pending = struct {
     /// The method as the permission store spells it, parsed once by the caller
     /// that already had to parse it.
     method_id: nip46.Method = .sign_event,
+    /// Whether `client_buf` is a name an app on this machine chose for itself,
+    /// rather than the pubkey of whoever signed a request that came over a
+    /// relay.
+    ///
+    /// The two look nothing alike and mean nothing alike, and a person deciding
+    /// whether to allow a signature has to be told which one they are reading.
+    /// A relay client proved it holds a key. A local one typed a word.
+    local: bool = false,
     /// What is being signed: the start of the event's content, for `sign_event`.
     ///
     /// The kind number says what SHAPE it is, never what it says. Approving a
@@ -84,7 +92,17 @@ fn signEventPreview(gpa: std.mem.Allocator, request: *const nip46.Request, out: 
         .{ .ignore_unknown_fields = true },
     ) catch return 0;
     defer parsed.deinit();
-    const text = std.mem.trim(u8, parsed.value.content, " \t\r\n");
+    return previewOf(parsed.value.content, out);
+}
+
+/// The same clip, for a caller that already holds the text.
+///
+/// One implementation, because the rule it enforces is not obvious and a second
+/// copy would be the copy that forgets it: a preview is cut on a character
+/// boundary, since half a UTF-8 sequence is not a character and this string
+/// goes into a JSON response and then onto a screen.
+pub fn previewOf(text_in: []const u8, out: *[160]u8) u8 {
+    const text = std.mem.trim(u8, text_in, " \t\r\n");
     var n = @min(text.len, out.len);
     while (n > 0 and n < text.len and (text[n] & 0xc0) == 0x80) n -= 1;
     @memcpy(out[0..n], text[0..n]);
@@ -98,6 +116,14 @@ const Slot = struct {
     /// How long the operator's answer should last. Written under the lock
     /// before the decision is published, and read after it.
     remember: nip46.Remember = .once,
+    /// Whether a thread is parked on this slot waiting for the answer.
+    ///
+    /// True for a request that arrived over a relay: that thread is inside
+    /// `submitRemembering` and frees the slot on its way out. False for one
+    /// that arrived over the local protocol, which was answered the moment it
+    /// was asked and left this behind as a question for a person. Nothing is
+    /// coming back for that one, so `resolveFor` frees it.
+    waiter: bool = true,
 };
 
 pub const Broker = struct {
@@ -144,7 +170,7 @@ pub const Broker = struct {
     pub const Answered = struct { decision: Decision, remember: nip46.Remember };
 
     pub fn submitRemembering(self: *Broker, io: std.Io, info: Pending) Answered {
-        const idx = self.claim(info) orelse return .{ .decision = .reject, .remember = .once };
+        const idx = self.claim(info, true) orelse return .{ .decision = .reject, .remember = .once };
 
         // Poll the decision slot, pacing with io.sleep (as the reconnect loop
         // does). Elapsed time is counted in sleep steps, no wall clock needed.
@@ -168,12 +194,46 @@ pub const Broker = struct {
         return .{ .decision = final, .remember = how_long };
     }
 
-    fn claim(self: *Broker, info: Pending) ?usize {
+    /// Puts a question on the queue for a request that is NOT waiting for the
+    /// answer, and says whether it is now there.
+    ///
+    /// The local protocol cannot wait. `submitRemembering` parks the calling
+    /// thread for up to the full approval timeout, and on the loopback server
+    /// that thread is one of eight, so eight unanswered local requests take
+    /// every handler the server has. The GUI polls the queue over that same
+    /// server, so it could no longer fetch the very questions it was being
+    /// asked to answer, and no answer could arrive to release anything. That is
+    /// not a slow path, it is a signer that has stopped, and reaching it costs
+    /// an attacker eight requests.
+    ///
+    /// So the request is refused now and the question is left here. The client
+    /// asks again; by then a person may have answered.
+    ///
+    /// Deduplicated on exactly what an answer covers, because a client that
+    /// retries every second would otherwise fill all thirty-two slots with one
+    /// question inside a minute, and bury every other app's under it.
+    pub fn knock(self: *Broker, info: Pending) bool {
+        self.acquire();
+        for (&self.slots) |*slot| {
+            if (!slot.in_use or slot.decision.load(.monotonic) != .pending) continue;
+            if (slot.info.local == info.local and slot.info.method_id == info.method_id and
+                slot.info.kind == info.kind and
+                std.mem.eql(u8, &slot.info.client_id, &info.client_id))
+            {
+                self.release();
+                return true;
+            }
+        }
+        self.release();
+        return self.claim(info, false) != null;
+    }
+
+    fn claim(self: *Broker, info: Pending, waiter: bool) ?usize {
         self.acquire();
         defer self.release();
         for (&self.slots, 0..) |*slot, i| {
             if (!slot.in_use) {
-                slot.* = .{ .in_use = true, .info = info, .decision = .init(.pending) };
+                slot.* = .{ .in_use = true, .info = info, .decision = .init(.pending), .waiter = waiter };
                 slot.info.id = self.next_id;
                 self.next_id += 1;
                 _ = self.version.fetchAdd(1, .monotonic);
@@ -244,6 +304,9 @@ pub const Broker = struct {
                 slot.remember = how_long;
                 slot.decision.store(decision, .release);
                 info = slot.info;
+                // Nobody is coming to collect this one. Left in use it would
+                // hold a slot forever, and there are thirty-two of them.
+                if (!slot.waiter) slot.in_use = false;
                 found = true;
                 break;
             }
@@ -618,4 +681,29 @@ test "walking away is not an answer, so a timeout is not remembered as a denial"
     const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.approve, nip46.Remember.once });
     defer t.join();
     try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
+}
+
+test "answered local questions do not fill the queue for good" {
+    // Nothing is parked on a local request. It was refused the moment it
+    // arrived and the app went away, so the only thing that can free its slot
+    // is the answer itself.
+    //
+    // The consequence is what this drives, not the mechanism: run more
+    // questions through than there are slots. If an answered one kept its
+    // slot, the queue silently fills, and from then on no app can raise a
+    // question and no relay request can either. The signer would look fine and
+    // simply stop asking.
+    var broker = Broker{};
+    var q: [Broker.capacity]Pending = undefined;
+    for (0..Broker.capacity * 2) |i| {
+        var info = Pending{ .local = true, .kind = @intCast(i), .method_id = .sign_event };
+        info.client_id = [_]u8{7} ** 32;
+        try testing.expect(broker.knock(info));
+        // One at a time, so a slot that was not freed is the only way to run out.
+        try testing.expectEqual(@as(usize, 1), broker.snapshot(&q));
+        // `.once` is never written down, so every turn is a fresh question
+        // rather than a permission piling up.
+        try testing.expect(broker.resolveFor(q[0].id, .reject, .once, 0));
+        try testing.expectEqual(@as(usize, 0), broker.snapshot(&q));
+    }
 }
