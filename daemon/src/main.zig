@@ -19,6 +19,7 @@ const PolicyConfig = nostr.nip46.PolicyConfig;
 const approval = @import("approval.zig");
 const approval_http = @import("approval_http.zig");
 const onboarding = @import("onboarding.zig");
+const audit = @import("audit.zig");
 const relay_keeper = @import("relay_keeper.zig");
 
 const keys = nostr.keys;
@@ -30,6 +31,7 @@ const hex = nostr.hex;
 // configuration; each is overridable via its environment variable. The key and
 // token files sit under $HOME; relays default to a public relay.
 const default_token_file = ".zig-nostr-signer.token";
+const default_log_file = audit.default_file;
 
 const default_key_file = ".zig-nostr-signer.key";
 // What the GUI serves on when the reader has not chosen. THREE, not one.
@@ -56,6 +58,14 @@ const default_key_file = ".zig-nostr-signer.key";
 var g_seen_requests: nostr.signer.SeenRequests = .{};
 var g_authorized_clients: nip46.AuthorizedClients = .{};
 
+/// Where every use of the key is written down.
+///
+/// Process-lived and shared, because both the relay threads and the approval
+/// server write to it, and one file with one lock is the only way those lines
+/// stay whole. Its path is set at startup; until then it is a log that goes
+/// nowhere, which is what the non-GUI paths want anyway.
+var g_audit: audit.Log = .{};
+
 const default_gui_relays = "wss://nostr.oxtr.dev,wss://theforest.nostr1.com,wss://relay.primal.net";
 
 const usage =
@@ -72,6 +82,8 @@ const usage =
     \\  SIGNER_ALLOWED_KINDS   comma-separated event kinds sign_event may sign
     \\                         (default: any kind)
     \\  SIGNER_INIT            if set, create/import an encrypted key file and exit
+    \\  SIGNER_LOG_FILE        where uses of the key are written down (default:
+    \\                         $HOME/.zig-nostr-signer.log; empty turns it off)
     \\
     \\Subcommands:
     \\  import                 paste an existing nsec, read from the terminal
@@ -192,12 +204,21 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         fail("out of memory tracking relay status");
     for (relay_status) |*s| s.* = std.atomic.Value(u8).init(@intFromEnum(approval_http.RelayStatus.connecting));
 
+    // Beside the key, and readable only by this user, because it is a list of
+    // everything that key has done. `SIGNER_LOG_FILE=""` turns it off for
+    // somebody who would rather it did not exist.
+    g_audit = .{
+        .dir = std.Io.Dir.cwd(),
+        .path = getEnv("SIGNER_LOG_FILE") orelse resolveHome(gpa, default_log_file),
+    };
+
     const token_hex = makeAndWriteToken(gpa, token_path);
     var approval_server: approval_http.Server = .{
         .gpa = gpa,
         .broker = &broker_storage,
         .gate = &gate,
         .token = token_hex,
+        .log = &g_audit,
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
         .clients = &g_authorized_clients,
         .host = hp.host,
@@ -217,10 +238,11 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         \\  approval API : http://{s}  (bearer token → {s})
         \\  key file     : {s}
         \\  key state    : {s}
+        \\  audit log    : {s}
         \\
         \\{s}
         \\
-    , .{ addr, token_path, key_file, @tagName(booted), key_note });
+    , .{ addr, token_path, key_file, @tagName(booted), if (g_audit.path.len == 0) "(off)" else g_audit.path, key_note });
 
     // Block until the GUI creates or unlocks the key (returns at once if a
     // preconfigured key was loaded above), then serve with it. The broker is
@@ -408,6 +430,7 @@ fn serveRelayForever(
         .config = policy_config,
         .io = io,
         .gpa = gpa,
+        .log = &g_audit,
     };
     const request_policy = if (broker != null) interactive.asPolicy() else policy_config.policy();
 
@@ -762,6 +785,7 @@ test {
     //
     // The serve loop, keystore, and policy tests now run in the nostr library.
     _ = @import("approval.zig");
+    _ = @import("audit.zig");
     _ = @import("approval_http.zig");
     _ = @import("onboarding.zig");
     _ = @import("relay_keeper.zig");

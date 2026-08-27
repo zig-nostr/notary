@@ -24,6 +24,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 const approval = @import("approval.zig");
+const audit = @import("audit.zig");
 const onboarding = @import("onboarding.zig");
 
 const net = std.Io.net;
@@ -69,6 +70,9 @@ pub const Server = struct {
     gate: *Gate,
     /// Bearer token clients must present.
     token: []const u8,
+    /// Where uses of the key are written down. Null writes nothing, which is
+    /// how the tests that are about something else stay about something else.
+    log: ?*audit.Log = null,
     info: Info,
     host: []const u8,
     port: u16,
@@ -324,7 +328,7 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     if (eql(method, "POST") and eql(path, "/forget"))
         return handleForget(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/lock"))
-        return handleLock(self, w);
+        return handleLock(self, io, w);
     if (eql(method, "POST") and eql(path, "/export"))
         return handleExport(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/nostrconnect"))
@@ -444,7 +448,24 @@ fn handleDecision(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8
     else
         .once;
 
+    // What the operator was looking at when they answered, so the record says
+    // who they allowed rather than only that they pressed something.
+    var asked: [Broker.capacity]Pending = undefined;
+    const n = self.broker.snapshot(&asked);
+    const row: ?Pending = for (asked[0..n]) |p| {
+        if (p.id == parsed.value.id) break p;
+    } else null;
+
     const ok = self.broker.resolveFor(parsed.value.id, decision, how_long, std.Io.Timestamp.now(io, .real).toMilliseconds());
+    if (ok) if (row) |p| note(self, io, .{
+        .what = "decision",
+        .outcome = if (decision == .approve) "allowed" else "denied",
+        .who = p.client(),
+        .local = p.local,
+        .method = p.method(),
+        .kind = p.kind,
+        .remember = @tagName(how_long),
+    });
     var out: [32]u8 = undefined;
     const j = std.fmt.bufPrint(&out, "{{\"ok\":{s}}}", .{if (ok) "true" else "false"}) catch unreachable;
     return respond(w, 200, j);
@@ -530,6 +551,10 @@ fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !
         error.InvalidSecretKey => respond(w, 400, "{\"error\":\"invalid secret key\"}"),
         else => respond(w, 500, "{\"error\":\"could not create the key\"}"),
     };
+    // Which of the two happened, because they are not the same event: one
+    // made an identity and one adopted one, and only the log can say which
+    // this key is.
+    note(self, io, .{ .what = "setup", .outcome = if (importing) "import" else "create" });
     return respondPubkey(self, w);
 }
 
@@ -560,6 +585,9 @@ fn handleForget(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     // Sessions granted against the key being removed must not outlive it. A
     // client still holding an authorization is one that would be recognised by
     // whatever key is set up next.
+    // Written before the key goes, so the last line in the log is the one that
+    // says where it went. This is the only irreversible thing the daemon does.
+    note(self, io, .{ .what = "forget", .outcome = "ok" });
     if (self.clients) |c| c.clear();
     self.broker.reset();
     self.gate.forget(io);
@@ -617,7 +645,8 @@ fn handleExport(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
 ///
 /// The key stays where it is, encrypted, so the next daemon comes up locked and
 /// asks for the passphrase. `/forget` is the one that removes it.
-fn handleLock(self: *Server, w: *std.Io.Writer) !void {
+fn handleLock(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
+    note(self, io, .{ .what = "lock", .outcome = "ok" });
     // Sessions granted before signing out must not outlive it: a client still
     // holding an authorization would be recognised by the daemon that follows.
     if (self.clients) |c| c.clear();
@@ -711,11 +740,18 @@ fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
         return respond(w, 400, bad_request);
     defer parsed.deinit();
 
-    self.gate.unlock(io, parsed.value.passphrase) catch |err| return switch (err) {
-        error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
-        error.NotLocked => respond(w, 409, "{\"error\":\"not locked\"}"),
-        else => respond(w, 500, "{\"error\":\"could not unlock\"}"),
+    self.gate.unlock(io, parsed.value.passphrase) catch |err| {
+        // A wrong passphrase is worth writing down. One is a typo; a run of
+        // them at four in the morning is the only warning this daemon can
+        // give that somebody is working on the key.
+        note(self, io, .{ .what = "unlock", .outcome = if (err == error.BadPassphrase) "bad" else "error" });
+        return switch (err) {
+            error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
+            error.NotLocked => respond(w, 409, "{\"error\":\"not locked\"}"),
+            else => respond(w, 500, "{\"error\":\"could not unlock\"}"),
+        };
     };
+    note(self, io, .{ .what = "unlock", .outcome = "ok" });
     return respondPubkey(self, w);
 }
 
@@ -739,6 +775,14 @@ fn signerState(gate: *const Gate) []const u8 {
         .locked => ipc.state_locked,
         .unlocked => ipc.state_ready,
     };
+}
+
+/// Writes one line about what the key was asked to do, if anybody is keeping a
+/// record. One helper rather than a check at every call site, because the call
+/// site that forgets the check is the one that stops recording.
+fn note(self: *Server, io: std.Io, event: audit.Event) void {
+    const l = self.log orelse return;
+    l.note(io, std.Io.Timestamp.now(io, .real).toSeconds(), event);
 }
 
 fn respondIpcError(self: *Server, w: *std.Io.Writer, status: u16, message: []const u8) !void {
@@ -770,11 +814,13 @@ fn localAllowed(
     method: nip46.Method,
     kind: i32,
     preview: []const u8,
+    comptime what: []const u8,
 ) !bool {
     // An app that will not say what it is gets nothing. There is no shared
     // "some local app" permission to fall back on, deliberately: that is the
     // single client this whole mechanism exists to break up.
     if (!ipc.clientNameOk(name)) {
+        note(self, io, .{ .what = what, .outcome = "unnamed", .method = method.name(), .kind = kind });
         try respondIpcError(self, w, 400, ipc.reason_unnamed);
         return false;
     }
@@ -783,6 +829,7 @@ fn localAllowed(
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
     if (self.broker.permissions.remembered(id, method, kind, now_ms)) |allowed| {
         if (allowed) return true;
+        note(self, io, .{ .what = what, .outcome = "refused", .who = name, .local = true, .method = method.name(), .kind = kind });
         try respondIpcError(self, w, 403, ipc.reason_refused);
         return false;
     }
@@ -810,6 +857,7 @@ fn localAllowed(
     info.preview_len = approval.previewOf(preview, &info.preview_buf);
     _ = self.broker.knock(info);
 
+    note(self, io, .{ .what = what, .outcome = "awaiting", .who = name, .local = true, .method = method.name(), .kind = kind });
     try respondIpcError(self, w, 403, ipc.reason_awaiting_approval);
     return false;
 }
@@ -852,7 +900,7 @@ fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const 
 
     // Locked first, then permission. Asking somebody to allow a signature the
     // daemon could not produce anyway is a question with no useful answer.
-    if (!try localAllowed(self, io, w, client_name, .sign_event, ev.kind, ev.content)) return;
+    if (!try localAllowed(self, io, w, client_name, .sign_event, ev.kind, ev.content, "sign")) return;
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -864,6 +912,21 @@ fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const 
     const json = nostr.event.toJson(self.gpa, signed) catch
         return respondIpcError(self, w, 500, "out of memory");
     defer self.gpa.free(json);
+
+    // By id, which is what finds the note again and is public the moment it is
+    // published. The content is not written down: an audit log that quotes what
+    // you wrote is a second copy of it in a file nothing else protects.
+    var id_hex: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&id_hex, "{x}", .{signed.id}) catch unreachable;
+    note(self, io, .{
+        .what = "sign",
+        .outcome = "ok",
+        .who = client_name,
+        .local = true,
+        .method = "sign_event",
+        .kind = ev.kind,
+        .id = &id_hex,
+    });
 
     const out = ipc.SignEvent{ .event = json };
     const out_json = out.toJson(self.gpa) catch
@@ -904,7 +967,7 @@ fn handleSignerCipher(
         .encrypt => .nip44_encrypt,
         .decrypt => .nip44_decrypt,
     };
-    if (!try localAllowed(self, io, w, client_name, method, -1, "")) return;
+    if (!try localAllowed(self, io, w, client_name, method, -1, "", "cipher")) return;
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -922,6 +985,18 @@ fn handleSignerCipher(
         out.append(self.gpa, result) catch
             return respondIpcError(self, w, 500, "out of memory");
     }
+
+    // Who with and how many, never what. The plaintext is the whole thing this
+    // is protecting.
+    note(self, io, .{
+        .what = "cipher",
+        .outcome = "ok",
+        .who = client_name,
+        .local = true,
+        .method = method.name(),
+        .peer = req.peer,
+        .count = req.items.len,
+    });
 
     const res = ipc.CipherResult{ .items = out.items };
     const j = res.toJson(self.gpa) catch
@@ -1713,4 +1788,89 @@ test "an app cannot name itself out of the queue's JSON" {
     try testing.expectEqualStrings(hostile, parsed.value.pending[0].client);
     try testing.expectEqual(@as(i32, 1), parsed.value.pending[0].kind);
     try testing.expect(parsed.value.pending[0].local);
+}
+
+test "what the key did is written down, and what it was told in confidence is not" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var log = audit.Log{ .dir = tmp.dir, .path = "audit.log" };
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    gate.preload(kp);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .log = &log, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    const req = try signRequest(gpa, 1);
+    defer gpa.free(req);
+
+    // Refused first, then answered, then signed: the three things that can
+    // happen to one request, in the order a person actually meets them.
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, io, &out.writer, req, test_client);
+    }
+    var queue: [Broker.capacity]Pending = undefined;
+    try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const body = try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"decision\":\"approve\",\"remember\":\"always\"}}", .{queue[0].id});
+        defer gpa.free(body);
+        try handleDecision(&server, io, &out.writer, body);
+    }
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
+    }
+
+    const written = try tmp.dir.readFileAlloc(io, "audit.log", gpa, .unlimited);
+    defer gpa.free(written);
+
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, written, "\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "\"outcome\":\"awaiting\"") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"decision\"") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"remember\":\"always\"") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"outcome\":\"ok\"") != null);
+    // Which app, and what it signed, by an id that finds the note again.
+    try testing.expect(std.mem.indexOf(u8, written, "\"who\":\"test-app\"") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"kind\":1") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "\"id\":\"") != null);
+
+    // And not what it said. The content of a signed note is the one thing a
+    // record of signatures must not become a second copy of.
+    try testing.expect(std.mem.indexOf(u8, written, "hello") == null);
+}
+
+test "a wrong passphrase is written down, because a run of them is the only warning" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var log = audit.Log{ .dir = tmp.dir, .path = "audit.log" };
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "no-such-key.ncryptsec", .locked);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .log = &log, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleUnlock(&server, io, &out.writer, "{\"passphrase\":\"hunter2\"}");
+
+    const written = try tmp.dir.readFileAlloc(io, "audit.log", gpa, .unlimited);
+    defer gpa.free(written);
+    try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"unlock\"") != null);
+    // The attempt, never the attempt's passphrase.
+    try testing.expect(std.mem.indexOf(u8, written, "hunter2") == null);
 }

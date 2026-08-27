@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const audit = @import("audit.zig");
 const PolicyConfig = nostr.nip46.PolicyConfig;
 
 const nip46 = nostr.nip46;
@@ -329,6 +330,8 @@ pub const Interactive = struct {
     config: *const PolicyConfig,
     io: std.Io,
     gpa: std.mem.Allocator,
+    /// Where uses of the key are written down. Null writes nothing.
+    log: ?*audit.Log = null,
 
     pub fn asPolicy(self: *const Interactive) nip46.Policy {
         return .{ .ctx = @constCast(self), .decideFn = &decide };
@@ -380,6 +383,7 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     const kind: i32 = if (nostr.nip46.signEventKind(self.gpa, request)) |k| @intCast(k) else -1;
     const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     if (self.broker.permissions.remembered(client, method, kind, now_ms)) |allowed| {
+        noteRelay(self, client, method, kind, if (allowed) "ok" else "refused");
         return if (allowed) .approve else .reject;
     }
 
@@ -405,10 +409,37 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     // away said nothing, and storing silence as a denial would lock a client
     // out over an absence.
     const answered = self.broker.submitRemembering(self.io, info);
+    // A request nobody answered is not a refusal, and the log says so. That
+    // difference is the whole reason a timeout is not written down as one.
+    noteRelay(self, client, method, kind, switch (answered.decision) {
+        .approve => "ok",
+        .pending => "unanswered",
+        .reject => "refused",
+    });
     return switch (answered.decision) {
         .approve => .approve,
         else => .reject,
     };
+}
+
+/// Writes down what a request that arrived over a relay was allowed to do.
+///
+/// By pubkey, and `local` false, because this one is proof: whoever sent it
+/// signed it with that key. The line an app on this machine gets carries a
+/// name it chose, and the two must not read alike in the record any more than
+/// they do on the screen.
+fn noteRelay(self: *const Interactive, client: [32]u8, method: nip46.Method, kind: i32, outcome: []const u8) void {
+    const l = self.log orelse return;
+    var who: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&who, "{x}", .{client}) catch return;
+    l.note(self.io, std.Io.Timestamp.now(self.io, .real).toSeconds(), .{
+        .what = "sign",
+        .outcome = outcome,
+        .who = &who,
+        .local = false,
+        .method = method.name(),
+        .kind = kind,
+    });
 }
 
 // ---------------------------------------------------------------------------
