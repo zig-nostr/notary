@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-08-27
+
 ### Fixed
 - **The passphrase field no longer shows the passphrase.** Both onboarding
   screens and the backup panel drew every character in the clear, which is the

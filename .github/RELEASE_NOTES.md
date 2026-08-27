@@ -1,10 +1,12 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.9.1
+### What's new in v0.9.2
 
-**A key imported from a terminal no longer needs a restart.** `signer import` takes your nsec from a terminal and stores it encrypted, and a Notary that was already open never found out. The window sat on "Set up your signer" until you quit and reopened the app, which is a strange thing to ask of somebody who has just typed their nsec and chosen a passphrase for it.
+**The passphrase field no longer shows the passphrase.** Both setup screens and the backup panel drew every character as you typed it, which is the wrong default for something people type in a cafe, on a call, or into a screen recording. They draw stars now, with an eye beside the field for the times you want to read back what you typed.
 
-It notices now, in about a second, and asks for that passphrase. Importing still writes the key to disk rather than handing it to the running app, and that is on purpose: the channel Notary listens on is deliberately hard to find, so nothing else on your Mac can reach it, and a command that could would have to publish where it is. So this lands on the unlock screen rather than straight into serving. One passphrase, instead of a relaunch.
+It starts hidden every launch, and goes back to hidden after each send. Hiding it also keeps the characters out of the name the window publishes for that field, which is where anything on your Mac with accessibility access could have read them.
+
+One rough edge, and it belongs to the toolkit rather than to Notary: replacing selected text with exactly as many characters leaves the typed ones on screen until your next keystroke. Reveal the field if you want to edit the middle of a passphrase.
 
 ### Install
 
