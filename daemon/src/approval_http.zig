@@ -28,6 +28,7 @@ const onboarding = @import("onboarding.zig");
 
 const net = std.Io.net;
 const nip46 = nostr.nip46;
+const ipc = nostr.signer_ipc;
 const Broker = approval.Broker;
 const Pending = approval.Pending;
 const Gate = onboarding.Gate;
@@ -332,6 +333,18 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handlePending(self, io, w, path);
     if (eql(method, "POST") and eql(path, "/decision"))
         return handleDecision(self, w, body);
+    // The local signing protocol (nostr's `signer_ipc`), which is what lets a
+    // client on this machine use this daemon without a relay round trip. The
+    // paths come from the library so every product speaks one protocol rather
+    // than each inventing its own.
+    if (eql(method, "GET") and eql(path, ipc.path_pubkey))
+        return handleSignerPubkey(self, w);
+    if (eql(method, "POST") and eql(path, ipc.path_sign))
+        return handleSignerSign(self, w, body);
+    if (eql(method, "POST") and eql(path, ipc.path_nip44_encrypt))
+        return handleSignerCipher(self, io, w, body, .encrypt);
+    if (eql(method, "POST") and eql(path, ipc.path_nip44_decrypt))
+        return handleSignerCipher(self, io, w, body, .decrypt);
     return respond(w, 404, "{\"error\":\"not found\"}");
 }
 
@@ -678,6 +691,135 @@ fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     return respondPubkey(self, w);
 }
 
+// --- the local signing protocol ------------------------------------------
+//
+// `nostr.signer_ipc` over this same channel, so a client on this machine can
+// use the key without a relay round trip. The relay side of this daemon serves
+// clients that reached it over NIP-46; this serves the ones that are right
+// here. Both end at the same key, the same gate and the same permissions.
+
+/// The state the wire reports, from the gate's own.
+///
+/// Three states, not two, and the mapping is the point. A LOCKED daemon must
+/// not report `uninitialized`: that reads as "there is no key here", and a
+/// client that believes it offers to make one over the top of an identity that
+/// already exists. A nostr key cannot be replaced, so that is the one mistake
+/// worth designing the vocabulary around.
+fn signerState(gate: *const Gate) []const u8 {
+    return switch (gate.current()) {
+        .uninitialized => ipc.state_uninitialized,
+        .locked => ipc.state_locked,
+        .unlocked => ipc.state_ready,
+    };
+}
+
+fn respondIpcError(self: *Server, w: *std.Io.Writer, status: u16, message: []const u8) !void {
+    const body = ipc.Failure{ .@"error" = message };
+    const j = body.toJson(self.gpa) catch return respond(w, status, bad_request);
+    defer self.gpa.free(j);
+    return respond(w, status, j);
+}
+
+/// GET /pubkey: what state this daemon is in and whose key it holds.
+///
+/// The pubkey rides along while LOCKED as well as ready, because whose key it
+/// is was never the secret and a client that knows it can name the account it
+/// is asking to unlock rather than showing a passphrase box for nobody.
+fn handleSignerPubkey(self: *Server, w: *std.Io.Writer) !void {
+    const locked_or_ready = self.gate.current() != .uninitialized;
+    const body = ipc.Pubkey{
+        .state = signerState(self.gate),
+        .pubkey = if (locked_or_ready) self.gate.pubkeyHex() else "",
+    };
+    const j = body.toJson(self.gpa) catch return respond(w, 500, bad_request);
+    defer self.gpa.free(j);
+    return respond(w, 200, j);
+}
+
+/// POST /sign: sign one event with the held key.
+fn handleSignerSign(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
+    var parsed = ipc.parse(ipc.SignEvent, self.gpa, body) catch
+        return respondIpcError(self, w, 400, "malformed sign request");
+    defer parsed.deinit();
+
+    var unsigned = nostr.event.fromJson(self.gpa, parsed.value.event) catch
+        return respondIpcError(self, w, 400, "not a valid event");
+    defer unsigned.deinit();
+    const ev = unsigned.value;
+
+    // Kinds 14 and 15 are the UNSIGNED rumors inside a NIP-59 gift wrap. A
+    // signature on one destroys the deniability the whole scheme exists for,
+    // so this refuses them however they are asked for.
+    if (ev.kind == 14 or ev.kind == 15)
+        return respondIpcError(self, w, 422, "kind 14 and 15 are never signed");
+
+    if (self.gate.current() != .unlocked)
+        return respondIpcError(self, w, 409, "the key is locked");
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const kp = signer.keyPairFromSecretKey(self.gate.secret_key) catch
+        return respondIpcError(self, w, 500, "bad key");
+
+    const signed = nostr.event.create(self.gpa, signer, kp, ev.created_at, ev.kind, ev.tags, ev.content, null) catch
+        return respondIpcError(self, w, 500, "signing failed");
+    const json = nostr.event.toJson(self.gpa, signed) catch
+        return respondIpcError(self, w, 500, "out of memory");
+    defer self.gpa.free(json);
+
+    const out = ipc.SignEvent{ .event = json };
+    const out_json = out.toJson(self.gpa) catch
+        return respondIpcError(self, w, 500, "out of memory");
+    defer self.gpa.free(out_json);
+    return respond(w, 200, out_json);
+}
+
+/// POST /nip44/encrypt and /nip44/decrypt: batched, N items in and N out in
+/// order. Batching is the point rather than a nicety: a DM catch-up is
+/// thousands of decrypts and one round trip each would drown in overhead.
+fn handleSignerCipher(
+    self: *Server,
+    io: std.Io,
+    w: *std.Io.Writer,
+    body: []const u8,
+    comptime dir: enum { encrypt, decrypt },
+) !void {
+    var parsed = ipc.parse(ipc.Cipher, self.gpa, body) catch
+        return respondIpcError(self, w, 400, "malformed cipher request");
+    defer parsed.deinit();
+    const req = parsed.value;
+
+    var peer: [32]u8 = undefined;
+    if (req.peer.len != 64 or (std.fmt.hexToBytes(&peer, req.peer) catch null) == null)
+        return respondIpcError(self, w, 400, "peer must be 32-byte hex");
+
+    if (self.gate.current() != .unlocked)
+        return respondIpcError(self, w, 409, "the key is locked");
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+
+    var out: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (out.items) |item| self.gpa.free(item);
+        out.deinit(self.gpa);
+    }
+    for (req.items) |item| {
+        const result = switch (dir) {
+            .encrypt => nostr.nip44.encrypt(self.gpa, io, signer, self.gate.secret_key, peer, item),
+            .decrypt => nostr.nip44.decrypt(self.gpa, signer, self.gate.secret_key, peer, item),
+        } catch return respondIpcError(self, w, 422, "a cipher item failed");
+        out.append(self.gpa, result) catch
+            return respondIpcError(self, w, 500, "out of memory");
+    }
+
+    const res = ipc.CipherResult{ .items = out.items };
+    const j = res.toJson(self.gpa) catch
+        return respondIpcError(self, w, 500, "out of memory");
+    defer self.gpa.free(j);
+    return respond(w, 200, j);
+}
+
 fn respondPubkey(self: *Server, w: *std.Io.Writer) !void {
     var out: [128]u8 = undefined;
     const j = std.fmt.bufPrint(&out, "{{\"ok\":true,\"pubkey\":\"{s}\"}}", .{self.gate.pubkeyHex()}) catch unreachable;
@@ -796,6 +938,158 @@ test "parseSince reads the query parameter" {
     try testing.expectEqual(@as(u64, 0), parseSince("/pending"));
     try testing.expectEqual(@as(u64, 7), parseSince("/pending?since=7"));
     try testing.expectEqual(@as(u64, 3), parseSince("/pending?foo=1&since=3"));
+}
+
+/// One `/sign` request body of the shape a client really sends: a complete
+/// event whose id, pubkey and signature are zeroed, since those are the three
+/// things it is asking the daemon to fill in.
+fn signRequest(gpa: std.mem.Allocator, kind: u16) ![]u8 {
+    const unsigned = nostr.event.Event{
+        .id = [_]u8{0} ** 32,
+        .pubkey = [_]u8{0} ** 32,
+        .created_at = 1_700_000_000,
+        .kind = kind,
+        .tags = &.{},
+        .content = "hello",
+        .sig = [_]u8{0} ** 64,
+    };
+    const unsigned_json = try nostr.event.toJson(gpa, unsigned);
+    defer gpa.free(unsigned_json);
+    return (ipc.SignEvent{ .event = unsigned_json }).toJson(gpa);
+}
+
+test "GET /pubkey tells a local client which of THREE states this is" {
+    // The mapping is the whole point. A locked daemon reporting
+    // "uninitialized" would read as "there is no key here", and a client that
+    // believes that offers to create one over the top of an identity that
+    // already exists. A nostr key cannot be replaced, so this is the mistake
+    // the vocabulary is shaped around.
+    const gpa = testing.allocator;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+    const pubkey_hex = "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659";
+
+    var broker: Broker = .{};
+
+    // Nothing set up: no key, and no pubkey to name.
+    {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerPubkey(&server, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"state\":\"uninitialized\"") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"pubkey\":\"\"") != null);
+    }
+
+    // Holds a key, cannot use it yet. It says so, AND it says whose key it is,
+    // so a client can name the account it is asking to unlock.
+    {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        gate.preload(kp);
+        gate.state.store(@intFromEnum(onboarding.State.locked), .release);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerPubkey(&server, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"state\":\"locked\"") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, pubkey_hex) != null);
+        // The one reading that must never happen.
+        try testing.expect(std.mem.indexOf(u8, body.items, "uninitialized") == null);
+    }
+
+    // Unlocked: ready, in the word the wire uses rather than the gate's own.
+    {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        gate.preload(kp);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerPubkey(&server, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"state\":\"ready\"") != null);
+    }
+}
+
+test "POST /sign signs with the held key, and refuses a locked one" {
+    const gpa = testing.allocator;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    // The shape a client actually sends: a complete event with the id, pubkey
+    // and signature left zeroed, because those are what it is asking for.
+    const req = try signRequest(gpa, 1);
+    defer gpa.free(req);
+
+    // Unlocked: the answer carries a signed event under the held key.
+    {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        gate.preload(kp);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, &out.writer, req);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
+        // Signed as the key this daemon holds, not as somebody else.
+        try testing.expect(std.mem.indexOf(u8, body.items, "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659") != null);
+    }
+
+    // Locked: refuses rather than signing with a key it has not been given.
+    {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .locked);
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, &out.writer, req);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "409") != null);
+    }
+}
+
+test "a gift-wrap rumor is never signed, locked or not" {
+    // Kinds 14 and 15 are the UNSIGNED inner payloads of a NIP-59 gift wrap. A
+    // signature on one destroys the deniability the whole scheme exists for,
+    // and a messenger asking for it is asking for a mistake. Refused before the
+    // gate is even consulted, so it reads the same whatever state the key is in.
+    const gpa = testing.allocator;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    for ([_]u16{ 14, 15 }) |kind| {
+        var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+        gate.preload(kp); // unlocked, so nothing else can be the reason
+        var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+        const req = try signRequest(gpa, kind);
+        defer gpa.free(req);
+
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, &out.writer, req);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "422") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"sig\"") == null);
+    }
 }
 
 test "GET /info reports the bunker URI once unlocked" {
