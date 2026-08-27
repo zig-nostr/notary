@@ -268,6 +268,23 @@ test "an approval row says who is asking and what would be signed" {
     main.parsePending(&old, "{\"version\":1,\"pending\":[{\"id\":9,\"method\":\"sign_event\",\"kind\":1,\"created_at\":0}]}");
     const old_tree = try buildTree(arena_state.allocator(), &old);
     _ = try expectByText(old_tree.root, .text, "unknown client");
+
+    // An app on this Mac gets the other sentence. It named itself, and any
+    // program running as this user could have named itself the same, so the
+    // row says what happened rather than asserting an identity: this is the
+    // one screen in the application whose whole job is to be read carefully
+    // before somebody allows a signature under their name.
+    var here = Model{};
+    here.phase = .connected;
+    main.parsePending(&here,
+        \\{"version":1,"pending":[{"id":10,"method":"sign_event","kind":1,"created_at":0,
+        \\"local":true,"client":"plaza","preview":"gm"}]}
+    );
+    const here_tree = try buildTree(arena_state.allocator(), &here);
+    _ = try expectByText(here_tree.root, .text, "an app on this Mac calling itself \"plaza\"");
+
+    // And it must not be dressed up as proof of who is asking.
+    try testing.expect(findByText(here_tree.root, .text, "from plaza") == null);
 }
 
 test "a populated view renders rows and dispatches typed approve/deny" {

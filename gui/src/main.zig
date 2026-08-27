@@ -159,6 +159,13 @@ pub const Row = struct {
     /// The requesting client's pubkey, hex.
     client_buf: [64]u8 = [_]u8{0} ** 64,
     client_len: u8 = 0,
+    /// Whether `client_buf` holds a name an app on this Mac chose for itself,
+    /// rather than the pubkey of whoever signed a request over a relay.
+    ///
+    /// The two are not the same kind of fact and the row must not read as
+    /// though they were. A relay client proved it holds a key. A local one
+    /// typed a word, and any program running as this user can type any word.
+    local: bool = false,
     /// The start of what would be signed.
     preview_buf: [160]u8 = [_]u8{0} ** 160,
     preview_len: u8 = 0,
@@ -206,14 +213,25 @@ pub const Row = struct {
         return self.method();
     }
 
-    /// Who is asking, short enough to read: the first and last of the pubkey.
+    /// Who is asking, short enough to read, and honest about how much that is
+    /// worth knowing.
     ///
-    /// The whole point of putting it on the row is that a person can tell one
-    /// requester from another, and sixty-four hex characters is not something
-    /// anybody compares. Eight and eight is.
+    /// Two different facts share this line. A request that came over a relay
+    /// carries the pubkey that signed it, which is proof: "from" is the right
+    /// word, and eight characters of each end is what makes it comparable at
+    /// all, since nobody reads sixty-four.
+    ///
+    /// A request from an app on this Mac carries a name the app chose. Any
+    /// program running as this user can read the daemon's token and claim any
+    /// name, so "from Plaza" would state something nobody checked, on the one
+    /// row in this application where a person is being asked to check
+    /// something. "Calling itself" is the same length and true.
     pub fn asker(self: *const Row, arena: std.mem.Allocator) []const u8 {
         const c = self.client();
-        if (c.len < 20) return if (c.len == 0) "unknown client" else c;
+        if (c.len == 0) return "unknown client";
+        if (self.local)
+            return std.fmt.allocPrint(arena, "an app on this Mac calling itself \"{s}\"", .{c}) catch c;
+        if (c.len < 20) return c;
         return std.fmt.allocPrint(arena, "from {s}…{s}", .{ c[0..8], c[c.len - 8 ..] }) catch c;
     }
 };
@@ -1675,6 +1693,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
             method: []const u8 = "",
             kind: i32 = -1,
             created_at: i64 = 0,
+            local: bool = false,
             client: []const u8 = "",
             preview: []const u8 = "",
         } = &.{},
@@ -1685,7 +1704,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
     var n: usize = 0;
     for (parsed.pending) |p| {
         if (n >= max_pending) break;
-        var row = Row{ .id = p.id, .kind = p.kind, .created_at = p.created_at };
+        var row = Row{ .id = p.id, .kind = p.kind, .created_at = p.created_at, .local = p.local };
         row.setMethod(p.method);
         row.setClient(p.client);
         row.setPreview(p.preview);

@@ -184,7 +184,7 @@
           <card padding="12">
             <column gap="10">
               <text>{r.label}</text>
-              <text foreground="text_muted">{r.asker}</text>
+              <text foreground="text_muted" wrap="true">{r.asker}</text>
               <if test="{r.has_preview}">
                 <text wrap="true">{r.preview}</text>
               </if>
