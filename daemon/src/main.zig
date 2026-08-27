@@ -30,6 +30,7 @@ const hex = nostr.hex;
 // configuration; each is overridable via its environment variable. The key and
 // token files sit under $HOME; relays default to a public relay.
 const default_token_file = ".zig-nostr-signer.token";
+
 const default_key_file = ".zig-nostr-signer.key";
 // What the GUI serves on when the reader has not chosen. THREE, not one.
 //

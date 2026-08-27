@@ -914,9 +914,26 @@ pub const app_markup = @embedFile("app.native");
 const NotaryApp = native_sdk.UiApp(Model, Msg);
 const Effects = NotaryApp.Effects;
 
-/// What we ask the daemon to bind in managed mode: loopback, port chosen by the
-/// kernel. See `Model.port_known` for why.
-const managed_bind_address = "127.0.0.1:0";
+/// What we ask the daemon to bind in managed mode.
+///
+/// The WELL KNOWN address now, not `127.0.0.1:0`. A kernel-chosen port and a
+/// stdout line is a rendezvous only the spawner can use, and it was the right
+/// shape while this window was the daemon's only client. It is the wrong shape
+/// for a daemon meant to be shared: another app that wants the same key did not
+/// spawn it, has no stdout to read, and has to be able to find one that is
+/// already running.
+///
+/// The NUMBER is the rendezvous, not a file naming the number. A port file is
+/// the obvious alternative and it is the dangerous one: it sits on disk
+/// writable by this same user, so anything running as them could point it at a
+/// listener of its own and every client would go there instead, while the real
+/// daemon sat healthy and idle, never knowing. There is nothing here to
+/// rewrite.
+///
+/// The bind stays EXCLUSIVE (`approval_http.Server.run`). Something that takes
+/// this port first does not get to answer for the daemon quietly: the bind
+/// fails and the daemon says so.
+const managed_bind_address = "127.0.0.1:8787";
 
 fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.phase = .starting;
