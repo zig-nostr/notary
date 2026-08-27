@@ -7,6 +7,31 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+### Fixed
+- **The passphrase field no longer shows the passphrase.** Both onboarding
+  screens and the backup panel drew every character in the clear, which is the
+  wrong default for something people type in a cafe, on a call, or into a screen
+  recording. They draw stars now, with an eye beside the field for the times you
+  want to read back what you typed. It starts hidden on every launch, and goes
+  back to hidden after each send.
+
+  The mask is one star per byte rather than a prettier bullet, and that is load
+  bearing rather than lazy: the runtime hands back caret offsets into the string
+  it drew, so a mask exactly as long as the text maps them straight through and
+  the caret lands on the character you clicked. Inserting is the one gesture
+  where the two disagree, and the buffer now follows the drawn caret home rather
+  than quietly typing somewhere you are not looking.
+
+  Hiding it also keeps the characters out of the accessible name the window
+  publishes for that field, which is where anything with accessibility access
+  would have read them.
+
+  One rough edge is left, and it belongs to the toolkit rather than to this
+  change: replacing selected text with exactly as many characters leaves the
+  typed ones on screen until the next keystroke, because the toolkit repaints
+  its own copy of the line whenever the length it was handed has not moved.
+  Reveal the field if you want to edit the middle of a passphrase.
+
 ## [0.9.1] - 2026-08-27
 
 ### Fixed
