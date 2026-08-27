@@ -332,7 +332,7 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     if (eql(method, "GET") and std.mem.startsWith(u8, path, "/pending"))
         return handlePending(self, io, w, path);
     if (eql(method, "POST") and eql(path, "/decision"))
-        return handleDecision(self, w, body);
+        return handleDecision(self, io, w, body);
     // The local signing protocol (nostr's `signer_ipc`), which is what lets a
     // client on this machine use this daemon without a relay round trip. The
     // paths come from the library so every product speaks one protocol rather
@@ -411,7 +411,7 @@ fn appendJsonString(out: *std.ArrayList(u8), gpa: std.mem.Allocator, s: []const 
     try out.append(gpa, '"');
 }
 
-fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
+fn handleDecision(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
     const Body = struct { id: u64, decision: []const u8, remember: []const u8 = "once" };
     const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
         return respond(w, 400, bad_request);
@@ -435,7 +435,7 @@ fn handleDecision(self: *Server, w: *std.Io.Writer, body: []const u8) !void {
     else
         .once;
 
-    const ok = self.broker.resolveFor(parsed.value.id, decision, how_long);
+    const ok = self.broker.resolveFor(parsed.value.id, decision, how_long, std.Io.Timestamp.now(io, .real).toMilliseconds());
     var out: [32]u8 = undefined;
     const j = std.fmt.bufPrint(&out, "{{\"ok\":{s}}}", .{if (ok) "true" else "false"}) catch unreachable;
     return respond(w, 200, j);
@@ -1295,6 +1295,9 @@ test "forgetting a key needs the exact confirmation phrase" {
 
 test "POST /decision carries how long the answer lasts, and a bad duration is the shortest" {
     const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
     var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
     var broker: Broker = .{};
     var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
@@ -1315,7 +1318,7 @@ test "POST /decision carries how long the answer lasts, and a bad duration is th
 
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleDecision(&server, &out.writer, c.body);
+        try handleDecision(&server, io, &out.writer, c.body);
         var body = out.toArrayList();
         defer body.deinit(gpa);
 

@@ -43,6 +43,15 @@ pub const Pending = struct {
     /// queue exists.
     client_buf: [64]u8 = [_]u8{0} ** 64,
     client_len: u8 = 0,
+    /// The 32 bytes this client's answers are filed under.
+    ///
+    /// Carried rather than parsed back out of `client_buf`, because the
+    /// display string and the key are not the same thing and only one of them
+    /// is always hex. A client on this machine shows a name it chose.
+    client_id: [32]u8 = [_]u8{0} ** 32,
+    /// The method as the permission store spells it, parsed once by the caller
+    /// that already had to parse it.
+    method_id: nip46.Method = .sign_event,
     /// What is being signed: the start of the event's content, for `sign_event`.
     ///
     /// The kind number says what SHAPE it is, never what it says. Approving a
@@ -209,28 +218,43 @@ pub const Broker = struct {
 
     /// Applies the GUI's decision to pending entry `id`. Returns true if it was
     /// found and still pending.
-    pub fn resolve(self: *Broker, id: u64, decision: Decision) bool {
-        return self.resolveFor(id, decision, .once);
+    pub fn resolve(self: *Broker, id: u64, decision: Decision, now_ms: i64) bool {
+        return self.resolveFor(id, decision, .once, now_ms);
     }
 
     /// The same, with how long the answer should last.
-    pub fn resolveFor(self: *Broker, id: u64, decision: Decision, how_long: nip46.Remember) bool {
+    ///
+    /// The answer is written down HERE, at the moment it is given, rather than
+    /// by whoever was waiting for it. "Allow for an hour" runs from when the
+    /// person said it, not from when the request arrived, and those differ by
+    /// however long they took to read the row. On a queue whose whole purpose
+    /// is to be read carefully, that difference is the reading.
+    ///
+    /// A request nobody answered never reaches here at all, which is how a
+    /// timeout stays an open question instead of hardening into a refusal.
+    pub fn resolveFor(self: *Broker, id: u64, decision: Decision, how_long: nip46.Remember, now_ms: i64) bool {
         if (decision == .pending) return false;
         self.acquire();
         var found = false;
+        var info: Pending = .{};
         for (&self.slots) |*slot| {
             if (slot.in_use and slot.info.id == id and slot.decision.load(.monotonic) == .pending) {
                 // The duration first, so a thread waking on the decision cannot
                 // read a remember value that has not been written yet.
                 slot.remember = how_long;
                 slot.decision.store(decision, .release);
+                info = slot.info;
                 found = true;
                 break;
             }
         }
         self.release();
-        if (found) _ = self.version.fetchAdd(1, .monotonic);
-        return found;
+        if (!found) return false;
+        _ = self.version.fetchAdd(1, .monotonic);
+        // Outside the broker's lock. The permission store has its own, and
+        // nesting two hand-rolled locks is how a daemon stops answering.
+        self.permissions.remember(info.client_id, info.method_id, info.kind, decision == .approve, how_long, now_ms);
+        return true;
     }
 };
 
@@ -307,15 +331,17 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     info.client_len = 64;
     // Both already read above, for the permission lookup.
     info.kind = kind;
+    info.client_id = client;
+    info.method_id = method;
     if (method == .sign_event) {
         info.preview_len = signEventPreview(self.gpa, request, &info.preview_buf);
     }
 
+    // What the operator said is written down by `resolveFor`, when they say it.
+    // Nothing is written for a request nobody answered: an operator who walked
+    // away said nothing, and storing silence as a denial would lock a client
+    // out over an absence.
     const answered = self.broker.submitRemembering(self.io, info);
-    // `.once` is never written down, which is how a timeout leaves the question
-    // open: an operator who walked away from the machine said nothing, and
-    // storing silence as a denial would lock a client out over an absence.
-    self.broker.permissions.remember(client, method, kind, answered.decision == .approve, answered.remember, now_ms);
     return switch (answered.decision) {
         .approve => .approve,
         else => .reject,
@@ -329,13 +355,24 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
 
 const testing = std.testing;
 
+/// Wall-clock milliseconds, the way the GUI's own thread reads them.
+///
+/// Real time rather than a fixed number, because the policy under test reads
+/// real time too, and an answer stamped in some other era either lapses on
+/// arrival or never lapses at all.
+fn testNow() i64 {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    return std.Io.Timestamp.now(threaded.io(), .real).toMilliseconds();
+}
+
 /// Stand-in for the GUI: waits for one pending entry, then resolves it.
 fn resolveFirstFor(broker: *Broker, decision: Decision, how_long: nip46.Remember) void {
     var buf: [4]Pending = undefined;
     var tries: usize = 0;
     while (tries < 1_000_000) : (tries += 1) {
         if (broker.snapshot(&buf) > 0) {
-            _ = broker.resolveFor(buf[0].id, decision, how_long);
+            _ = broker.resolveFor(buf[0].id, decision, how_long, testNow());
             return;
         }
         std.Thread.yield() catch {};
@@ -347,7 +384,7 @@ fn resolveFirst(broker: *Broker, decision: Decision) void {
     var tries: usize = 0;
     while (tries < 1_000_000) : (tries += 1) {
         if (broker.snapshot(&buf) > 0) {
-            _ = broker.resolve(buf[0].id, decision);
+            _ = broker.resolve(buf[0].id, decision, testNow());
             return;
         }
         std.Thread.yield() catch {};
