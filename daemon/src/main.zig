@@ -240,12 +240,15 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .path = getEnv("SIGNER_LOG_FILE") orelse resolveHome(gpa, default_log_file),
     };
 
-    const token_hex = makeAndWriteToken(gpa, token_path);
     var approval_server: approval_http.Server = .{
         .gpa = gpa,
         .broker = &broker_storage,
         .gate = &gate,
-        .token = token_hex,
+        // Filled after the bind. Minting it here would overwrite a RUNNING
+        // daemon's token before discovering the port is already theirs, and
+        // every client holding the old one would start getting 401s from a
+        // daemon that was working perfectly.
+        .token = "",
         .log = &g_audit,
         .idle_exit_ms = idleExitMs(),
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
@@ -263,6 +266,12 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
     // detach rather than after: afterwards there is nobody left to tell.
     approval_server.bind(io) catch |err|
         failFmt("could not bind the approval API on {s}: {s}", .{ addr, @errorName(err) });
+
+    // The port is ours, so the credential for it is ours to mint. Not one line
+    // earlier: the address is fixed and well known, so losing the race to it is
+    // the ordinary way a second daemon starts, and a loser that had already
+    // rewritten the shared token file would take every client down with it.
+    approval_server.token = makeAndWriteToken(gpa, token_path);
     announcePort(io, approval_server.bound_port.load(.acquire));
 
     if (detach) detachFromSpawner();

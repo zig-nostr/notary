@@ -131,6 +131,45 @@ pub const Broker = struct {
     /// Max simultaneously-pending approvals; further submits fail closed.
     pub const capacity = 32;
 
+    /// An answer given ONCE, to a request that had nobody waiting for it.
+    ///
+    /// "Allow once" is the safest thing a person can press and it was the one
+    /// button that did nothing. `Remember.once` is deliberately never written
+    /// to the permission store, because on the relay path the thread that
+    /// asked is parked on the slot and reads the decision straight off it: the
+    /// answer covered that request, and there is nothing to remember.
+    ///
+    /// A local request has no such thread. It was refused the moment it
+    /// arrived and the app was told to ask again, so the ONLY way an answer
+    /// can reach it is through this daemon's memory. With `.once` storing
+    /// nothing, the retry found nothing, was refused again, and queued another
+    /// identical question. Pressing the primary button re-prompted forever and
+    /// no local app could ever sign; only "For a day" and "Until locked"
+    /// worked.
+    ///
+    /// So a `.once` answer is held right here until the retry collects it, and
+    /// collecting it destroys it. That is what "once" means, and it is now
+    /// true on both paths instead of one.
+    const OneShot = struct {
+        used: bool = false,
+        client: [32]u8 = [_]u8{0} ** 32,
+        method: nip46.Method = .sign_event,
+        kind: i32 = -1,
+        allow: bool = false,
+        /// When it was given. An answer nobody came back for is not kept: the
+        /// app that asked may have been closed between the question and the
+        /// answer, and an allow left lying around would be spent by whatever
+        /// asked next.
+        at_ms: i64 = 0,
+    };
+
+    /// How long an uncollected one-shot answer stands.
+    ///
+    /// Long enough for a client that retries on a human timescale, short
+    /// enough that an answer given to an app that has since quit is gone
+    /// before anything else can pick it up.
+    pub const one_shot_ms: i64 = 60 * 1000;
+
     lock: std.atomic.Value(bool) = .init(false),
     slots: [capacity]Slot = [_]Slot{.{}} ** capacity,
     next_id: u64 = 1,
@@ -139,6 +178,7 @@ pub const Broker = struct {
     /// Milliseconds a submitted request waits before it is auto-denied when no
     /// GUI resolves it.
     timeout_ms: u64 = 120_000,
+
     /// What the operator has already answered, and for how long.
     ///
     /// The library's, so no product carries a second idea of what a permission
@@ -156,6 +196,7 @@ pub const Broker = struct {
     /// Persisting these means binding them to the key, not writing them beside
     /// it.
     permissions: nip46.Permissions = .{},
+    one_shots: [8]OneShot = [_]OneShot{.{}} ** 8,
 
     fn acquire(self: *Broker) void {
         while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -202,6 +243,59 @@ pub const Broker = struct {
         _ = self.version.fetchAdd(1, .monotonic);
         if (final == .pending) return .{ .decision = .reject, .remember = .once };
         return .{ .decision = final, .remember = how_long };
+    }
+
+    /// Holds a `.once` answer until the request that prompted it comes back.
+    ///
+    /// The oldest is overwritten when full. Eight is far more than the number
+    /// of questions a person can have answered in the last minute, and an
+    /// answer that old has already been collected or abandoned.
+    fn keepOneShot(self: *Broker, info: Pending, allow: bool, now_ms: i64) void {
+        self.acquire();
+        defer self.release();
+        var pick: usize = 0;
+        for (&self.one_shots, 0..) |*g, i| {
+            if (!g.used or !liveOneShot(g, now_ms)) {
+                pick = i;
+                break;
+            }
+            if (g.at_ms < self.one_shots[pick].at_ms) pick = i;
+        }
+        self.one_shots[pick] = .{
+            .used = true,
+            .client = info.client_id,
+            .method = info.method_id,
+            .kind = info.kind,
+            .allow = allow,
+            .at_ms = now_ms,
+        };
+    }
+
+    /// Collects a `.once` answer, and SPENDS it.
+    ///
+    /// Null when there is none, which is the caller's cue to consult what was
+    /// remembered instead. Taking it destroys it, because that is the whole of
+    /// what "once" means: the next request is a fresh question.
+    pub fn takeOneShot(self: *Broker, client: [32]u8, method: nip46.Method, kind: i32, now_ms: i64) ?bool {
+        self.acquire();
+        defer self.release();
+        for (&self.one_shots) |*g| {
+            if (!g.used) continue;
+            if (!liveOneShot(g, now_ms)) {
+                g.* = .{};
+                continue;
+            }
+            if (g.method != method or g.kind != kind) continue;
+            if (!std.mem.eql(u8, &g.client, &client)) continue;
+            const allow = g.allow;
+            g.* = .{};
+            return allow;
+        }
+        return null;
+    }
+
+    fn liveOneShot(g: *const OneShot, now_ms: i64) bool {
+        return now_ms - g.at_ms < one_shot_ms;
     }
 
     /// Puts a question on the queue for a request that is NOT waiting for the
@@ -306,6 +400,7 @@ pub const Broker = struct {
         if (decision == .pending) return false;
         self.acquire();
         var found = false;
+        var had_waiter = true;
         var info: Pending = .{};
         for (&self.slots) |*slot| {
             if (slot.in_use and slot.info.id == id and slot.decision.load(.monotonic) == .pending) {
@@ -314,6 +409,7 @@ pub const Broker = struct {
                 slot.remember = how_long;
                 slot.decision.store(decision, .release);
                 info = slot.info;
+                had_waiter = slot.waiter;
                 // Nobody is coming to collect this one. Left in use it would
                 // hold a slot forever, and there are thirty-two of them.
                 if (!slot.waiter) slot.in_use = false;
@@ -326,7 +422,13 @@ pub const Broker = struct {
         _ = self.version.fetchAdd(1, .monotonic);
         // Outside the broker's lock. The permission store has its own, and
         // nesting two hand-rolled locks is how a daemon stops answering.
-        self.permissions.remember(info.client_id, info.method_id, info.kind, decision == .approve, how_long, now_ms);
+        if (how_long == .once and !had_waiter) {
+            // Nobody is parked on this one to read the answer off the slot, so
+            // "once" has to be kept somewhere until the retry collects it.
+            self.keepOneShot(info, decision == .approve, now_ms);
+        } else {
+            self.permissions.remember(info.client_id, info.method_id, info.kind, decision == .approve, how_long, now_ms);
+        }
         return true;
     }
 };

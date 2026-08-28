@@ -384,20 +384,44 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     self.last_request_ms.store(std.Io.Timestamp.now(io, .awake).toMilliseconds(), .monotonic);
 
     // Assemble the body: bytes already read after the head, plus any remainder.
+    //
+    // Four kilobytes on the stack covers a passphrase, a decision and an
+    // ordinary note, and it is nowhere near enough for the two things this
+    // server grew: a `/sign` body carries a whole event as ESCAPED JSON inside
+    // another JSON string, so a note with a few tags and a link doubles on the
+    // way in, and the cipher endpoints are batched precisely so a catch-up of
+    // thousands of messages is not thousands of round trips. A batch that has
+    // to fit in four kilobytes is not a batch.
+    //
+    // So anything larger is read onto the heap, and the ceiling is a real
+    // refusal rather than a formality: a body arrives before any of it is
+    // understood, and something has to say when to stop.
     var body_storage: [4096]u8 = undefined;
     defer std.crypto.secureZero(u8, &body_storage);
+    var heap_body: ?[]u8 = null;
+    defer if (heap_body) |b| {
+        // The same care the stack buffer gets. A `/setup` import or a decrypted
+        // batch passes through here, and freed memory is not erased memory.
+        std.crypto.secureZero(u8, b);
+        self.gpa.free(b);
+    };
     var body: []const u8 = "";
     if (content_length > 0) {
-        if (content_length > body_storage.len) return respond(w, 413, "{\"error\":\"body too large\"}");
+        if (content_length > max_body_bytes) return respond(w, 413, "{\"error\":\"body too large\"}");
+        const dest: []u8 = if (content_length <= body_storage.len) body_storage[0..content_length] else blk: {
+            heap_body = self.gpa.alloc(u8, content_length) catch
+                return respond(w, 413, "{\"error\":\"body too large\"}");
+            break :blk heap_body.?;
+        };
         const body_start = head_end + 4;
         var got = @min(len - body_start, content_length);
-        @memcpy(body_storage[0..got], buf[body_start .. body_start + got]);
+        @memcpy(dest[0..got], buf[body_start .. body_start + got]);
         while (got < content_length) {
-            const n = r.readSliceShort(body_storage[got..content_length]) catch break;
+            const n = r.readSliceShort(dest[got..content_length]) catch break;
             if (n == 0) break;
             got += n;
         }
-        body = body_storage[0..got];
+        body = dest[0..got];
     }
 
     if (eql(method, "GET") and eql(path, "/info"))
@@ -922,6 +946,18 @@ fn localAllowed(
 
     const id = ipc.clientId(name);
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
+
+    // An answer given ONCE, to the question this request already raised. Taking
+    // it spends it, which is the whole of what "once" means. Checked before
+    // what was remembered, because a request only reached the queue at all
+    // when nothing was remembered for it.
+    if (self.broker.takeOneShot(id, method, kind, now_ms)) |allowed| {
+        if (allowed) return true;
+        note(self, io, .{ .what = what, .outcome = "refused", .who = name, .local = true, .method = method.name(), .kind = kind });
+        try respondIpcError(self, w, 403, ipc.reason_refused);
+        return false;
+    }
+
     if (self.broker.permissions.remembered(id, method, kind, now_ms)) |allowed| {
         if (allowed) return true;
         note(self, io, .{ .what = what, .outcome = "refused", .who = name, .local = true, .method = method.name(), .kind = kind });
@@ -1107,6 +1143,18 @@ fn respondPubkey(self: *Server, w: *std.Io.Writer) !void {
 }
 
 // --- HTTP plumbing -------------------------------------------------------
+
+/// The largest request body this server will read.
+///
+/// One megabyte, against a batched NIP-44 catch-up, which is the only thing
+/// here that is legitimately big: a few thousand ciphertexts of a few hundred
+/// bytes each. A signed event is a fraction of it even after the JSON escaping
+/// doubles it.
+///
+/// A ceiling rather than no limit, because the length is a number the caller
+/// chose and the memory is committed before a single byte of the body has been
+/// looked at.
+const max_body_bytes = 1024 * 1024;
 
 const bad_request = "{\"error\":\"bad request\"}";
 
@@ -2068,4 +2116,104 @@ test "the idle clock is only wound by a caller that presented the token" {
     // which is where an unauthorized caller would slip one in.
     const head_at = std.mem.indexOf(u8, src, "const request_line = lines.next()").?;
     try testing.expect(std.mem.indexOfPos(u8, src, head_at, "self.last_request_ms.store(").? == stamp_at);
+}
+
+test "Allow once actually lets one request through, and only one" {
+    // The button a careful person presses, and the one that did nothing.
+    //
+    // `.once` is deliberately never written to the permission store, because
+    // on the relay path the thread that asked is parked on the slot and reads
+    // the answer straight off it. A local request has no such thread: it was
+    // refused the moment it arrived, so the only way an answer can reach it is
+    // through the daemon's memory. With `.once` storing nothing, the retry
+    // found nothing and queued the same question again. Pressing "Allow once"
+    // re-prompted forever and no local app could ever sign.
+    const gpa = testing.allocator;
+    const io = testing.io;
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    gate.preload(kp);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    const req = try signRequest(gpa, 1);
+    defer gpa.free(req);
+
+    // Asked, and refused pending an answer.
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, io, &out.writer, req, test_client);
+    }
+    var queue: [Broker.capacity]Pending = undefined;
+    try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
+
+    // "Allow once".
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const body = try std.fmt.allocPrint(gpa, "{{\"id\":{d},\"decision\":\"approve\",\"remember\":\"once\"}}", .{queue[0].id});
+        defer gpa.free(body);
+        try handleDecision(&server, io, &out.writer, body);
+    }
+
+    // The retry signs. This is the assertion that was false.
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, "dff1d77f2a671c5f36183726db2341be58feae1da2deced843240f7b502ba659") != null);
+    }
+
+    // And ONLY one. The next request is a fresh question, or "once" would be a
+    // quieter way of saying "always".
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, nostr.signer_ipc.reason_awaiting_approval) != null);
+    }
+    try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
+}
+
+test "a one-shot answer covers only the question it answered" {
+    var broker: Broker = .{};
+    const plaza = nostr.signer_ipc.clientId("plaza");
+    const other = nostr.signer_ipc.clientId("something-else");
+
+    var info = Pending{ .local = true, .kind = 1, .method_id = .sign_event, .client_id = plaza };
+    try testing.expect(broker.knock(info));
+    var q: [Broker.capacity]Pending = undefined;
+    _ = broker.snapshot(&q);
+    try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
+
+    // Not another app's request, not another method, not another kind. Each of
+    // those is a different question, and an answer to one is not an answer to
+    // any of the others.
+    try testing.expect(broker.takeOneShot(other, .sign_event, 1, 1_000_000) == null);
+    try testing.expect(broker.takeOneShot(plaza, .nip44_decrypt, 1, 1_000_000) == null);
+    try testing.expect(broker.takeOneShot(plaza, .sign_event, 3, 1_000_000) == null);
+
+    // The right one, once.
+    try testing.expectEqual(true, broker.takeOneShot(plaza, .sign_event, 1, 1_000_000).?);
+    try testing.expect(broker.takeOneShot(plaza, .sign_event, 1, 1_000_000) == null);
+
+    // An answer nobody came back for lapses, so it cannot be spent by whatever
+    // asks next: the app it was given to may have been closed in between.
+    info.kind = 7;
+    try testing.expect(broker.knock(info));
+    _ = broker.snapshot(&q);
+    try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
+    try testing.expect(broker.takeOneShot(plaza, .sign_event, 7, 1_000_000 + Broker.one_shot_ms) == null);
 }
