@@ -142,9 +142,12 @@ pub const Log = struct {
 fn format(w: *std.Io.Writer, at: i64, e: Event) !void {
     try w.print("{{\"at\":{d},\"what\":\"{s}\"", .{ at, e.what });
     if (e.outcome.len != 0) try w.print(",\"outcome\":\"{s}\"", .{e.outcome});
+    // `local` stands on its own, because a local request has nobody to name:
+    // the one client is whoever started this daemon. Tying it to `who` meant
+    // the only line that needed the distinction was the one that lost it.
+    if (e.local) try w.writeAll(",\"local\":true");
     if (e.who.len != 0) {
-        try w.writeAll(",\"local\":");
-        try w.writeAll(if (e.local) "true" else "false");
+        if (!e.local) try w.writeAll(",\"local\":false");
         try w.writeAll(",\"who\":");
         try jsonString(w, e.who);
     }
