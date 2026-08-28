@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const audit = @import("audit.zig");
 const PolicyConfig = nostr.nip46.PolicyConfig;
 
 const nip46 = nostr.nip46;
@@ -43,6 +44,23 @@ pub const Pending = struct {
     /// queue exists.
     client_buf: [64]u8 = [_]u8{0} ** 64,
     client_len: u8 = 0,
+    /// The 32 bytes this client's answers are filed under.
+    ///
+    /// Carried rather than parsed back out of `client_buf`, because the
+    /// display string and the key are not the same thing and only one of them
+    /// is always hex. A client on this machine shows a name it chose.
+    client_id: [32]u8 = [_]u8{0} ** 32,
+    /// The method as the permission store spells it, parsed once by the caller
+    /// that already had to parse it.
+    method_id: nip46.Method = .sign_event,
+    /// Whether `client_buf` is a name an app on this machine chose for itself,
+    /// rather than the pubkey of whoever signed a request that came over a
+    /// relay.
+    ///
+    /// The two look nothing alike and mean nothing alike, and a person deciding
+    /// whether to allow a signature has to be told which one they are reading.
+    /// A relay client proved it holds a key. A local one typed a word.
+    local: bool = false,
     /// What is being signed: the start of the event's content, for `sign_event`.
     ///
     /// The kind number says what SHAPE it is, never what it says. Approving a
@@ -75,7 +93,17 @@ fn signEventPreview(gpa: std.mem.Allocator, request: *const nip46.Request, out: 
         .{ .ignore_unknown_fields = true },
     ) catch return 0;
     defer parsed.deinit();
-    const text = std.mem.trim(u8, parsed.value.content, " \t\r\n");
+    return previewOf(parsed.value.content, out);
+}
+
+/// The same clip, for a caller that already holds the text.
+///
+/// One implementation, because the rule it enforces is not obvious and a second
+/// copy would be the copy that forgets it: a preview is cut on a character
+/// boundary, since half a UTF-8 sequence is not a character and this string
+/// goes into a JSON response and then onto a screen.
+pub fn previewOf(text_in: []const u8, out: *[160]u8) u8 {
+    const text = std.mem.trim(u8, text_in, " \t\r\n");
     var n = @min(text.len, out.len);
     while (n > 0 and n < text.len and (text[n] & 0xc0) == 0x80) n -= 1;
     @memcpy(out[0..n], text[0..n]);
@@ -89,11 +117,58 @@ const Slot = struct {
     /// How long the operator's answer should last. Written under the lock
     /// before the decision is published, and read after it.
     remember: nip46.Remember = .once,
+    /// Whether a thread is parked on this slot waiting for the answer.
+    ///
+    /// True for a request that arrived over a relay: that thread is inside
+    /// `submitRemembering` and frees the slot on its way out. False for one
+    /// that arrived over the local protocol, which was answered the moment it
+    /// was asked and left this behind as a question for a person. Nothing is
+    /// coming back for that one, so `resolveFor` frees it.
+    waiter: bool = true,
 };
 
 pub const Broker = struct {
     /// Max simultaneously-pending approvals; further submits fail closed.
     pub const capacity = 32;
+
+    /// An answer given ONCE, to a request that had nobody waiting for it.
+    ///
+    /// "Allow once" is the safest thing a person can press and it was the one
+    /// button that did nothing. `Remember.once` is deliberately never written
+    /// to the permission store, because on the relay path the thread that
+    /// asked is parked on the slot and reads the decision straight off it: the
+    /// answer covered that request, and there is nothing to remember.
+    ///
+    /// A local request has no such thread. It was refused the moment it
+    /// arrived and the app was told to ask again, so the ONLY way an answer
+    /// can reach it is through this daemon's memory. With `.once` storing
+    /// nothing, the retry found nothing, was refused again, and queued another
+    /// identical question. Pressing the primary button re-prompted forever and
+    /// no local app could ever sign; only "For a day" and "Until locked"
+    /// worked.
+    ///
+    /// So a `.once` answer is held right here until the retry collects it, and
+    /// collecting it destroys it. That is what "once" means, and it is now
+    /// true on both paths instead of one.
+    const OneShot = struct {
+        used: bool = false,
+        client: [32]u8 = [_]u8{0} ** 32,
+        method: nip46.Method = .sign_event,
+        kind: i32 = -1,
+        allow: bool = false,
+        /// When it was given. An answer nobody came back for is not kept: the
+        /// app that asked may have been closed between the question and the
+        /// answer, and an allow left lying around would be spent by whatever
+        /// asked next.
+        at_ms: i64 = 0,
+    };
+
+    /// How long an uncollected one-shot answer stands.
+    ///
+    /// Long enough for a client that retries on a human timescale, short
+    /// enough that an answer given to an app that has since quit is gone
+    /// before anything else can pick it up.
+    pub const one_shot_ms: i64 = 60 * 1000;
 
     lock: std.atomic.Value(bool) = .init(false),
     slots: [capacity]Slot = [_]Slot{.{}} ** capacity,
@@ -103,14 +178,37 @@ pub const Broker = struct {
     /// Milliseconds a submitted request waits before it is auto-denied when no
     /// GUI resolves it.
     timeout_ms: u64 = 120_000,
+
     /// What the operator has already answered, and for how long.
     ///
-    /// The library's, shared with Plaza's signer so the two cannot drift on what
-    /// a permission means. Until this, Notary prompted for every request
-    /// forever: there was no way to say "always allow this app to post notes"
-    /// and no way to say "stop asking", which is the prompt fatigue that teaches
-    /// people to approve without reading.
+    /// The library's, so no product carries a second idea of what a permission
+    /// means. Before it, Notary prompted for every request forever: there was
+    /// no way to say "let this app post notes" and no way to say "stop
+    /// asking", which is the prompt fatigue that teaches people to approve
+    /// without reading.
+    ///
+    /// IN MEMORY, and nothing writes it down, which is why the longest answer
+    /// the window offers reads "until locked" rather than "always". That is
+    /// not an omission waiting to be filled in with a file. A file of
+    /// permissions is a file that grants signing, and anything running as this
+    /// user could add itself a line and never be asked again, which turns the
+    /// operator's attention from the last defence into no defence at all.
+    /// Persisting these means binding them to the key, not writing them beside
+    /// it.
     permissions: nip46.Permissions = .{},
+    /// When this daemon last did something for somebody, in milliseconds.
+    ///
+    /// Lives here rather than on the loopback server because BOTH ways in have
+    /// to wind it. It was on the server, counting only local traffic, which
+    /// meant a daemon serving a phone over relays with no window open looked
+    /// idle no matter how much signing it was doing, and would clock out in the
+    /// middle of it. Relays are the other half of what this daemon is for.
+    last_request_ms: std.atomic.Value(i64) = .init(0),
+    one_shots: [8]OneShot = [_]OneShot{.{}} ** 8,
+
+    pub fn touch(self: *Broker, now_ms: i64) void {
+        self.last_request_ms.store(now_ms, .monotonic);
+    }
 
     fn acquire(self: *Broker) void {
         while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -135,7 +233,7 @@ pub const Broker = struct {
     pub const Answered = struct { decision: Decision, remember: nip46.Remember };
 
     pub fn submitRemembering(self: *Broker, io: std.Io, info: Pending) Answered {
-        const idx = self.claim(info) orelse return .{ .decision = .reject, .remember = .once };
+        const idx = self.claim(info, true) orelse return .{ .decision = .reject, .remember = .once };
 
         // Poll the decision slot, pacing with io.sleep (as the reconnect loop
         // does). Elapsed time is counted in sleep steps, no wall clock needed.
@@ -159,12 +257,133 @@ pub const Broker = struct {
         return .{ .decision = final, .remember = how_long };
     }
 
-    fn claim(self: *Broker, info: Pending) ?usize {
+    /// Holds a `.once` answer until the request that prompted it comes back.
+    ///
+    /// The oldest is overwritten when full. Eight is far more than the number
+    /// of questions a person can have answered in the last minute, and an
+    /// answer that old has already been collected or abandoned.
+    fn keepOneShot(self: *Broker, info: Pending, allow: bool, now_ms: i64) void {
+        self.acquire();
+        defer self.release();
+        var pick: usize = 0;
+        for (&self.one_shots, 0..) |*g, i| {
+            if (!g.used or !liveOneShot(g, now_ms)) {
+                pick = i;
+                break;
+            }
+            if (g.at_ms < self.one_shots[pick].at_ms) pick = i;
+        }
+        self.one_shots[pick] = .{
+            .used = true,
+            .client = info.client_id,
+            .method = info.method_id,
+            .kind = info.kind,
+            .allow = allow,
+            .at_ms = now_ms,
+        };
+    }
+
+    /// Collects a `.once` answer, and SPENDS it.
+    ///
+    /// Null when there is none, which is the caller's cue to consult what was
+    /// remembered instead. Taking it destroys it, because that is the whole of
+    /// what "once" means: the next request is a fresh question.
+    pub fn takeOneShot(self: *Broker, client: [32]u8, method: nip46.Method, kind: i32, now_ms: i64) ?bool {
+        self.acquire();
+        defer self.release();
+        for (&self.one_shots) |*g| {
+            if (!g.used) continue;
+            if (!liveOneShot(g, now_ms)) {
+                g.* = .{};
+                continue;
+            }
+            if (g.method != method or g.kind != kind) continue;
+            if (!std.mem.eql(u8, &g.client, &client)) continue;
+            const allow = g.allow;
+            g.* = .{};
+            return allow;
+        }
+        return null;
+    }
+
+    fn liveOneShot(g: *const OneShot, now_ms: i64) bool {
+        return now_ms - g.at_ms < one_shot_ms;
+    }
+
+    /// Puts a question on the queue for a request that is NOT waiting for the
+    /// answer, and says whether it is now there.
+    ///
+    /// The local protocol cannot wait. `submitRemembering` parks the calling
+    /// thread for up to the full approval timeout, and on the loopback server
+    /// that thread is one of eight, so eight unanswered local requests take
+    /// every handler the server has. The GUI polls the queue over that same
+    /// server, so it could no longer fetch the very questions it was being
+    /// asked to answer, and no answer could arrive to release anything. That is
+    /// not a slow path, it is a signer that has stopped, and reaching it costs
+    /// an attacker eight requests.
+    ///
+    /// So the request is refused now and the question is left here. The client
+    /// asks again; by then a person may have answered.
+    ///
+    /// Deduplicated on exactly what an answer covers, because a client that
+    /// retries every second would otherwise fill all thirty-two slots with one
+    /// question inside a minute, and bury every other app's under it.
+    /// Says whether this call FILED the question or found it already there.
+    /// The caller uses that to decide whether anything is worth writing down:
+    /// a retry is not news, and a client whose every retry produced a line
+    /// could roll the audit log away simply by asking often enough.
+    pub fn knock(self: *Broker, info: Pending) Knock {
+        self.acquire();
+        for (&self.slots) |*slot| {
+            if (!slot.in_use or slot.decision.load(.monotonic) != .pending) continue;
+            if (slot.info.local == info.local and slot.info.method_id == info.method_id and
+                slot.info.kind == info.kind and
+                std.mem.eql(u8, &slot.info.client_id, &info.client_id))
+            {
+                self.release();
+                return .already_asked;
+            }
+        }
+        self.release();
+        return if (self.claim(info, false) != null) .filed else .no_room;
+    }
+
+    pub const Knock = enum { filed, already_asked, no_room };
+
+    /// Drops questions from the local protocol that nobody has answered.
+    ///
+    /// A relay request cannot leave one behind: the thread that asked is
+    /// parked on the slot and frees it when the broker times out. A local one
+    /// has nobody, so an unanswered question stayed in the queue for good, and
+    /// thirty-two of them filled it permanently. An app can raise a distinct
+    /// question per event KIND, so getting there costs one badly-behaved app a
+    /// few seconds, and once the queue is full nothing else can be asked about
+    /// either, relay requests included: the signer stops asking and starts
+    /// refusing.
+    ///
+    /// The same clock a waiting relay thread uses, so both kinds of question
+    /// have the same patience.
+    pub fn expireUnanswered(self: *Broker, now_s: i64) void {
+        const limit_s = @as(i64, @intCast(self.timeout_ms / 1000));
+        self.acquire();
+        var dropped = false;
+        for (&self.slots) |*slot| {
+            if (!slot.in_use or slot.waiter) continue;
+            if (slot.decision.load(.monotonic) != .pending) continue;
+            if (now_s - slot.info.created_at < limit_s) continue;
+            slot.in_use = false;
+            dropped = true;
+        }
+        self.release();
+        if (dropped) _ = self.version.fetchAdd(1, .monotonic);
+    }
+
+    fn claim(self: *Broker, info: Pending, waiter: bool) ?usize {
         self.acquire();
         defer self.release();
         for (&self.slots, 0..) |*slot, i| {
             if (!slot.in_use) {
-                slot.* = .{ .in_use = true, .info = info, .decision = .init(.pending) };
+                slot.* = .{ .in_use = true, .info = info, .decision = .init(.pending), .waiter = waiter };
                 slot.info.id = self.next_id;
                 self.next_id += 1;
                 _ = self.version.fetchAdd(1, .monotonic);
@@ -209,28 +428,54 @@ pub const Broker = struct {
 
     /// Applies the GUI's decision to pending entry `id`. Returns true if it was
     /// found and still pending.
-    pub fn resolve(self: *Broker, id: u64, decision: Decision) bool {
-        return self.resolveFor(id, decision, .once);
+    pub fn resolve(self: *Broker, id: u64, decision: Decision, now_ms: i64) bool {
+        return self.resolveFor(id, decision, .once, now_ms);
     }
 
     /// The same, with how long the answer should last.
-    pub fn resolveFor(self: *Broker, id: u64, decision: Decision, how_long: nip46.Remember) bool {
+    ///
+    /// The answer is written down HERE, at the moment it is given, rather than
+    /// by whoever was waiting for it. "Allow for an hour" runs from when the
+    /// person said it, not from when the request arrived, and those differ by
+    /// however long they took to read the row. On a queue whose whole purpose
+    /// is to be read carefully, that difference is the reading.
+    ///
+    /// A request nobody answered never reaches here at all, which is how a
+    /// timeout stays an open question instead of hardening into a refusal.
+    pub fn resolveFor(self: *Broker, id: u64, decision: Decision, how_long: nip46.Remember, now_ms: i64) bool {
         if (decision == .pending) return false;
         self.acquire();
         var found = false;
+        var had_waiter = true;
+        var info: Pending = .{};
         for (&self.slots) |*slot| {
             if (slot.in_use and slot.info.id == id and slot.decision.load(.monotonic) == .pending) {
                 // The duration first, so a thread waking on the decision cannot
                 // read a remember value that has not been written yet.
                 slot.remember = how_long;
                 slot.decision.store(decision, .release);
+                info = slot.info;
+                had_waiter = slot.waiter;
+                // Nobody is coming to collect this one. Left in use it would
+                // hold a slot forever, and there are thirty-two of them.
+                if (!slot.waiter) slot.in_use = false;
                 found = true;
                 break;
             }
         }
         self.release();
-        if (found) _ = self.version.fetchAdd(1, .monotonic);
-        return found;
+        if (!found) return false;
+        _ = self.version.fetchAdd(1, .monotonic);
+        // Outside the broker's lock. The permission store has its own, and
+        // nesting two hand-rolled locks is how a daemon stops answering.
+        if (how_long == .once and !had_waiter) {
+            // Nobody is parked on this one to read the answer off the slot, so
+            // "once" has to be kept somewhere until the retry collects it.
+            self.keepOneShot(info, decision == .approve, now_ms);
+        } else {
+            self.permissions.remember(info.client_id, info.method_id, info.kind, decision == .approve, how_long, now_ms);
+        }
+        return true;
     }
 };
 
@@ -242,6 +487,8 @@ pub const Interactive = struct {
     config: *const PolicyConfig,
     io: std.Io,
     gpa: std.mem.Allocator,
+    /// Where uses of the key are written down. Null writes nothing.
+    log: ?*audit.Log = null,
 
     pub fn asPolicy(self: *const Interactive) nip46.Policy {
         return .{ .ctx = @constCast(self), .decideFn = &decide };
@@ -275,12 +522,29 @@ fn touchesKey(method_name: []const u8) bool {
 fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46.Decision {
     const self: *const Interactive = @ptrCast(@alignCast(ctx.?));
 
+    // Somebody is using this daemon, even though nothing on this machine is.
+    // Without it a bunker serving a phone reads as abandoned and clocks out
+    // mid-conversation.
+    self.broker.touch(std.Io.Timestamp.now(self.io, .awake).toMilliseconds());
+
     // The static allowlist is the first gate: a disallowed request is denied
     // outright and never bothers the human.
     if (self.config.policy().decide(request, client) == .reject) return .reject;
 
     // Only a request that uses the key is worth waking somebody up for.
     if (!touchesKey(request.method)) return .approve;
+
+    // Kinds 14 and 15 are the UNSIGNED rumors inside a NIP-59 gift wrap, and a
+    // signature on one destroys the deniability the whole scheme exists for.
+    // The local protocol refused them from the day it was written; this side
+    // did not, so a client that reached the same key over a relay could still
+    // ask, and the answer was a prompt rather than a refusal. Refused before
+    // the human, because it is not a judgement call: there is no circumstance
+    // in which the right answer is yes, and putting it on the queue teaches
+    // somebody to approve the one request that should never have been shown.
+    if (nostr.nip46.signEventKind(self.gpa, request)) |k| {
+        if (k == 14 or k == 15) return .reject;
+    }
 
     // Already answered, and the answer has not lapsed. This is what stops
     // Notary asking about the same thing forever: the operator says "always" or
@@ -293,6 +557,7 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     const kind: i32 = if (nostr.nip46.signEventKind(self.gpa, request)) |k| @intCast(k) else -1;
     const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     if (self.broker.permissions.remembered(client, method, kind, now_ms)) |allowed| {
+        noteRelay(self, client, method, kind, if (allowed) "ok" else "refused");
         return if (allowed) .approve else .reject;
     }
 
@@ -307,19 +572,48 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
     info.client_len = 64;
     // Both already read above, for the permission lookup.
     info.kind = kind;
+    info.client_id = client;
+    info.method_id = method;
     if (method == .sign_event) {
         info.preview_len = signEventPreview(self.gpa, request, &info.preview_buf);
     }
 
+    // What the operator said is written down by `resolveFor`, when they say it.
+    // Nothing is written for a request nobody answered: an operator who walked
+    // away said nothing, and storing silence as a denial would lock a client
+    // out over an absence.
     const answered = self.broker.submitRemembering(self.io, info);
-    // `.once` is never written down, which is how a timeout leaves the question
-    // open: an operator who walked away from the machine said nothing, and
-    // storing silence as a denial would lock a client out over an absence.
-    self.broker.permissions.remember(client, method, kind, answered.decision == .approve, answered.remember, now_ms);
+    // A request nobody answered is not a refusal, and the log says so. That
+    // difference is the whole reason a timeout is not written down as one.
+    noteRelay(self, client, method, kind, switch (answered.decision) {
+        .approve => "ok",
+        .pending => "unanswered",
+        .reject => "refused",
+    });
     return switch (answered.decision) {
         .approve => .approve,
         else => .reject,
     };
+}
+
+/// Writes down what a request that arrived over a relay was allowed to do.
+///
+/// By pubkey, and `local` false, because this one is proof: whoever sent it
+/// signed it with that key. The line an app on this machine gets carries a
+/// name it chose, and the two must not read alike in the record any more than
+/// they do on the screen.
+fn noteRelay(self: *const Interactive, client: [32]u8, method: nip46.Method, kind: i32, outcome: []const u8) void {
+    const l = self.log orelse return;
+    var who: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&who, "{x}", .{client}) catch return;
+    l.note(self.io, std.Io.Timestamp.now(self.io, .real).toSeconds(), .{
+        .what = "sign",
+        .outcome = outcome,
+        .who = &who,
+        .local = false,
+        .method = method.name(),
+        .kind = kind,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -329,13 +623,24 @@ fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46
 
 const testing = std.testing;
 
+/// Wall-clock milliseconds, the way the GUI's own thread reads them.
+///
+/// Real time rather than a fixed number, because the policy under test reads
+/// real time too, and an answer stamped in some other era either lapses on
+/// arrival or never lapses at all.
+fn testNow() i64 {
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    return std.Io.Timestamp.now(threaded.io(), .real).toMilliseconds();
+}
+
 /// Stand-in for the GUI: waits for one pending entry, then resolves it.
 fn resolveFirstFor(broker: *Broker, decision: Decision, how_long: nip46.Remember) void {
     var buf: [4]Pending = undefined;
     var tries: usize = 0;
     while (tries < 1_000_000) : (tries += 1) {
         if (broker.snapshot(&buf) > 0) {
-            _ = broker.resolveFor(buf[0].id, decision, how_long);
+            _ = broker.resolveFor(buf[0].id, decision, how_long, testNow());
             return;
         }
         std.Thread.yield() catch {};
@@ -347,7 +652,7 @@ fn resolveFirst(broker: *Broker, decision: Decision) void {
     var tries: usize = 0;
     while (tries < 1_000_000) : (tries += 1) {
         if (broker.snapshot(&buf) > 0) {
-            _ = broker.resolve(buf[0].id, decision);
+            _ = broker.resolve(buf[0].id, decision, testNow());
             return;
         }
         std.Thread.yield() catch {};
@@ -581,4 +886,114 @@ test "walking away is not an answer, so a timeout is not remembered as a denial"
     const t = try std.Thread.spawn(.{}, resolveFirstFor, .{ &broker, Decision.approve, nip46.Remember.once });
     defer t.join();
     try testing.expectEqual(nip46.Decision.approve, p.decide(&req, client));
+}
+
+test "answered local questions do not fill the queue for good" {
+    // Nothing is parked on a local request. It was refused the moment it
+    // arrived and the app went away, so the only thing that can free its slot
+    // is the answer itself.
+    //
+    // The consequence is what this drives, not the mechanism: run more
+    // questions through than there are slots. If an answered one kept its
+    // slot, the queue silently fills, and from then on no app can raise a
+    // question and no relay request can either. The signer would look fine and
+    // simply stop asking.
+    var broker = Broker{};
+    var q: [Broker.capacity]Pending = undefined;
+    for (0..Broker.capacity * 2) |i| {
+        var info = Pending{ .local = true, .kind = @intCast(i), .method_id = .sign_event };
+        info.client_id = [_]u8{7} ** 32;
+        try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
+        // One at a time, so a slot that was not freed is the only way to run out.
+        try testing.expectEqual(@as(usize, 1), broker.snapshot(&q));
+        // `.once` is never written down, so every turn is a fresh question
+        // rather than a permission piling up.
+        try testing.expect(broker.resolveFor(q[0].id, .reject, .once, 0));
+        try testing.expectEqual(@as(usize, 0), broker.snapshot(&q));
+    }
+}
+
+test "one app cannot fill the queue and stop every other question" {
+    // A local question has nobody parked on it to time it out, so it stayed in
+    // the queue for good. An app raises a distinct question per event KIND, so
+    // thirty-two of them costs a badly-behaved app a few seconds, and once the
+    // queue is full nothing can be asked about at all: relay requests included,
+    // because they share these slots. The signer stops asking and starts
+    // refusing, which looks exactly like a signer that is working.
+    var broker = Broker{ .timeout_ms = 120_000 };
+    const start: i64 = 1_700_000_000;
+
+    for (0..Broker.capacity) |i| {
+        var info = Pending{
+            .local = true,
+            .kind = @intCast(i),
+            .method_id = .sign_event,
+            .client_id = [_]u8{9} ** 32,
+            .created_at = start,
+        };
+        info.client_len = 0;
+        try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
+    }
+
+    // Full, and a relay request cannot get in. This is the wedge.
+    var q: [Broker.capacity]Pending = undefined;
+    try testing.expectEqual(Broker.capacity, broker.snapshot(&q));
+    const relay = Pending{ .kind = 1, .method_id = .sign_event, .client_id = [_]u8{1} ** 32, .created_at = start };
+    try testing.expectEqual(Broker.Knock.no_room, broker.knock(relay));
+
+    // Nothing expires before the same patience a waiting relay thread gets.
+    broker.expireUnanswered(start + 119);
+    try testing.expectEqual(Broker.capacity, broker.snapshot(&q));
+
+    // And then they all go, because nobody answered any of them.
+    broker.expireUnanswered(start + 120);
+    try testing.expectEqual(@as(usize, 0), broker.snapshot(&q));
+    try testing.expectEqual(Broker.Knock.filed, broker.knock(relay));
+}
+
+test "a question somebody is waiting on is never expired out from under them" {
+    // The relay path frees its own slots when the broker times out, and that
+    // thread is still parked reading the decision off this slot. Dropping it
+    // here would hand the same slot to somebody else while a relay thread is
+    // still looking at it.
+    var broker = Broker{ .timeout_ms = 1000 };
+    const start: i64 = 1_700_000_000;
+    const idx = broker.claim(.{ .kind = 1, .created_at = start }, true).?;
+    broker.expireUnanswered(start + 10_000);
+    try testing.expect(broker.slots[idx].in_use);
+}
+
+test "a gift-wrap rumor is refused over a relay too, without asking anybody" {
+    // The local protocol refused kinds 14 and 15 from the day it was written.
+    // This side did not, so a client that reached the same key over a relay
+    // could still ask for one, and what it got was a PROMPT. That is worse
+    // than a hole: it teaches somebody to approve the one request that should
+    // never have been shown to them.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+    const client = [_]u8{4} ** 32;
+
+    for ([_]u16{ 14, 15 }) |kind| {
+        var buf: [128]u8 = undefined;
+        const tmpl = try std.fmt.bufPrint(&buf, "{{\"kind\":{d},\"content\":\"hi\",\"tags\":[],\"created_at\":1}}", .{kind});
+        const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+        const before = broker.version.load(.monotonic);
+        try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+        // And nobody was woken up about it.
+        try testing.expectEqual(before, broker.version.load(.monotonic));
+    }
+
+    // An ordinary note still reaches the queue, so this is a refusal of two
+    // kinds rather than of signing.
+    const ok_tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const ok_req = nip46.Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{ok_tmpl} };
+    const before = broker.version.load(.monotonic);
+    _ = p.decide(&ok_req, client); // times out into a reject; the queue is the point
+    try testing.expect(broker.version.load(.monotonic) != before);
 }

@@ -19,6 +19,7 @@ const PolicyConfig = nostr.nip46.PolicyConfig;
 const approval = @import("approval.zig");
 const approval_http = @import("approval_http.zig");
 const onboarding = @import("onboarding.zig");
+const audit = @import("audit.zig");
 const relay_keeper = @import("relay_keeper.zig");
 
 const keys = nostr.keys;
@@ -30,6 +31,27 @@ const hex = nostr.hex;
 // configuration; each is overridable via its environment variable. The key and
 // token files sit under $HOME; relays default to a public relay.
 const default_token_file = ".zig-nostr-signer.token";
+const default_log_file = audit.default_file;
+
+/// How long the daemon stays up with nothing using it.
+///
+/// Fifteen minutes, and the number is a trade rather than a preference. Both
+/// windows poll while they are open, so this clock only starts once every app
+/// has gone; shorter and somebody who quits an app for two minutes has to type
+/// their passphrase again, longer and a machine left alone keeps a decrypted
+/// key for an afternoon.
+///
+/// `SIGNER_IDLE_EXIT_MS=0` keeps it up forever, which is what somebody running
+/// this headless as a bunker for their phone wants: there is no window there
+/// to poll, so silence is the normal state rather than a sign that everyone
+/// left.
+const default_idle_exit_ms: i64 = 15 * 60 * 1000;
+
+fn idleExitMs() i64 {
+    const raw = getEnv("SIGNER_IDLE_EXIT_MS") orelse return default_idle_exit_ms;
+    return std.fmt.parseInt(i64, raw, 10) catch default_idle_exit_ms;
+}
+
 const default_key_file = ".zig-nostr-signer.key";
 // What the GUI serves on when the reader has not chosen. THREE, not one.
 //
@@ -55,6 +77,14 @@ const default_key_file = ".zig-nostr-signer.key";
 var g_seen_requests: nostr.signer.SeenRequests = .{};
 var g_authorized_clients: nip46.AuthorizedClients = .{};
 
+/// Where every use of the key is written down.
+///
+/// Process-lived and shared, because both the relay threads and the approval
+/// server write to it, and one file with one lock is the only way those lines
+/// stay whole. Its path is set at startup; until then it is a log that goes
+/// nowhere, which is what the non-GUI paths want anyway.
+var g_audit: audit.Log = .{};
+
 const default_gui_relays = "wss://nostr.oxtr.dev,wss://theforest.nostr1.com,wss://relay.primal.net";
 
 const usage =
@@ -71,6 +101,12 @@ const usage =
     \\  SIGNER_ALLOWED_KINDS   comma-separated event kinds sign_event may sign
     \\                         (default: any kind)
     \\  SIGNER_INIT            if set, create/import an encrypted key file and exit
+    \\  SIGNER_LOG_FILE        where uses of the key are written down (default:
+    \\                         $HOME/.zig-nostr-signer.log; empty turns it off)
+    \\  SIGNER_DETACH          if set, leave the starting app's process group, so
+    \\                         the daemon outlives it and can be shared
+    \\  SIGNER_IDLE_EXIT_MS    exit after this long with no request (default:
+    \\                         900000, fifteen minutes; 0 stays up forever)
     \\
     \\Subcommands:
     \\  import                 paste an existing nsec, read from the terminal
@@ -121,17 +157,22 @@ pub fn main(init: std.process.Init) !void {
     // `SIGNER_APPROVAL_HTTP`. Parse argv here so the slice lives for the process
     // (GUI/relay mode never returns).
     var approval_addr = getEnv("SIGNER_APPROVAL_HTTP");
+    // `--detach` for the same reason as the address: an app started from
+    // Finder has no environment worth inheriting, so anything the window needs
+    // to say to the daemon has to be said in argv.
+    var detach = envIsOn("SIGNER_DETACH");
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // argv[0]
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--approval-http")) {
             approval_addr = args.next();
-            break;
+        } else if (std.mem.eql(u8, arg, "--detach")) {
+            detach = true;
         }
     }
 
     if (approval_addr) |addr| {
-        runGuiMode(gpa, addr, conn_secret, &policy_config);
+        runGuiMode(gpa, addr, conn_secret, &policy_config, detach);
     }
 
     // Headless mode: the key must already be available (from an encrypted key
@@ -154,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
 /// first-run key onboarding over it, then serve with the resulting key. The
 /// broker and server live in this frame, which never returns (it tail-calls the
 /// forever-serving `runRelays`), so their addresses are stable for the process.
-fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig) noreturn {
+fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig, detach: bool) noreturn {
     const hp = parseHostPort(addr) orelse
         fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:8787");
 
@@ -191,17 +232,50 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         fail("out of memory tracking relay status");
     for (relay_status) |*s| s.* = std.atomic.Value(u8).init(@intFromEnum(approval_http.RelayStatus.connecting));
 
-    const token_hex = makeAndWriteToken(gpa, token_path);
+    // Beside the key, and readable only by this user, because it is a list of
+    // everything that key has done. `SIGNER_LOG_FILE=""` turns it off for
+    // somebody who would rather it did not exist.
+    g_audit = .{
+        .dir = std.Io.Dir.cwd(),
+        .path = getEnv("SIGNER_LOG_FILE") orelse resolveHome(gpa, default_log_file),
+    };
+
     var approval_server: approval_http.Server = .{
         .gpa = gpa,
         .broker = &broker_storage,
         .gate = &gate,
-        .token = token_hex,
+        // Filled after the bind. Minting it here would overwrite a RUNNING
+        // daemon's token before discovering the port is already theirs, and
+        // every client holding the old one would start getting 401s from a
+        // daemon that was working perfectly.
+        .token = "",
+        .log = &g_audit,
+        .idle_exit_ms = idleExitMs(),
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
         .clients = &g_authorized_clients,
         .host = hp.host,
         .port = hp.port,
     };
+    // Bind BEFORE anything else, and before any thread exists, because the
+    // next two things both depend on it: the spawner is told the port only if
+    // there is one, and the fork that frees this daemon from its spawner has
+    // to happen while this is still a single-threaded process.
+    //
+    // A bind that fails kills the daemon here, loudly, while the spawner is
+    // still watching. That is the whole reason the port is reported before the
+    // detach rather than after: afterwards there is nobody left to tell.
+    approval_server.bind(io) catch |err|
+        failFmt("could not bind the approval API on {s}: {s}", .{ addr, @errorName(err) });
+
+    // The port is ours, so the credential for it is ours to mint. Not one line
+    // earlier: the address is fixed and well known, so losing the race to it is
+    // the ordinary way a second daemon starts, and a loser that had already
+    // rewritten the shared token file would take every client down with it.
+    approval_server.token = makeAndWriteToken(gpa, token_path);
+    announcePort(io, approval_server.bound_port.load(.acquire));
+
+    if (detach) detachFromSpawner();
+
     const server_thread = std.Thread.spawn(.{}, runApprovalServer, .{&approval_server}) catch
         fail("could not start the approval server");
     server_thread.detach();
@@ -216,10 +290,11 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         \\  approval API : http://{s}  (bearer token → {s})
         \\  key file     : {s}
         \\  key state    : {s}
+        \\  audit log    : {s}
         \\
         \\{s}
         \\
-    , .{ addr, token_path, key_file, @tagName(booted), key_note });
+    , .{ addr, token_path, key_file, @tagName(booted), if (g_audit.path.len == 0) "(off)" else g_audit.path, key_note });
 
     // Block until the GUI creates or unlocks the key (returns at once if a
     // preconfigured key was loaded above), then serve with it. The broker is
@@ -407,6 +482,7 @@ fn serveRelayForever(
         .config = policy_config,
         .io = io,
         .gpa = gpa,
+        .log = &g_audit,
     };
     const request_policy = if (broker != null) interactive.asPolicy() else policy_config.policy();
 
@@ -714,6 +790,78 @@ fn makeAndWriteToken(gpa: std.mem.Allocator, path: []const u8) []u8 {
     return token_hex;
 }
 
+/// The one line the spawner reads: the port this daemon is listening on.
+///
+/// STDOUT, and that matters. The SDK's line-mode spawn ignores a child's
+/// stderr outright (`.stderr = ... else .ignore`), so the human-facing banner
+/// below it is dropped on the floor and a spawner watching for this would wait
+/// forever.
+///
+/// Printed after the bind and before the detach. Both halves of that are
+/// deliberate: after, because a port nobody got is not worth reporting; before,
+/// because once this process has detached there is nobody left listening.
+fn announcePort(io: std.Io, port: u16) void {
+    var out_buf: [64]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &out_buf);
+    stdout.interface.print("{s} {d}\n", .{ approval_http.port_line_prefix, port }) catch {};
+    stdout.interface.flush() catch {};
+}
+
+/// Leaves the process group of whoever started this daemon, when asked to.
+///
+/// A keyholder that several apps share cannot be one app's child. The Native
+/// SDK group-kills the children it spawns when the app quits, which is right
+/// for a private helper and catastrophic for a shared one: close the window
+/// that happened to start the daemon and every OTHER app loses its signer
+/// mid-sentence, with no error anywhere, because from their side the socket
+/// simply stops answering.
+///
+/// A plain `setsid` does not get out of the way. The group kill falls back to
+/// signalling the child's own pid, and after `setsid` that pid is exactly what
+/// the new group is named after, so it is hit either way. Escaping takes a
+/// DESCENDANT: this process forks, the parent exits at once so the spawner
+/// sees a clean exit, and the child takes a new session whose id is its own
+/// pid, which nothing the spawner knows about can name.
+///
+/// Then the three inherited standard descriptors go to /dev/null. Not tidiness:
+/// a detached child holding the spawner's stdout write end open means the
+/// spawner's reader never sees EOF and its worker is abandoned rather than
+/// finishing. Nothing is lost by closing them, because a process that has just
+/// left its terminal has no reader.
+///
+/// The listening socket is untouched and survives the fork, which is the whole
+/// reason binding happens first.
+/// Whether an environment variable is set to something meaning yes.
+///
+/// Present-but-empty and "0" mean no, so a launcher that exports the name
+/// unconditionally does not turn a behaviour on by accident.
+fn envIsOn(name: [*:0]const u8) bool {
+    const v = getEnv(name) orelse return false;
+    return v.len != 0 and !std.mem.eql(u8, v, "0");
+}
+
+fn detachFromSpawner() void {
+    const pid = std.c.fork();
+    if (pid < 0) {
+        // Could not fork: keep serving as a child rather than not at all. The
+        // shared-daemon hazard is back, and saying so is better than exiting
+        // and leaving the reader with no signer whatsoever.
+        std.debug.print("signer: could not detach; this daemon will end when the app that started it does\n", .{});
+        return;
+    }
+    if (pid > 0) std.c._exit(0); // the spawner's child, done the moment it has forked
+
+    _ = std.c.setsid();
+
+    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR });
+    if (devnull >= 0) {
+        _ = std.c.dup2(devnull, 0);
+        _ = std.c.dup2(devnull, 1);
+        _ = std.c.dup2(devnull, 2);
+        if (devnull > 2) _ = std.c.close(devnull);
+    }
+}
+
 /// Runs the approval HTTP server on its own thread with its own io.
 ///
 /// A listener that cannot come up KILLS the daemon. It used to print and let
@@ -761,6 +909,7 @@ test {
     //
     // The serve loop, keystore, and policy tests now run in the nostr library.
     _ = @import("approval.zig");
+    _ = @import("audit.zig");
     _ = @import("approval_http.zig");
     _ = @import("onboarding.zig");
     _ = @import("relay_keeper.zig");

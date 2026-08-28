@@ -159,6 +159,13 @@ pub const Row = struct {
     /// The requesting client's pubkey, hex.
     client_buf: [64]u8 = [_]u8{0} ** 64,
     client_len: u8 = 0,
+    /// Whether `client_buf` holds a name an app on this Mac chose for itself,
+    /// rather than the pubkey of whoever signed a request over a relay.
+    ///
+    /// The two are not the same kind of fact and the row must not read as
+    /// though they were. A relay client proved it holds a key. A local one
+    /// typed a word, and any program running as this user can type any word.
+    local: bool = false,
     /// The start of what would be signed.
     preview_buf: [160]u8 = [_]u8{0} ** 160,
     preview_len: u8 = 0,
@@ -206,14 +213,25 @@ pub const Row = struct {
         return self.method();
     }
 
-    /// Who is asking, short enough to read: the first and last of the pubkey.
+    /// Who is asking, short enough to read, and honest about how much that is
+    /// worth knowing.
     ///
-    /// The whole point of putting it on the row is that a person can tell one
-    /// requester from another, and sixty-four hex characters is not something
-    /// anybody compares. Eight and eight is.
+    /// Two different facts share this line. A request that came over a relay
+    /// carries the pubkey that signed it, which is proof: "from" is the right
+    /// word, and eight characters of each end is what makes it comparable at
+    /// all, since nobody reads sixty-four.
+    ///
+    /// A request from an app on this Mac carries a name the app chose. Any
+    /// program running as this user can read the daemon's token and claim any
+    /// name, so "from Plaza" would state something nobody checked, on the one
+    /// row in this application where a person is being asked to check
+    /// something. "Calling itself" is the same length and true.
     pub fn asker(self: *const Row, arena: std.mem.Allocator) []const u8 {
         const c = self.client();
-        if (c.len < 20) return if (c.len == 0) "unknown client" else c;
+        if (c.len == 0) return "unknown client";
+        if (self.local)
+            return std.fmt.allocPrint(arena, "an app on this Mac calling itself \"{s}\"", .{c}) catch c;
+        if (c.len < 20) return c;
         return std.fmt.allocPrint(arena, "from {s}…{s}", .{ c[0..8], c[c.len - 8 ..] }) catch c;
     }
 };
@@ -392,6 +410,22 @@ pub const Model = struct {
     /// Attached mode sets it at boot: the address came from the environment and
     /// is the operator's business.
     port_known: bool = false,
+    /// Whether this window has already started a daemon. Not the same question
+    /// as "is one running": another app may have started the one we are talking
+    /// to, and that is the ordinary case rather than a fallback.
+    spawned: bool = false,
+    /// Retry ticks in a row that have not reached a daemon.
+    ///
+    /// The only evidence this window gets that a DETACHED daemon has died. It
+    /// is no longer a child, so nothing reports its exit; a socket that stops
+    /// answering is the whole signal.
+    connect_failures: u8 = 0,
+    /// Whether anything has ever answered on this address.
+    ///
+    /// Separates "there is no daemon here" from "the daemon I was talking to
+    /// went quiet for a moment". Those need opposite responses and looked
+    /// identical to a window that had not spawned anything itself.
+    ever_connected: bool = false,
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -914,20 +948,116 @@ pub const app_markup = @embedFile("app.native");
 const NotaryApp = native_sdk.UiApp(Model, Msg);
 const Effects = NotaryApp.Effects;
 
-/// What we ask the daemon to bind in managed mode: loopback, port chosen by the
-/// kernel. See `Model.port_known` for why.
-const managed_bind_address = "127.0.0.1:0";
+/// What we ask the daemon to bind in managed mode.
+///
+/// The WELL KNOWN address now, not `127.0.0.1:0`. A kernel-chosen port and a
+/// stdout line is a rendezvous only the spawner can use, and it was the right
+/// shape while this window was the daemon's only client. It is the wrong shape
+/// for a daemon meant to be shared: another app that wants the same key did not
+/// spawn it, has no stdout to read, and has to be able to find one that is
+/// already running.
+///
+/// The NUMBER is the rendezvous, not a file naming the number. A port file is
+/// the obvious alternative and it is the dangerous one: it sits on disk
+/// writable by this same user, so anything running as them could point it at a
+/// listener of its own and every client would go there instead, while the real
+/// daemon sat healthy and idle, never knowing. There is nothing here to
+/// rewrite.
+///
+/// The bind stays EXCLUSIVE (`approval_http.Server.run`). Something that takes
+/// this port first does not get to answer for the daemon quietly: the bind
+/// fails and the daemon says so.
+const managed_bind_address = "127.0.0.1:8787";
+
+/// Whether this window may start a daemon of its own, on a retry tick.
+///
+/// Split out because it is the rule the shared daemon turns on, and a rule
+/// worth being able to state without an event loop around it. Three ways to
+/// answer no, and each is a different mistake avoided:
+///
+///   - not managed: this window was pointed at somebody else's daemon on
+///     purpose, and starting a competing one is not ours to do;
+///   - already spawned: a second would race the first onto a port the first
+///     holds exclusively, and the loser exits while this window waits for it;
+///   - connected: something is already serving, which is the ordinary case now
+///     rather than a fallback. Another app may have started it, or the reader
+///     may have opened Notary before Plaza.
+fn shouldStartDaemon(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
+    if (!managed) return false;
+    if (phase == .connected) return false;
+    // Nothing has ever answered here and this window has started nothing: its
+    // turn, once an attempt has actually come back empty.
+    if (!spawned and !ever_connected) return failures >= 1;
+    // Otherwise something WAS there: either this window started it, or it
+    // attached to a daemon somebody else did. Either way its death is not
+    // reported here, because a detached daemon is nobody's child, so a run of
+    // ticks that reached nothing is the only evidence there is.
+    //
+    // Waiting for the run matters most in the ATTACHED case. A single dropped
+    // poll against a perfectly healthy daemon would otherwise start a second
+    // one, which loses the race for a port the first holds exclusively and
+    // exits, for no reason the reader could see.
+    return failures >= respawn_after_failures;
+}
+
+/// How many silent retry ticks amount to "there is no daemon there".
+///
+/// Three, against a retry that backs off, so a daemon still starting is not
+/// competed with. The cost of guessing wrong is small in one direction only:
+/// the bind is exclusive, so a redundant daemon exits at once instead of
+/// quietly taking over the address.
+const respawn_after_failures: u8 = 3;
+
+pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
+    return shouldStartDaemon(managed, spawned, ever_connected, failures, phase);
+}
+
+/// Whether this exit is a daemon that detached, rather than one that failed.
+///
+/// A detaching daemon forks and its first process exits 0 immediately, so this
+/// arrives seconds after every successful start and means the opposite of what
+/// it looks like: the daemon is up, it is simply no longer this window's child.
+///
+/// A clean exit is therefore not news. Anything else is: the daemon binds its
+/// port BEFORE it forks, precisely so a port it could not get still fails here,
+/// while somebody is watching, instead of vanishing into a process nobody is
+/// attached to.
+///
+/// Liveness after this point is the HTTP connection, which is the honest
+/// measure anyway. The process being alive never meant it was answering.
+fn daemonDetached(exit: native_sdk.EffectExit) bool {
+    return exit.reason == .exited and exit.code == 0;
+}
+
+pub fn daemonDetachedForTest(reason: native_sdk.EffectExitReason, code: i32) bool {
+    return daemonDetached(.{ .key = 0, .reason = reason, .code = code });
+}
 
 fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.phase = .starting;
-    // A restarted daemon gets a different port, so anything we knew is stale.
-    model.port_known = false;
+    // Recorded so the retry tick starts at most one daemon per window: a second
+    // would race the first onto a port the first holds exclusively, and the
+    // loser exits while this window waits for it. It gates only the AUTOMATIC
+    // spawn; Restart and the sign-out paths call this directly and are meant to.
+    model.spawned = true;
     fx.spawn(.{
         .key = daemon_key,
-        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address },
+        // `--detach` is what makes this a shared service rather than this
+        // window's child. The SDK group-kills what it spawns when the app
+        // quits, which is right for a private helper and wrong here: close
+        // this window and every other app using the key would lose its signer
+        // mid-sentence, with nothing to see but a socket that stopped
+        // answering. The daemon forks itself out of reach instead, and ends
+        // itself when nobody has asked it for anything in a while.
+        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address, "--detach" },
         .on_line = Effects.lineMsg(.daemon_line),
         .on_exit = Effects.exitMsg(.daemon_exited),
     });
+}
+
+/// Counts an attempt that reached nothing, and forgets the run once one lands.
+fn noteConnectFailure(model: *Model) void {
+    if (model.connect_failures < 255) model.connect_failures += 1;
 }
 
 /// One connection attempt: (re-)read the token file, then poll. Re-reading on
@@ -1025,11 +1155,16 @@ fn sendSetup(model: *Model, fx: *Effects) void {
     var url_buf: [128]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}/setup", .{model.baseUrl()}) catch return;
     var body_buf: [768]u8 = undefined;
-    const Body = struct { passphrase: []const u8, secret: []const u8 };
+    const Body = struct { method: []const u8, passphrase: []const u8, secret: []const u8 };
     // Trim whitespace so a stray space or newline (the key field is a wrapping
     // textarea) can't corrupt a pasted nsec/hex secret.
     const secret = if (model.import_mode) std.mem.trim(u8, model.secret(), " \t\r\n") else "";
-    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .passphrase = model.passphrase(), .secret = secret }, .{})}) catch return;
+    // Which one the reader chose, SAID rather than left to be guessed from an
+    // empty secret. The daemon used to read "no secret" as "make me a new key",
+    // so an import whose paste trimmed to nothing minted a fresh identity
+    // instead of failing. It refuses now, and this is the half that tells it.
+    const method = if (model.import_mode) "import" else "create";
+    const body = std.fmt.bufPrint(&body_buf, "{f}", .{std.json.fmt(Body{ .method = method, .passphrase = model.passphrase(), .secret = secret }, .{})}) catch return;
     const headers = [_]std.http.Header{
         .{ .name = "authorization", .value = model.auth() },
         .{ .name = "content-type", .value = "application/json" },
@@ -1170,11 +1305,18 @@ fn onUnauthorized(model: *Model, fx: *Effects) void {
 
 /// Boot command: in managed mode spawn the daemon; either way begin connecting.
 pub fn boot(model: *Model, fx: *Effects) void {
-    if (model.managed) {
-        spawnDaemon(model, fx);
-    } else {
-        model.phase = .connecting;
-    }
+    // Look before starting one. The daemon is shared now: it outlives the
+    // window that spawned it (only `/lock` ends it), another app on this
+    // machine may have started it, and the reader may have opened that app
+    // first. Spawning unconditionally would put a second daemon on a port the
+    // first one holds exclusively, and the loser would exit while this window
+    // waited for it.
+    //
+    // So connect first and let the retry path start one only if nothing
+    // answers. Attaching to a daemon somebody else started is the normal case,
+    // not a fallback: the alternative is signing the reader out of whatever was
+    // already using it.
+    model.phase = .connecting;
     attemptConnect(model, fx);
     // Keep the live relay status fresh while serving (the initial /info is a
     // one-shot; the pending poll doesn't carry relay state).
@@ -1209,6 +1351,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // A cancel we initiated (restart / app quit) reports `.cancelled`.
             // That is expected teardown, not a crash to report.
             if (exit.reason == .cancelled) return;
+            // A detaching daemon exits its FIRST process the moment it has
+            // forked, and that exit is the success signal, not a failure: the
+            // daemon it left behind is the one now listening. Only a non-zero
+            // code says something actually went wrong, and the daemon is
+            // careful to bind before it forks so a bad port still lands here
+            // where somebody can be told about it.
+            if (daemonDetached(exit)) return;
             model.phase = .daemon_exited;
             model.setExitNote(exit);
             model.setAuth("");
@@ -1254,6 +1403,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 onUnauthorized(model, fx);
             } else {
                 // The daemon may still be coming up; try again shortly.
+                noteConnectFailure(model);
                 armRetry(fx);
             }
         },
@@ -1262,12 +1412,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .ok => switch (r.status) {
                 200 => {
                     model.phase = .connected;
+                    model.connect_failures = 0; // something answered
+                    model.ever_connected = true;
                     parsePending(model, r.body);
                     pollPending(model, fx); // re-arm the long-poll chain
                 },
                 401 => onUnauthorized(model, fx),
                 else => {
                     model.phase = .disconnected;
+                    noteConnectFailure(model);
                     armRetry(fx);
                 },
             },
@@ -1276,6 +1429,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .rejected => armRetry(fx),
             else => {
                 if (model.phase == .connected) model.phase = .disconnected;
+                noteConnectFailure(model);
                 armRetry(fx);
             },
         },
@@ -1286,6 +1440,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         .tick => |t| {
             if (t.outcome != .fired) return;
             if (model.phase == .daemon_exited) return; // wait for the Restart button
+            // Nothing answered on the well-known address, so there is no daemon
+            // to attach to and this window may start one. Only in managed mode,
+            // and only once: attached mode was pointed at somebody else's
+            // daemon on purpose, and a second spawn would race the first.
+            if (shouldStartDaemon(model.managed, model.spawned, model.ever_connected, model.connect_failures, model.phase)) {
+                model.connect_failures = 0; // this attempt gets its own run
+                spawnDaemon(model, fx);
+            }
             // A full reconnect attempt: re-read the token, then poll.
             attemptConnect(model, fx);
         },
@@ -1611,6 +1773,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
             method: []const u8 = "",
             kind: i32 = -1,
             created_at: i64 = 0,
+            local: bool = false,
             client: []const u8 = "",
             preview: []const u8 = "",
         } = &.{},
@@ -1621,7 +1784,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
     var n: usize = 0;
     for (parsed.pending) |p| {
         if (n >= max_pending) break;
-        var row = Row{ .id = p.id, .kind = p.kind, .created_at = p.created_at };
+        var row = Row{ .id = p.id, .kind = p.kind, .created_at = p.created_at, .local = p.local };
         row.setMethod(p.method);
         row.setClient(p.client);
         row.setPreview(p.preview);
@@ -1681,9 +1844,14 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
         model.setDaemonBin(bin);
         model.managed = true;
     }
-    // Attached mode talks to whatever the operator pointed us at, so the
-    // address above is already the answer. Managed mode waits to be told.
-    model.port_known = !model.managed;
+    // The address is known in BOTH modes now. Attached mode talks to whatever
+    // the operator pointed us at; managed mode used to wait to be told, because
+    // the daemon was given a kernel-chosen port and printed it back. A
+    // well-known port removes that wait, and removing it is what lets this
+    // window look for a daemon that is ALREADY running before starting one of
+    // its own.
+    model.port_known = true;
+    if (model.managed) model.setBaseUrl(managed_bind_address);
 
     if (environ.get("SIGNER_APPROVAL_TOKEN_FILE")) |path| {
         model.setTokenPath(path);

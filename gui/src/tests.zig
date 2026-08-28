@@ -63,6 +63,102 @@ fn expectByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const 
 
 // ------------------------------------------------------------- parsing
 
+test "a window looks for a daemon before starting one" {
+    // The daemon is shared. It outlives the window that spawned it (only
+    // `/lock` ends it), another app on this machine may have started it, and
+    // the reader may have opened that app first. A window that spawned
+    // unconditionally would put a second daemon on a port the first holds
+    // exclusively: the loser exits, and this window waits for something that is
+    // never coming while a perfectly good daemon is already serving.
+
+    // Nothing is answering and this window has started nothing: its turn, once
+    // one attempt has actually come back empty. Not on the very first tick,
+    // when the first connect may still be in flight.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .disconnected));
+
+    // But a window that ATTACHED to somebody else's daemon must not start a
+    // second one over a single dropped poll: the new one loses the race for a
+    // port the first holds exclusively and exits, for no reason a reader could
+    // see. It waits for the same run of silence as one that spawned.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 1, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 2, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, true, 3, .disconnected));
+
+    // Something IS answering. Attaching to a daemon somebody else started is
+    // the ordinary case, not a fallback.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connected));
+
+    // Already started one. A second races the first onto a port held
+    // exclusively, and the loser exits.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .connecting));
+
+    // Attached mode was pointed at somebody else's daemon on purpose.
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .disconnected));
+}
+
+test "a detached daemon that dies is noticed by silence, since nothing reports it" {
+    // The daemon this window starts forks itself out of the window's process
+    // group, so that closing this window does not take the signer away from
+    // every other app using it. The price is that its death is no longer
+    // reported here: it is not a child any more, and `.daemon_exited` arrived
+    // seconds after it STARTED.
+    //
+    // So a run of ticks that reached nothing is the only evidence there is,
+    // and without this the window would retry a dead address forever while
+    // refusing to start a replacement, because it had started one once.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 3, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 200, .disconnected));
+
+    // Still not while something is answering, however long the run was.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 200, .connected));
+    // And still never in attached mode: that daemon is somebody else's.
+    try testing.expect(!main.shouldStartDaemonForTest(false, true, false, 200, .disconnected));
+}
+
+test "the window does not report a stopped signer when the daemon merely detached" {
+    // Drives the message rather than the predicate. The predicate had a test
+    // and the wiring did not, so removing the guard changed nothing anybody
+    // could see: this is the assertion that the window still shows a working
+    // signer after the exit that every successful start produces.
+    var m = Model{};
+    m.phase = .connecting;
+    m.managed = true;
+    m.spawned = true;
+    main.update(&m, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 0 } }, undefined);
+    try testing.expect(m.phase != .daemon_exited);
+    try testing.expectEqual(main.Phase.connecting, m.phase);
+
+    // A real failure still is one. The daemon binds before it forks so that a
+    // port it could not get lands here, while somebody is watching.
+    var bad = Model{};
+    bad.phase = .connecting;
+    bad.managed = true;
+    bad.spawned = true;
+    main.update(&bad, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 1 } }, undefined);
+    try testing.expectEqual(main.Phase.daemon_exited, bad.phase);
+}
+
+test "a daemon that detached is not a daemon that failed" {
+    // A detaching daemon's first process exits 0 the moment it has forked, so
+    // this arrives after every successful start. Reading it as a crash would
+    // put the window into "Signer stopped" with a Restart button, seconds
+    // after the daemon came up perfectly.
+    try testing.expect(main.daemonDetachedForTest(.exited, 0));
+
+    // Everything else is real. The daemon binds its port BEFORE it forks
+    // precisely so a port it could not get still lands here, where somebody
+    // can be told, instead of vanishing into a process nobody is attached to.
+    try testing.expect(!main.daemonDetachedForTest(.exited, 1));
+    try testing.expect(!main.daemonDetachedForTest(.signaled, 0));
+    try testing.expect(!main.daemonDetachedForTest(.spawn_failed, 0));
+    try testing.expect(!main.daemonDetachedForTest(.rejected, 0));
+}
+
 test "parseInfo fills the header fields" {
     var m = Model{};
     main.parseInfo(&m, "{\"pubkey\":\"aabbccddeeff00112233\",\"timeout_ms\":120000}");
@@ -243,6 +339,23 @@ test "an approval row says who is asking and what would be signed" {
     main.parsePending(&old, "{\"version\":1,\"pending\":[{\"id\":9,\"method\":\"sign_event\",\"kind\":1,\"created_at\":0}]}");
     const old_tree = try buildTree(arena_state.allocator(), &old);
     _ = try expectByText(old_tree.root, .text, "unknown client");
+
+    // An app on this Mac gets the other sentence. It named itself, and any
+    // program running as this user could have named itself the same, so the
+    // row says what happened rather than asserting an identity: this is the
+    // one screen in the application whose whole job is to be read carefully
+    // before somebody allows a signature under their name.
+    var here = Model{};
+    here.phase = .connected;
+    main.parsePending(&here,
+        \\{"version":1,"pending":[{"id":10,"method":"sign_event","kind":1,"created_at":0,
+        \\"local":true,"client":"plaza","preview":"gm"}]}
+    );
+    const here_tree = try buildTree(arena_state.allocator(), &here);
+    _ = try expectByText(here_tree.root, .text, "an app on this Mac calling itself \"plaza\"");
+
+    // And it must not be dressed up as proof of who is asking.
+    try testing.expect(findByText(here_tree.root, .text, "from plaza") == null);
 }
 
 test "a populated view renders rows and dispatches typed approve/deny" {
@@ -273,11 +386,17 @@ test "a populated view renders rows and dispatches typed approve/deny" {
         else => return error.WrongMessage,
     }
 
-    const always = try expectByText(tree.root, .button, "Always");
+    // "Until locked", not "Always". Answers live in the daemon's memory and
+    // nothing writes them down, so every one of them ends when the key does.
+    // A button that promised forever would be describing a durability this
+    // does not have, on the screen where somebody is deciding how much to
+    // trust an app.
+    const always = try expectByText(tree.root, .button, "Until locked");
     switch (tree.msgForPointer(always.id, .up).?) {
         .approve_always => |id| try testing.expectEqual(@as(u64, 42), id),
         else => return error.WrongMessage,
     }
+    try testing.expect(findByText(tree.root, .button, "Always") == null);
 
     const deny = try expectByText(tree.root, .button, "Deny");
     switch (tree.msgForPointer(deny.id, .up).?) {
