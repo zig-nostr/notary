@@ -309,6 +309,9 @@ pub const Model = struct {
     base_url_len: usize = 0,
     daemon_bin_buf: [512]u8 = [_]u8{0} ** 512,
     daemon_bin_len: usize = 0,
+    /// `<that binary> import`, composed once the real path is known.
+    import_cmd_buf: [576]u8 = [_]u8{0} ** 576,
+    import_cmd_len: usize = 0,
     /// True when `SIGNER_BIN` is set: the app spawns and supervises the daemon.
     managed: bool = false,
     /// Whether this keyholder answers clients over relays, as the daemon
@@ -435,6 +438,11 @@ pub const Model = struct {
         const n = @min(path.len, self.daemon_bin_buf.len);
         @memcpy(self.daemon_bin_buf[0..n], path[0..n]);
         self.daemon_bin_len = n;
+        // The terminal card names THIS binary from here on. Composed where the
+        // path arrives rather than read later, so the card and the Copy button
+        // cannot disagree about what they are offering.
+        const cmd = std.fmt.bufPrint(&self.import_cmd_buf, "{s} import", .{self.daemon_bin_buf[0..n]}) catch "";
+        self.import_cmd_len = cmd.len;
     }
     pub fn daemonBin(self: *const Model) []const u8 {
         return self.daemon_bin_buf[0..self.daemon_bin_len];
@@ -534,8 +542,21 @@ pub const Model = struct {
     // -- onboarding view bindings --
 
     pub fn import_command_text(self: *const Model) []const u8 {
-        _ = self;
-        return import_command;
+        return self.importCommand();
+    }
+    /// The command that takes a key without it passing through this window.
+    ///
+    /// This window ships inside more than one app. Started from Plaza, the
+    /// signer beside it is Plaza's, and naming Notary's sends a reader to a
+    /// path that does not exist on their Mac unless they also installed Notary
+    /// on its own. So the real neighbour wins whenever there is one.
+    ///
+    /// The constant stays for the case it was written for: a dev build with no
+    /// sibling, where a path derived from the build cache would be useless and
+    /// the installed app is the right guess.
+    pub fn importCommand(self: *const Model) []const u8 {
+        if (self.import_cmd_len == 0) return import_command;
+        return self.import_cmd_buf[0..self.import_cmd_len];
     }
     /// "Copy", or the confirmation, on the terminal card's own button.
     pub fn command_copy_label(self: *const Model) []const u8 {
@@ -1446,7 +1467,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
 
         .copy_command => fx.writeClipboard(.{
             .key = command_clipboard_key,
-            .text = import_command,
+            .text = model.importCommand(),
             .on_result = Effects.clipboardMsg(.command_copied_result),
         }),
         .command_copied_result => |result| {
