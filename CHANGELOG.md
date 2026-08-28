@@ -7,6 +7,31 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-08-28
+
+### Changed
+
+- **Whether this keyholder answers other devices is Notary's setting, not the
+  starting app's.** It was a switch in the app that spawned the daemon, which
+  made a client responsible for a keyholder's policy and had it storing a
+  preference about a key it deliberately knows nothing about.
+
+  The daemon reads its own config file, beside its own key, readable only by
+  this user. An app that embeds Notary passes no flag and has no opinion.
+  `--serve-relays` remains as an override for a terminal.
+
+  Notary's window shows it and the daemon owns the answer: the toggle posts, the
+  daemon writes, and the next `/info` is what the screen believes. A window
+  keeping its own copy would eventually disagree with the thing actually
+  signing, and the disagreement would be invisible.
+
+  It says WHEN, too: relay threads are created once, with the key, so a running
+  daemon cannot grow or drop them and the switch lands on the next start.
+
+  Missing or unreadable config means off. The safe reading of "I could not tell"
+  is not to put the process holding a key on the network.
+
+
 ## [0.10.0] - 2026-08-28
 
 Notary can now sign for the app it is shipped inside, not only for clients that
