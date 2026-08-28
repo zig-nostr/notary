@@ -105,6 +105,9 @@ const usage =
     \\                         $HOME/.zig-nostr-signer.log; empty turns it off)
     \\  SIGNER_IDLE_EXIT_MS    exit after this long with no request (default:
     \\                         900000, fifteen minutes; 0 stays up forever)
+    \\  SIGNER_CONF_FILE       where this daemon's own settings live (default:
+    \\                         $HOME/.zig-nostr-signer.conf), currently just
+    \\                         whether it answers clients over relays
     \\
     \\Subcommands:
     \\  import                 paste an existing nsec, read from the terminal
