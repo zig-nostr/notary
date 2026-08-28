@@ -268,6 +268,10 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .broker = &broker_storage,
         .gate = &gate,
         .token = secret,
+        // Reached only from the `--approval-http` path, which failed above if
+        // no secret arrived on stdin. So a caller holding this token is the
+        // parent that minted it.
+        .local_paired = true,
         .log = &g_audit,
         .idle_exit_ms = idleExitMs(),
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status, .serve_relays = serve_relays, .conf_file = conf_path },

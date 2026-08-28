@@ -77,6 +77,23 @@ pub const Server = struct {
     gate: *Gate,
     /// Bearer token clients must present.
     token: []const u8,
+    /// Whether the holder of that token is this daemon's own parent.
+    ///
+    /// Set only by a daemon started with `--approval-http`, which refuses to
+    /// come up at all unless a secret arrived on stdin. That secret is minted
+    /// in the parent's memory, handed over a pipe, and written nowhere, so
+    /// presenting it is not a claim about who you are, it is proof of being
+    /// the process that started this one. There is no second way to obtain it.
+    ///
+    /// The per-question approval below exists for a caller this daemon cannot
+    /// identify. It is the wrong instrument here twice over: the pairing
+    /// already answered "who is asking", and a question filed for a private
+    /// child reaches nobody, because the window that shows the queue finds
+    /// daemons by a fixed port and a token file this one does not use.
+    ///
+    /// Defaults false so that every other construction, the tests included,
+    /// keeps the gate.
+    local_paired: bool = false,
     /// Where uses of the key are written down. Null writes nothing, which is
     /// how the tests that are about something else stay about something else.
     log: ?*audit.Log = null,
@@ -1016,6 +1033,18 @@ fn localAllowed(
     preview: []const u8,
     comptime what: []const u8,
 ) !bool {
+    // A daemon that was handed its secret by the process it serves has already
+    // been told who is asking, and the answer cannot be forged. Asking a person
+    // to confirm it would not add a check, it would add a question nobody can
+    // reach: the queue is served over a fixed port and a token file this daemon
+    // does not use, so the window shows a different daemon's questions. Plaza
+    // v0.13.0 shipped that way and could not write at all.
+    //
+    // This is not the relay surface. A client that arrives over a relay is
+    // still identified by its own keypair and still answers to everything
+    // below.
+    if (self.local_paired) return true;
+
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
 
     // An answer given ONCE, to the question this request already raised. Taking
@@ -1781,6 +1810,82 @@ test "an app nobody has answered for is refused, and asks once" {
         try handleSignerSign(&server, io, &out.writer, req);
     }
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
+}
+
+test "a daemon its own parent started signs without asking anybody" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    gate.preload(kp);
+    // The one difference from the test above: this daemon was handed its
+    // secret by the process it serves.
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .local_paired = true, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    // A contact list, because that is the write that found this. Plaza v0.13.0
+    // asked for exactly this, was told to wait for an answer nobody could give,
+    // and reported the unfollow to the user as done.
+    const req = try signRequest(gpa, 3);
+    defer gpa.free(req);
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleSignerSign(&server, io, &out.writer, req);
+    var body = out.toArrayList();
+    defer body.deinit(gpa);
+
+    // 200 with a signature, not a question. The signed event comes back nested
+    // as an escaped JSON string, so this looks for the status and the absence
+    // of the refusal rather than for a bare `"sig"` that is never spelled that
+    // way in the wire form.
+    try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "sig") != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, nostr.signer_ipc.reason_awaiting_approval) == null);
+
+    // And it left no question behind. A row filed here is a row nobody can
+    // answer, so it would sit until the sweeper took it.
+    var queue: [Broker.capacity]Pending = undefined;
+    try testing.expectEqual(@as(usize, 0), broker.snapshot(&queue));
+}
+
+test "pairing is off unless it is asked for" {
+    // The same request, the same key, the same everything but the pairing. If
+    // this ever passes by default, every caller that can read a token is
+    // pre-approved and the queue stops meaning anything.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    gate.preload(kp);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+    try testing.expect(!server.local_paired);
+
+    const req = try signRequest(gpa, 3);
+    defer gpa.free(req);
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleSignerSign(&server, io, &out.writer, req);
+    var body = out.toArrayList();
+    defer body.deinit(gpa);
+    try testing.expect(std.mem.indexOf(u8, body.items, nostr.signer_ipc.reason_awaiting_approval) != null);
+    try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);
 }
 
 test "an answer given once is not asked again, and frees its slot" {
