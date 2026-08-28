@@ -976,7 +976,13 @@ fn spawnDaemon(model: *Model, fx: *Effects) void {
         // Port ZERO. There is no shared address any more, so there is nothing
         // for anything else to be sitting on, and the daemon says on stdout
         // where it landed.
-        .argv = &.{ model.daemonBin(), "--approval-http", "127.0.0.1:0" },
+        // `--serve-relays`: this is the STANDALONE Notary, so its daemon is a
+        // bunker on real relays, where a client proves who it is with its own
+        // keypair. An app that embeds Notary starts the same binary WITHOUT
+        // this flag and gets a keyholder that serves only that app, on no relay
+        // at all. Being both at once is a keyholder with a public door, which
+        // is the shape nobody has made safe on the desktop.
+        .argv = &.{ model.daemonBin(), "--approval-http", "127.0.0.1:0", "--serve-relays" },
         // The secret, down a pipe only this process and its child hold.
         //
         // Measured, and this is the whole design: another program running as

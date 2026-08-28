@@ -812,3 +812,22 @@ test "the app asks for no file access at all" {
         }
     }
 }
+
+test "the standalone window asks for a bunker, an embedded one does not" {
+    // The one flag that separates the two things this daemon can be. Notary's
+    // own window is the standalone case: its daemon is a bunker on real relays,
+    // where a client proves who it is with its own keypair.
+    //
+    // An app that embeds Notary starts the same binary without the flag and
+    // gets a keyholder that serves only that app, down a pipe, on no relay.
+    // Serving both at once is a keyholder with a public door, which is the
+    // shape nobody has made safe on the desktop.
+    const src = @embedFile("main.zig");
+    const spawn_at = std.mem.indexOf(u8, src, ".argv = &.{ model.daemonBin()").?;
+    const line_end = std.mem.indexOfScalarPos(u8, src, spawn_at, '\n').?;
+    const argv = src[spawn_at..line_end];
+    try testing.expect(std.mem.indexOf(u8, argv, "--serve-relays") != null);
+    // And a kernel-chosen port, because a well-known one is something else can
+    // be sitting on first.
+    try testing.expect(std.mem.indexOf(u8, argv, "127.0.0.1:0") != null);
+}
