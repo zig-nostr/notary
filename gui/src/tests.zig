@@ -766,13 +766,36 @@ test "the terminal path is offered beside the paste field, not instead of it" {
             .copy_command => {},
             else => return error.WrongMessage,
         }
-        // The command names the INSTALLED binary. A path derived from argv[0]
-        // would be right in development and wrong for everybody else.
+        // With no signer beside this binary there is nothing better to name, so
+        // it names the installed app. A path derived from a build cache would
+        // be right in development and useless to everybody else.
         _ = try expectByText(tree.root, .text, "/Applications/Notary.app/Contents/MacOS/signer import");
         // And it says to reopen, because the import writes the key for the next
         // launch rather than handing it to a daemon it cannot reach.
         _ = try expectByText(tree.root, .text, "Run it, then reopen Notary to pick the key up.");
     }
+}
+
+test "the terminal card names the signer this window actually ships with" {
+    // This window ships inside Plaza too. Started from there, the signer beside
+    // it is Plaza's, and naming Notary's sent a reader to a path that is not on
+    // their Mac at all unless they installed Notary separately. Reported from a
+    // real install of Plaza v0.13.1.
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var model = main.initialModel();
+    model.phase = .needs_setup;
+    model.import_mode = true;
+    model.setDaemonBin("/Applications/Plaza.app/Contents/MacOS/signer");
+
+    const tree = try buildTree(arena, &model);
+    _ = try expectByText(tree.root, .text, "/Applications/Plaza.app/Contents/MacOS/signer import");
+
+    // And the button copies what the card shows. They read from one place, so
+    // they cannot offer different commands.
+    try testing.expectEqualStrings("/Applications/Plaza.app/Contents/MacOS/signer import", model.importCommand());
 }
 
 test "one status line, and it says the phase before there is a queue to count" {
