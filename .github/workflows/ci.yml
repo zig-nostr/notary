@@ -40,6 +40,33 @@ jobs:
       - name: Check formatting
         run: zig fmt --check .
 
+  # The release page's notes are a hand-written file, and v0.10.0 shipped with
+  # v0.9.2's text in it: the release commit bumped the versions and the
+  # changelog and forgot this one, and nothing anywhere noticed. Whoever reads
+  # that page is told about a release that is not the one they are downloading.
+  #
+  # So the version has to appear in the notes. It is one grep, it runs on every
+  # push, and it fails the moment a bump and its notes disagree.
+  release-notes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The release notes name the version being released
+        run: |
+          version="$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' gui/app.zon | head -1)"
+          [ -n "$version" ] || { echo "could not read the version from gui/app.zon"; exit 1; }
+          if ! grep -qF "What's new in v$version" .github/RELEASE_NOTES.md; then
+            echo "gui/app.zon says $version, but .github/RELEASE_NOTES.md does not say"
+            echo "\"What's new in v$version\". The release page takes its text from that"
+            echo "file, so publishing now would describe a different release."
+            echo
+            echo "It currently says:"
+            grep -n "What's new in" .github/RELEASE_NOTES.md || echo "  (nothing)"
+            exit 1
+          fi
+          echo "release notes are for v$version"
+
   # The GUI (Native SDK): macOS only, via the native CLI.
   gui:
     runs-on: macos-latest
