@@ -1010,7 +1010,13 @@ fn localAllowed(
         // that was never asked.
         .no_room => {
             note(self, io, .{ .what = what, .outcome = "no room", .who = name, .local = true, .method = method.name(), .kind = kind });
-            try respondIpcError(self, w, 503, ipc.reason_refused);
+            // NOT `reason_refused`: that one means a person said no and the
+            // client should stop. A full queue is nobody's decision and it
+            // clears on its own, so this says so in a message the contract
+            // does not spell, which a client reads as "some other failure"
+            // and a 503 tells it to try later. A fourth reason constant would
+            // say it better and is a change to the shared library.
+            try respondIpcError(self, w, 503, "the approval queue is full");
             return false;
         },
     }
