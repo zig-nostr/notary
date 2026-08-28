@@ -909,6 +909,21 @@ fn respondIpcError(self: *Server, w: *std.Io.Writer, status: u16, message: []con
 /// Whether the app named `name` may do this, and if nobody has ever said, the
 /// question that asks them.
 ///
+/// WHAT THIS IS NOT, stated here because the rest of this file reads like it is
+/// more: it is not a defence against a hostile program running as this user.
+/// Such a program can read the bearer token, and the token is all `/decision`
+/// asks for, so it can answer its own question without a person ever seeing it.
+/// Nothing in a file can separate this daemon's window from anything else the
+/// same user runs, which is the whole reason a same-uid attacker was named as
+/// out of scope from the start.
+///
+/// What it IS: separate answers for separate apps that are behaving. That is
+/// worth having on its own, because "the messenger may read my messages, my
+/// feed reader may not" cannot even be SAID otherwise, and because a person who
+/// is asked can say no. Every one of these decisions is written to the audit
+/// log, so an app that answers for itself leaves the record of having done so,
+/// which is the most this layer can honestly offer.
+///
 /// Returns false having ALREADY answered the request. The three refusals are
 /// spelled apart because a client has to do three different things with them:
 /// name yourself, wait and ask again, or stop.
