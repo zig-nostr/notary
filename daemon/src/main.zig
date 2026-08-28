@@ -29,8 +29,7 @@ const hex = nostr.hex;
 
 // Turnkey defaults for GUI mode, so a freshly downloaded app works with zero
 // configuration; each is overridable via its environment variable. The key and
-// token files sit under $HOME; relays default to a public relay.
-const default_token_file = ".zig-nostr-signer.token";
+// files sit under $HOME; relays default to a public relay.
 const default_log_file = audit.default_file;
 
 /// How long the daemon stays up with nothing using it.
@@ -157,22 +156,14 @@ pub fn main(init: std.process.Init) !void {
     // `SIGNER_APPROVAL_HTTP`. Parse argv here so the slice lives for the process
     // (GUI/relay mode never returns).
     var approval_addr = getEnv("SIGNER_APPROVAL_HTTP");
-    // `--detach` for the same reason as the address: an app started from
-    // Finder has no environment worth inheriting, so anything the window needs
-    // to say to the daemon has to be said in argv.
-    var detach = envIsOn("SIGNER_DETACH");
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // argv[0]
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--approval-http")) {
-            approval_addr = args.next();
-        } else if (std.mem.eql(u8, arg, "--detach")) {
-            detach = true;
-        }
+        if (std.mem.eql(u8, arg, "--approval-http")) approval_addr = args.next();
     }
 
     if (approval_addr) |addr| {
-        runGuiMode(gpa, addr, conn_secret, &policy_config, detach);
+        runGuiMode(gpa, addr, conn_secret, &policy_config);
     }
 
     // Headless mode: the key must already be available (from an encrypted key
@@ -195,12 +186,11 @@ pub fn main(init: std.process.Init) !void {
 /// first-run key onboarding over it, then serve with the resulting key. The
 /// broker and server live in this frame, which never returns (it tail-calls the
 /// forever-serving `runRelays`), so their addresses are stable for the process.
-fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig, detach: bool) noreturn {
+fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig) noreturn {
     const hp = parseHostPort(addr) orelse
-        fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:8787");
+        fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:0");
 
     // Turnkey defaults so a fresh download needs no configuration.
-    const token_path = getEnv("SIGNER_APPROVAL_TOKEN_FILE") orelse resolveHome(gpa, default_token_file);
     const key_file = getEnv("SIGNER_KEY_FILE") orelse resolveHome(gpa, default_key_file);
     const relays_env = getEnv("SIGNER_RELAYS") orelse default_gui_relays;
 
@@ -232,6 +222,13 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         fail("out of memory tracking relay status");
     for (relay_status) |*s| s.* = std.atomic.Value(u8).init(@intFromEnum(approval_http.RelayStatus.connecting));
 
+    // The one thing that lets anybody in, read before a single thread exists.
+    // A parent that sends nothing gets a daemon with no local channel at all,
+    // which is the right failure: better to serve nobody than everybody.
+    const secret = readSecretFromStdin(gpa, io);
+    if (secret.len == 0)
+        fail("no secret arrived on stdin; this daemon is started BY the app it signs for");
+
     // Beside the key, and readable only by this user, because it is a list of
     // everything that key has done. `SIGNER_LOG_FILE=""` turns it off for
     // somebody who would rather it did not exist.
@@ -244,11 +241,7 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .gpa = gpa,
         .broker = &broker_storage,
         .gate = &gate,
-        // Filled after the bind. Minting it here would overwrite a RUNNING
-        // daemon's token before discovering the port is already theirs, and
-        // every client holding the old one would start getting 401s from a
-        // daemon that was working perfectly.
-        .token = "",
+        .token = secret,
         .log = &g_audit,
         .idle_exit_ms = idleExitMs(),
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
@@ -265,16 +258,13 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
     // still watching. That is the whole reason the port is reported before the
     // detach rather than after: afterwards there is nobody left to tell.
     approval_server.bind(io) catch |err|
-        failFmt("could not bind the approval API on {s}: {s}", .{ addr, @errorName(err) });
+        failFmt("could not bind the local channel on {s}: {s}", .{ addr, @errorName(err) });
 
-    // The port is ours, so the credential for it is ours to mint. Not one line
-    // earlier: the address is fixed and well known, so losing the race to it is
-    // the ordinary way a second daemon starts, and a loser that had already
-    // rewritten the shared token file would take every client down with it.
-    approval_server.token = makeAndWriteToken(gpa, token_path);
+    // The port goes out on stdout, where only the parent is reading. Asking the
+    // kernel for a port rather than fixing one is the other half of having no
+    // public front door: an address nobody has chosen yet cannot be squatted,
+    // and there is no well-known number for anything else to try.
     announcePort(io, approval_server.bound_port.load(.acquire));
-
-    if (detach) detachFromSpawner();
 
     const server_thread = std.Thread.spawn(.{}, runApprovalServer, .{&approval_server}) catch
         fail("could not start the approval server");
@@ -286,15 +276,15 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .uninitialized => "Waiting for the GUI to set up the key…",
     };
     std.debug.print(
-        \\zig-nostr signer (GUI mode)
-        \\  approval API : http://{s}  (bearer token → {s})
+        \\zig-nostr signer (embedded)
+        \\  serving      : the process that started me, on 127.0.0.1:{d}
         \\  key file     : {s}
         \\  key state    : {s}
         \\  audit log    : {s}
         \\
         \\{s}
         \\
-    , .{ addr, token_path, key_file, @tagName(booted), if (g_audit.path.len == 0) "(off)" else g_audit.path, key_note });
+    , .{ approval_server.bound_port.load(.acquire), key_file, @tagName(booted), if (g_audit.path.len == 0) "(off)" else g_audit.path, key_note });
 
     // Block until the GUI creates or unlocks the key (returns at once if a
     // preconfigured key was loaded above), then serve with it. The broker is
@@ -771,23 +761,35 @@ fn parseHostPort(s: []const u8) ?HostPort {
     return .{ .host = host, .port = port };
 }
 
-/// Generates a fresh random bearer token, writes it to `path` as a `0600` file
-/// (overwriting a stale one), and returns the hex token (owned, process-lived).
-fn makeAndWriteToken(gpa: std.mem.Allocator, path: []const u8) []u8 {
-    var startup = std.Io.Threaded.init(gpa, .{});
-    defer startup.deinit();
-    const io = startup.io();
-
-    var raw: [24]u8 = undefined;
-    io.randomSecure(&raw) catch |err| failFmt("could not generate an API token: {s}", .{@errorName(err)});
-    const token_hex = hex.encode(gpa, &raw) catch fail("out of memory generating the API token");
-
-    std.Io.Dir.cwd().writeFile(io, .{
-        .sub_path = path,
-        .data = token_hex,
-        .flags = .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
-    }) catch |err| failFmt("could not write the token file '{s}': {s}", .{ path, @errorName(err) });
-    return token_hex;
+/// The one-time secret this daemon's parent handed it on stdin.
+///
+/// It replaces a bearer token in a 0600 file, and the reason is measured rather
+/// than assumed. What another program running as the same user can see about a
+/// process: its argv (`ps` prints it), its environment (`ps -Eww` prints it),
+/// and any file it can read. A 0600 file separates USERS, not apps, so every
+/// app you run could read the old token and sign as you.
+///
+/// A pipe from a parent is the one channel with none of those properties. It
+/// has no name, no path, and no port: there is nothing for another process to
+/// open. Possession of the channel IS the authentication, so this daemon does
+/// not have to answer "which app is this", which is a question nobody has
+/// solved on the desktop.
+///
+/// Read before anything else and before any thread exists. A parent that sends
+/// nothing gets a daemon with no local channel at all, which is the correct
+/// failure: better to serve nobody than to serve everybody.
+fn readSecretFromStdin(gpa: std.mem.Allocator, io: std.Io) []const u8 {
+    var buf: [256]u8 = undefined;
+    var r = std.Io.File.stdin().reader(io, &buf);
+    const line = r.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        // The parent closed the pipe having written the whole secret and no
+        // newline. Everything read so far is the secret.
+        error.EndOfStream => r.interface.buffered(),
+        else => return "",
+    };
+    const trimmed = std.mem.trim(u8, line, " \t\r\n");
+    if (trimmed.len < 16) return ""; // too short to be a secret anybody minted
+    return gpa.dupe(u8, trimmed) catch "";
 }
 
 /// The one line the spawner reads: the port this daemon is listening on.
@@ -807,70 +809,15 @@ fn announcePort(io: std.Io, port: u16) void {
     stdout.interface.flush() catch {};
 }
 
-/// Leaves the process group of whoever started this daemon, when asked to.
-///
-/// A keyholder that several apps share cannot be one app's child. The Native
-/// SDK group-kills the children it spawns when the app quits, which is right
-/// for a private helper and catastrophic for a shared one: close the window
-/// that happened to start the daemon and every OTHER app loses its signer
-/// mid-sentence, with no error anywhere, because from their side the socket
-/// simply stops answering.
-///
-/// A plain `setsid` does not get out of the way. The group kill falls back to
-/// signalling the child's own pid, and after `setsid` that pid is exactly what
-/// the new group is named after, so it is hit either way. Escaping takes a
-/// DESCENDANT: this process forks, the parent exits at once so the spawner
-/// sees a clean exit, and the child takes a new session whose id is its own
-/// pid, which nothing the spawner knows about can name.
-///
-/// Then the three inherited standard descriptors go to /dev/null. Not tidiness:
-/// a detached child holding the spawner's stdout write end open means the
-/// spawner's reader never sees EOF and its worker is abandoned rather than
-/// finishing. Nothing is lost by closing them, because a process that has just
-/// left its terminal has no reader.
-///
-/// The listening socket is untouched and survives the fork, which is the whole
-/// reason binding happens first.
-/// Whether an environment variable is set to something meaning yes.
-///
-/// Present-but-empty and "0" mean no, so a launcher that exports the name
-/// unconditionally does not turn a behaviour on by accident.
-fn envIsOn(name: [*:0]const u8) bool {
-    const v = getEnv(name) orelse return false;
-    return v.len != 0 and !std.mem.eql(u8, v, "0");
-}
-
-fn detachFromSpawner() void {
-    const pid = std.c.fork();
-    if (pid < 0) {
-        // Could not fork: keep serving as a child rather than not at all. The
-        // shared-daemon hazard is back, and saying so is better than exiting
-        // and leaving the reader with no signer whatsoever.
-        std.debug.print("signer: could not detach; this daemon will end when the app that started it does\n", .{});
-        return;
-    }
-    if (pid > 0) std.c._exit(0); // the spawner's child, done the moment it has forked
-
-    _ = std.c.setsid();
-
-    const devnull = std.c.open("/dev/null", .{ .ACCMODE = .RDWR });
-    if (devnull >= 0) {
-        _ = std.c.dup2(devnull, 0);
-        _ = std.c.dup2(devnull, 1);
-        _ = std.c.dup2(devnull, 2);
-        if (devnull > 2) _ = std.c.close(devnull);
-    }
-}
-
 /// Runs the approval HTTP server on its own thread with its own io.
 ///
 /// A listener that cannot come up KILLS the daemon. It used to print and let
 /// the thread die, and the consequence was not a missing feature: the daemon
 /// went on running with no listener, blocked forever waiting to be unlocked,
 /// while whatever was already holding that port answered the GUI instead. The
-/// GUI has no way to tell the difference, so it would read the token file, find
-/// something answering, and post the unlock passphrase, or an imported nsec,
-/// straight to it. Dying loudly is what turns that into a startup failure the
+/// parent has no way to tell the difference, so it would find something
+/// answering and post the unlock passphrase, or an imported nsec, straight to
+/// it. Dying loudly is what turns that into a startup failure the
 /// GUI's supervision already knows how to show.
 fn runApprovalServer(server: *approval_http.Server) void {
     var threaded = std.Io.Threaded.init(server.gpa, .{});

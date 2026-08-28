@@ -23,7 +23,7 @@
 //!
 //! The view lives in `app.native`; this file is the logic. All I/O is through
 //! the Native SDK effects channel (`fx.spawn` supervises the daemon, `fx.fetch`
-//! talks HTTP, `fx.readFile` reads the token, `fx.startTimer` backs off), so
+//! talks HTTP, `fx.startTimer` backs off), so
 //! `update` stays a pure state transition and the view stays declarative.
 
 const std = @import("std");
@@ -39,14 +39,12 @@ const canvas_label = "main-canvas";
 const window_width: f32 = 460;
 const window_height: f32 = 560;
 
-// `filesystem` is what lets the GUI read the daemon's bearer token. SDK 0.9.1
-// confines raw file effects to the app's own directories unless this is
-// declared, and the token lives at $HOME/.zig-nostr-signer.token, which is
-// outside every one of them. Without it `fx.readFile` is rejected SILENTLY:
-// `.token_read` arrives as `.rejected`, every non-ok outcome arms a retry,
-// the phase never advances, and the app sits at "Connecting to the signer…"
-// forever looking exactly like a network fault.
-pub const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard, native_sdk.security.permission_filesystem };
+// No `filesystem`. This window used to need it to read the daemon's bearer
+// token out of $HOME, and there is no token to read now: it mints a secret and
+// hands it to the daemon it starts, over a pipe. Dropping a permission is worth
+// a line of its own, because it is the rare change that makes an app able to do
+// strictly less.
+pub const app_permissions = [_][]const u8{ native_sdk.security.permission_command, native_sdk.security.permission_view, native_sdk.security.permission_clipboard };
 const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
@@ -71,7 +69,6 @@ const default_address = "127.0.0.1:8787";
 /// right for the app they installed rather than for wherever this binary
 /// happens to be running from during development.
 const import_command = "/Applications/Notary.app/Contents/MacOS/signer import";
-const default_token_file = ".zig-nostr-signer.token";
 
 /// What a hidden passphrase field renders instead of its characters.
 ///
@@ -120,7 +117,6 @@ fn applyMaskedEdit(buf: *canvas.TextBuffer(128), event: canvas.TextInputEvent, m
 const daemon_port_prefix = "notary-approval-port";
 
 const daemon_key: u64 = 1;
-const token_key: u64 = 2;
 const info_key: u64 = 3;
 const pending_key: u64 = 4;
 const setup_key: u64 = 5;
@@ -310,14 +306,12 @@ pub const Model = struct {
     // Resolved at boot from the environment; stable for the process.
     base_url_buf: [96]u8 = [_]u8{0} ** 96,
     base_url_len: usize = 0,
-    token_path_buf: [512]u8 = [_]u8{0} ** 512,
-    token_path_len: usize = 0,
     daemon_bin_buf: [512]u8 = [_]u8{0} ** 512,
     daemon_bin_len: usize = 0,
     /// True when `SIGNER_BIN` is set: the app spawns and supervises the daemon.
     managed: bool = false,
 
-    // Read from the token file via `fx.readFile`; the bearer header value.
+    // The bearer header value, built from the secret this window minted.
     auth_buf: [96]u8 = [_]u8{0} ** 96,
     auth_len: usize = 0,
 
@@ -414,18 +408,9 @@ pub const Model = struct {
     /// as "is one running": another app may have started the one we are talking
     /// to, and that is the ordinary case rather than a fallback.
     spawned: bool = false,
-    /// Retry ticks in a row that have not reached a daemon.
-    ///
-    /// The only evidence this window gets that a DETACHED daemon has died. It
-    /// is no longer a child, so nothing reports its exit; a socket that stops
-    /// answering is the whole signal.
-    connect_failures: u8 = 0,
-    /// Whether anything has ever answered on this address.
-    ///
-    /// Separates "there is no daemon here" from "the daemon I was talking to
-    /// went quiet for a moment". Those need opposite responses and looked
-    /// identical to a window that had not spawned anything itself.
-    ever_connected: bool = false,
+    daemon_secret_buf: [64]u8 = undefined,
+    daemon_secret_len: usize = 0,
+
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -440,14 +425,6 @@ pub const Model = struct {
     pub fn baseUrl(self: *const Model) []const u8 {
         return self.base_url_buf[0..self.base_url_len];
     }
-    pub fn setTokenPath(self: *Model, path: []const u8) void {
-        const n = @min(path.len, self.token_path_buf.len);
-        @memcpy(self.token_path_buf[0..n], path[0..n]);
-        self.token_path_len = n;
-    }
-    pub fn tokenPath(self: *const Model) []const u8 {
-        return self.token_path_buf[0..self.token_path_len];
-    }
     pub fn setDaemonBin(self: *Model, path: []const u8) void {
         const n = @min(path.len, self.daemon_bin_buf.len);
         @memcpy(self.daemon_bin_buf[0..n], path[0..n]);
@@ -456,6 +433,30 @@ pub const Model = struct {
     pub fn daemonBin(self: *const Model) []const u8 {
         return self.daemon_bin_buf[0..self.daemon_bin_len];
     }
+    /// Mints the one-time secret this window hands its daemon on stdin, and
+    /// arms the header that presents it.
+    ///
+    /// Random per spawn and never written anywhere: not to a file, not into
+    /// argv, not into the environment. Those are the three places another
+    /// program running as this user can read, and a pipe to a child is the one
+    /// place it cannot.
+    pub fn mintDaemonSecret(self: *Model) void {
+        var raw: [24]u8 = undefined;
+        // The OS CSPRNG, reached directly because this runs in a Model method
+        // that has no `io` to hand. macOS guarantees `arc4random_buf` never
+        // fails and needs no seeding.
+        std.c.arc4random_buf(&raw, raw.len);
+        const hexed = std.fmt.bufPrint(&self.daemon_secret_buf, "{x}\n", .{raw}) catch return;
+        self.daemon_secret_len = hexed.len;
+        self.setAuth(hexed[0 .. hexed.len - 1]); // the header wants it without the newline
+    }
+
+    /// The secret as it goes down the pipe, newline included so the daemon's
+    /// read has a terminator.
+    pub fn daemonSecret(self: *const Model) []const u8 {
+        return self.daemon_secret_buf[0..self.daemon_secret_len];
+    }
+
     pub fn setAuth(self: *Model, token: []const u8) void {
         if (token.len == 0) {
             self.auth_len = 0;
@@ -702,7 +703,7 @@ pub const Model = struct {
             .connecting => "Connecting to the signer…",
             .connected => "Connected",
             .disconnected => "Signer unreachable, retrying…",
-            .unauthorized => "Unauthorized: check the token file",
+            .unauthorized => "Something else is answering. Not connecting.",
             .daemon_exited => "Signer stopped",
             .needs_setup => "First-run setup",
             .needs_unlock => "Locked",
@@ -717,7 +718,7 @@ pub const Model = struct {
             .starting => "Starting the signer…",
             .connecting => "Connecting to the signer…",
             .disconnected => "Signer unreachable, retrying…",
-            .unauthorized => "Unauthorized: check the token file",
+            .unauthorized => "Something else is answering. Not connecting.",
             .daemon_exited, .needs_setup, .needs_unlock => "",
         };
     }
@@ -875,7 +876,6 @@ pub const Model = struct {
 pub const Msg = union(enum) {
     daemon_line: native_sdk.EffectLine,
     daemon_exited: native_sdk.EffectExit,
-    token_read: native_sdk.EffectFileResult,
     info: native_sdk.EffectResponse,
     pending: native_sdk.EffectResponse,
     decided: native_sdk.EffectResponse,
@@ -948,89 +948,19 @@ pub const app_markup = @embedFile("app.native");
 const NotaryApp = native_sdk.UiApp(Model, Msg);
 const Effects = NotaryApp.Effects;
 
-/// What we ask the daemon to bind in managed mode.
+/// Whether this window should start a daemon.
 ///
-/// The WELL KNOWN address now, not `127.0.0.1:0`. A kernel-chosen port and a
-/// stdout line is a rendezvous only the spawner can use, and it was the right
-/// shape while this window was the daemon's only client. It is the wrong shape
-/// for a daemon meant to be shared: another app that wants the same key did not
-/// spawn it, has no stdout to read, and has to be able to find one that is
-/// already running.
-///
-/// The NUMBER is the rendezvous, not a file naming the number. A port file is
-/// the obvious alternative and it is the dangerous one: it sits on disk
-/// writable by this same user, so anything running as them could point it at a
-/// listener of its own and every client would go there instead, while the real
-/// daemon sat healthy and idle, never knowing. There is nothing here to
-/// rewrite.
-///
-/// The bind stays EXCLUSIVE (`approval_http.Server.run`). Something that takes
-/// this port first does not get to answer for the daemon quietly: the bind
-/// fails and the daemon says so.
-const managed_bind_address = "127.0.0.1:8787";
-
-/// Whether this window may start a daemon of its own, on a retry tick.
-///
-/// Split out because it is the rule the shared daemon turns on, and a rule
-/// worth being able to state without an event loop around it. Three ways to
-/// answer no, and each is a different mistake avoided:
-///
-///   - not managed: this window was pointed at somebody else's daemon on
-///     purpose, and starting a competing one is not ours to do;
-///   - already spawned: a second would race the first onto a port the first
-///     holds exclusively, and the loser exits while this window waits for it;
-///   - connected: something is already serving, which is the ordinary case now
-///     rather than a fallback. Another app may have started it, or the reader
-///     may have opened Notary before Plaza.
-fn shouldStartDaemon(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
-    if (!managed) return false;
-    if (phase == .connected) return false;
-    // Nothing has ever answered here and this window has started nothing: its
-    // turn, once an attempt has actually come back empty.
-    if (!spawned and !ever_connected) return failures >= 1;
-    // Otherwise something WAS there: either this window started it, or it
-    // attached to a daemon somebody else did. Either way its death is not
-    // reported here, because a detached daemon is nobody's child, so a run of
-    // ticks that reached nothing is the only evidence there is.
-    //
-    // Waiting for the run matters most in the ATTACHED case. A single dropped
-    // poll against a perfectly healthy daemon would otherwise start a second
-    // one, which loses the race for a port the first holds exclusively and
-    // exits, for no reason the reader could see.
-    return failures >= respawn_after_failures;
+/// Only in managed mode, and only once. There is nothing to look for first any
+/// more: the daemon has no shared address and no shared credential, so it is
+/// not something another app could already be running and it is not something
+/// this window could attach to. It is this window's child or it does not exist.
+fn shouldStartDaemon(managed: bool, spawned: bool, phase: Phase) bool {
+    if (!managed or spawned) return false;
+    return phase != .connected;
 }
 
-/// How many silent retry ticks amount to "there is no daemon there".
-///
-/// Three, against a retry that backs off, so a daemon still starting is not
-/// competed with. The cost of guessing wrong is small in one direction only:
-/// the bind is exclusive, so a redundant daemon exits at once instead of
-/// quietly taking over the address.
-const respawn_after_failures: u8 = 3;
-
-pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
-    return shouldStartDaemon(managed, spawned, ever_connected, failures, phase);
-}
-
-/// Whether this exit is a daemon that detached, rather than one that failed.
-///
-/// A detaching daemon forks and its first process exits 0 immediately, so this
-/// arrives seconds after every successful start and means the opposite of what
-/// it looks like: the daemon is up, it is simply no longer this window's child.
-///
-/// A clean exit is therefore not news. Anything else is: the daemon binds its
-/// port BEFORE it forks, precisely so a port it could not get still fails here,
-/// while somebody is watching, instead of vanishing into a process nobody is
-/// attached to.
-///
-/// Liveness after this point is the HTTP connection, which is the honest
-/// measure anyway. The process being alive never meant it was answering.
-fn daemonDetached(exit: native_sdk.EffectExit) bool {
-    return exit.reason == .exited and exit.code == 0;
-}
-
-pub fn daemonDetachedForTest(reason: native_sdk.EffectExitReason, code: i32) bool {
-    return daemonDetached(.{ .key = 0, .reason = reason, .code = code });
+pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, phase: Phase) bool {
+    return shouldStartDaemon(managed, spawned, phase);
 }
 
 fn spawnDaemon(model: *Model, fx: *Effects) void {
@@ -1040,44 +970,42 @@ fn spawnDaemon(model: *Model, fx: *Effects) void {
     // loser exits while this window waits for it. It gates only the AUTOMATIC
     // spawn; Restart and the sign-out paths call this directly and are meant to.
     model.spawned = true;
+    model.mintDaemonSecret();
     fx.spawn(.{
         .key = daemon_key,
-        // `--detach` is what makes this a shared service rather than this
-        // window's child. The SDK group-kills what it spawns when the app
-        // quits, which is right for a private helper and wrong here: close
-        // this window and every other app using the key would lose its signer
-        // mid-sentence, with nothing to see but a socket that stopped
-        // answering. The daemon forks itself out of reach instead, and ends
-        // itself when nobody has asked it for anything in a while.
-        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address, "--detach" },
+        // Port ZERO. There is no shared address any more, so there is nothing
+        // for anything else to be sitting on, and the daemon says on stdout
+        // where it landed.
+        .argv = &.{ model.daemonBin(), "--approval-http", "127.0.0.1:0" },
+        // The secret, down a pipe only this process and its child hold.
+        //
+        // Measured, and this is the whole design: another program running as
+        // this user can read a process's argv (`ps` prints it) and its
+        // environment (`ps -Eww` prints it), and could read a token file
+        // (0600 separates users, not apps). It cannot read this. There is no
+        // name and no path, so there is nothing to open.
+        //
+        // Possession of the channel IS the authentication, which is why the
+        // daemon no longer has to answer "which app is this" — a question
+        // nobody has solved on the desktop.
+        .stdin = model.daemonSecret(),
         .on_line = Effects.lineMsg(.daemon_line),
         .on_exit = Effects.exitMsg(.daemon_exited),
     });
 }
 
-/// Counts an attempt that reached nothing, and forgets the run once one lands.
-fn noteConnectFailure(model: *Model) void {
-    if (model.connect_failures < 255) model.connect_failures += 1;
-}
-
-/// One connection attempt: (re-)read the token file, then poll. Re-reading on
-/// every attempt means a freshly (re)started daemon's new token is always
-/// picked up, healing both the initial startup race and a restart.
+/// One connection attempt.
+///
+/// There is no token file to read any more: this window MINTED the secret and
+/// handed it to the daemon it started, so it has always had it. What used to be
+/// a file read, a retry, and a whole `.unauthorized` phase for a token that had
+/// gone stale is now nothing at all.
 fn attemptConnect(model: *Model, fx: *Effects) void {
     // Nothing to connect to until the daemon says where it landed. Staying in
     // `.starting` is the honest state, and it is what the retry tick already
     // knows how to leave.
     if (!model.port_known) return;
-    if (model.tokenPath().len == 0) {
-        // No token file configured at all: nothing to authenticate with.
-        model.phase = .unauthorized;
-        return;
-    }
-    fx.readFile(.{
-        .key = token_key,
-        .path = model.tokenPath(),
-        .on_result = Effects.fileMsg(.token_read),
-    });
+    fetchInfo(model, fx);
 }
 
 fn fetchInfo(model: *Model, fx: *Effects) void {
@@ -1305,18 +1233,13 @@ fn onUnauthorized(model: *Model, fx: *Effects) void {
 
 /// Boot command: in managed mode spawn the daemon; either way begin connecting.
 pub fn boot(model: *Model, fx: *Effects) void {
-    // Look before starting one. The daemon is shared now: it outlives the
-    // window that spawned it (only `/lock` ends it), another app on this
-    // machine may have started it, and the reader may have opened that app
-    // first. Spawning unconditionally would put a second daemon on a port the
-    // first one holds exclusively, and the loser would exit while this window
-    // waited for it.
-    //
-    // So connect first and let the retry path start one only if nothing
-    // answers. Attaching to a daemon somebody else started is the normal case,
-    // not a fallback: the alternative is signing the reader out of whatever was
-    // already using it.
+    // Start it. There is nothing to look for first: the daemon has no shared
+    // address and no credential on disk, so it is not something another app
+    // could already be running and not something this window could attach to.
+    // It is this window's child.
     model.phase = .connecting;
+    if (shouldStartDaemon(model.managed, model.spawned, model.phase))
+        spawnDaemon(model, fx);
     attemptConnect(model, fx);
     // Keep the live relay status fresh while serving (the initial /info is a
     // one-shot; the pending poll doesn't carry relay state).
@@ -1357,7 +1280,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // code says something actually went wrong, and the daemon is
             // careful to bind before it forks so a bad port still lands here
             // where somebody can be told about it.
-            if (daemonDetached(exit)) return;
             model.phase = .daemon_exited;
             model.setExitNote(exit);
             model.setAuth("");
@@ -1367,23 +1289,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clearSecrets(); // don't keep a passphrase around a dead daemon
             model.clearOnboardError();
             model.submitting = false;
-        },
-
-        .token_read => |r| switch (r.outcome) {
-            .ok => {
-                const token = std.mem.trim(u8, r.bytes, " \t\r\n");
-                if (token.len > 0) {
-                    model.setAuth(token);
-                    // Learn the key state from /info before doing anything else;
-                    // it decides between onboarding and the approvals queue.
-                    if (model.phase != .connected) model.phase = .connecting;
-                    fetchInfo(model, fx);
-                } else {
-                    armRetry(fx); // empty file, the daemon has not written it yet
-                }
-            },
-            // Not there yet (managed daemon still starting) or unreadable: retry.
-            else => armRetry(fx),
         },
 
         // /info reports the daemon's key state, which selects the screen.
@@ -1403,7 +1308,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 onUnauthorized(model, fx);
             } else {
                 // The daemon may still be coming up; try again shortly.
-                noteConnectFailure(model);
                 armRetry(fx);
             }
         },
@@ -1412,15 +1316,12 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .ok => switch (r.status) {
                 200 => {
                     model.phase = .connected;
-                    model.connect_failures = 0; // something answered
-                    model.ever_connected = true;
                     parsePending(model, r.body);
                     pollPending(model, fx); // re-arm the long-poll chain
                 },
                 401 => onUnauthorized(model, fx),
                 else => {
                     model.phase = .disconnected;
-                    noteConnectFailure(model);
                     armRetry(fx);
                 },
             },
@@ -1429,7 +1330,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .rejected => armRetry(fx),
             else => {
                 if (model.phase == .connected) model.phase = .disconnected;
-                noteConnectFailure(model);
                 armRetry(fx);
             },
         },
@@ -1444,10 +1344,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // to attach to and this window may start one. Only in managed mode,
             // and only once: attached mode was pointed at somebody else's
             // daemon on purpose, and a second spawn would race the first.
-            if (shouldStartDaemon(model.managed, model.spawned, model.ever_connected, model.connect_failures, model.phase)) {
-                model.connect_failures = 0; // this attempt gets its own run
+            if (shouldStartDaemon(model.managed, model.spawned, model.phase))
                 spawnDaemon(model, fx);
-            }
             // A full reconnect attempt: re-read the token, then poll.
             attemptConnect(model, fx);
         },
@@ -1845,22 +1743,11 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
         model.managed = true;
     }
     // The address is known in BOTH modes now. Attached mode talks to whatever
-    // the operator pointed us at; managed mode used to wait to be told, because
-    // the daemon was given a kernel-chosen port and printed it back. A
-    // well-known port removes that wait, and removing it is what lets this
-    // window look for a daemon that is ALREADY running before starting one of
-    // its own.
-    model.port_known = true;
-    if (model.managed) model.setBaseUrl(managed_bind_address);
-
-    if (environ.get("SIGNER_APPROVAL_TOKEN_FILE")) |path| {
-        model.setTokenPath(path);
-    } else if (environ.get("HOME")) |home| {
-        var buf: [512]u8 = undefined;
-        if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, default_token_file })) |path| {
-            model.setTokenPath(path);
-        } else |_| {}
-    }
+    // the operator pointed us at. In managed mode there is nothing to know
+    // yet: the daemon takes a kernel-chosen port and prints it back, which is
+    // what removes the well-known address anything else could have been
+    // sitting on.
+    model.port_known = !model.managed;
 }
 
 pub fn main(init: std.process.Init) !void {

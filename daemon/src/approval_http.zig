@@ -362,11 +362,9 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     const path = parts.next() orelse return respond(w, 400, bad_request);
 
     var auth: []const u8 = "";
-    var client_name: []const u8 = "";
     var content_length: usize = 0;
     while (lines.next()) |line| {
         if (headerValue(line, "authorization")) |v| auth = v;
-        if (headerValue(line, ipc.header_client)) |v| client_name = v;
         if (headerValue(line, "content-length")) |v|
             content_length = std.fmt.parseInt(usize, v, 10) catch 0;
     }
@@ -444,11 +442,11 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     if (eql(method, "GET") and eql(path, ipc.path_pubkey))
         return handleSignerPubkey(self, w);
     if (eql(method, "POST") and eql(path, ipc.path_sign))
-        return handleSignerSign(self, io, w, body, client_name);
+        return handleSignerSign(self, io, w, body);
     if (eql(method, "POST") and eql(path, ipc.path_nip44_encrypt))
-        return handleSignerCipher(self, io, w, body, client_name, .encrypt);
+        return handleSignerCipher(self, io, w, body, .encrypt);
     if (eql(method, "POST") and eql(path, ipc.path_nip44_decrypt))
-        return handleSignerCipher(self, io, w, body, client_name, .decrypt);
+        return handleSignerCipher(self, io, w, body, .decrypt);
     return respond(w, 404, "{\"error\":\"not found\"}");
 }
 
@@ -883,6 +881,24 @@ fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
 /// client that believes it offers to make one over the top of an identity that
 /// already exists. A nostr key cannot be replaced, so that is the one mistake
 /// worth designing the vocabulary around.
+/// The 32 bytes the one local client's answers are filed under.
+///
+/// A constant, because there IS one local client: the process that started this
+/// daemon and holds the only channel to it. There is nothing to distinguish, so
+/// nothing to name. The header a client used to introduce itself with is gone
+/// with the shared front door that made it necessary.
+///
+/// Domain-separated so it can never collide with a real 32-byte pubkey, which
+/// is what the relay side of this same store keys on.
+/// A literal rather than a hash, because a comptime hash is a comptime loop and
+/// this only has to be a constant nothing else can be.
+const local_client: [32]u8 = [_]u8{
+    0x6c, 0x6f, 0x63, 0x61, 0x6c, 0x2d, 0x63, 0x6c,
+    0x69, 0x65, 0x6e, 0x74, 0x2f, 0x74, 0x68, 0x65,
+    0x2d, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+};
+
 fn signerState(gate: *const Gate) []const u8 {
     return switch (gate.current()) {
         .uninitialized => ipc.state_uninitialized,
@@ -906,23 +922,18 @@ fn respondIpcError(self: *Server, w: *std.Io.Writer, status: u16, message: []con
     return respond(w, status, j);
 }
 
-/// Whether the app named `name` may do this, and if nobody has ever said, the
-/// question that asks them.
+/// Whether the app that started this daemon may do this, and if nobody has
+/// ever said, the question that asks them.
 ///
-/// WHAT THIS IS NOT, stated here because the rest of this file reads like it is
-/// more: it is not a defence against a hostile program running as this user.
-/// Such a program can read the bearer token, and the token is all `/decision`
-/// asks for, so it can answer its own question without a person ever seeing it.
-/// Nothing in a file can separate this daemon's window from anything else the
-/// same user runs, which is the whole reason a same-uid attacker was named as
-/// out of scope from the start.
+/// There is exactly ONE local client: the process that started this daemon and
+/// handed it the secret on stdin. Nothing else can reach the channel, because
+/// it has no name, no path and no well-known port. So this is not asking "which
+/// app is this", a question nobody has solved on the desktop. It is asking what
+/// the person has already allowed the one app there is to do.
 ///
-/// What it IS: separate answers for separate apps that are behaving. That is
-/// worth having on its own, because "the messenger may read my messages, my
-/// feed reader may not" cannot even be SAID otherwise, and because a person who
-/// is asked can say no. Every one of these decisions is written to the audit
-/// log, so an app that answers for itself leaves the record of having done so,
-/// which is the most this layer can honestly offer.
+/// That is why the answers are still per method and per event kind. Signing a
+/// note and signing a contact list are different risks even when only one app
+/// can ask.
 ///
 /// Returns false having ALREADY answered the request. The three refusals are
 /// spelled apart because a client has to do three different things with them:
@@ -939,38 +950,27 @@ fn localAllowed(
     self: *Server,
     io: std.Io,
     w: *std.Io.Writer,
-    name: []const u8,
     method: nip46.Method,
     kind: i32,
     preview: []const u8,
     comptime what: []const u8,
 ) !bool {
-    // An app that will not say what it is gets nothing. There is no shared
-    // "some local app" permission to fall back on, deliberately: that is the
-    // single client this whole mechanism exists to break up.
-    if (!ipc.clientNameOk(name)) {
-        note(self, io, .{ .what = what, .outcome = "unnamed", .method = method.name(), .kind = kind });
-        try respondIpcError(self, w, 400, ipc.reason_unnamed);
-        return false;
-    }
-
-    const id = ipc.clientId(name);
     const now_ms = std.Io.Timestamp.now(io, .real).toMilliseconds();
 
     // An answer given ONCE, to the question this request already raised. Taking
     // it spends it, which is the whole of what "once" means. Checked before
     // what was remembered, because a request only reached the queue at all
     // when nothing was remembered for it.
-    if (self.broker.takeOneShot(id, method, kind, now_ms)) |allowed| {
+    if (self.broker.takeOneShot(local_client, method, kind, now_ms)) |allowed| {
         if (allowed) return true;
-        note(self, io, .{ .what = what, .outcome = "refused", .who = name, .local = true, .method = method.name(), .kind = kind });
+        note(self, io, .{ .what = what, .outcome = "refused", .local = true, .method = method.name(), .kind = kind });
         try respondIpcError(self, w, 403, ipc.reason_refused);
         return false;
     }
 
-    if (self.broker.permissions.remembered(id, method, kind, now_ms)) |allowed| {
+    if (self.broker.permissions.remembered(local_client, method, kind, now_ms)) |allowed| {
         if (allowed) return true;
-        note(self, io, .{ .what = what, .outcome = "refused", .who = name, .local = true, .method = method.name(), .kind = kind });
+        note(self, io, .{ .what = what, .outcome = "refused", .local = true, .method = method.name(), .kind = kind });
         try respondIpcError(self, w, 403, ipc.reason_refused);
         return false;
     }
@@ -978,7 +978,7 @@ fn localAllowed(
     var info = Pending{
         .kind = kind,
         .created_at = std.Io.Timestamp.now(io, .real).toSeconds(),
-        .client_id = id,
+        .client_id = local_client,
         .method_id = method,
         .local = true,
     };
@@ -986,36 +986,24 @@ fn localAllowed(
     const mlen = @min(mname.len, info.method_buf.len);
     @memcpy(info.method_buf[0..mlen], mname[0..mlen]);
     info.method_len = @intCast(mlen);
-    // The name as the app wrote it. `clientNameOk` bounds it, and the bound
-    // lives in the other repo, so this pins the two together rather than
-    // trusting them to be widened in step.
-    comptime {
-        const cap = @typeInfo(@FieldType(Pending, "client_buf")).array.len;
-        std.debug.assert(ipc.client_name_max <= cap);
-    }
-    @memcpy(info.client_buf[0..name.len], name);
-    info.client_len = @intCast(name.len);
     info.preview_len = approval.previewOf(preview, &info.preview_buf);
+
     // Only a question actually FILED is worth a line. A client that retries
     // every second is not news, and one whose every retry wrote a line could
     // roll the audit log away by asking often enough.
     switch (self.broker.knock(info)) {
-        .filed => note(self, io, .{ .what = what, .outcome = "awaiting", .who = name, .local = true, .method = method.name(), .kind = kind }),
+        .filed => note(self, io, .{ .what = what, .outcome = "awaiting", .local = true, .method = method.name(), .kind = kind }),
         .already_asked => {},
         // The queue is full, so nobody will ever see this question. Answering
         // "awaiting approval" would send the client away to wait for something
         // that was never asked.
-        // The queue is full, so nobody will ever see this question. Answering
-        // "awaiting approval" would send the client away to wait for something
-        // that was never asked.
         .no_room => {
-            note(self, io, .{ .what = what, .outcome = "no room", .who = name, .local = true, .method = method.name(), .kind = kind });
+            note(self, io, .{ .what = what, .outcome = "no room", .local = true, .method = method.name(), .kind = kind });
             // NOT `reason_refused`: that one means a person said no and the
             // client should stop. A full queue is nobody's decision and it
             // clears on its own, so this says so in a message the contract
             // does not spell, which a client reads as "some other failure"
-            // and a 503 tells it to try later. A fourth reason constant would
-            // say it better and is a change to the shared library.
+            // and a 503 tells it to try later.
             try respondIpcError(self, w, 503, "the approval queue is full");
             return false;
         },
@@ -1042,7 +1030,7 @@ fn handleSignerPubkey(self: *Server, w: *std.Io.Writer) !void {
 }
 
 /// POST /sign: sign one event with the held key, if this app may.
-fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8, client_name: []const u8) !void {
+fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
     var parsed = ipc.parse(ipc.SignEvent, self.gpa, body) catch
         return respondIpcError(self, w, 400, "malformed sign request");
     defer parsed.deinit();
@@ -1063,7 +1051,7 @@ fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const 
 
     // Locked first, then permission. Asking somebody to allow a signature the
     // daemon could not produce anyway is a question with no useful answer.
-    if (!try localAllowed(self, io, w, client_name, .sign_event, ev.kind, ev.content, "sign")) return;
+    if (!try localAllowed(self, io, w, .sign_event, ev.kind, ev.content, "sign")) return;
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -1084,7 +1072,6 @@ fn handleSignerSign(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const 
     note(self, io, .{
         .what = "sign",
         .outcome = "ok",
-        .who = client_name,
         .local = true,
         .method = "sign_event",
         .kind = ev.kind,
@@ -1106,7 +1093,6 @@ fn handleSignerCipher(
     io: std.Io,
     w: *std.Io.Writer,
     body: []const u8,
-    client_name: []const u8,
     comptime dir: enum { encrypt, decrypt },
 ) !void {
     var parsed = ipc.parse(ipc.Cipher, self.gpa, body) catch
@@ -1130,7 +1116,7 @@ fn handleSignerCipher(
         .encrypt => .nip44_encrypt,
         .decrypt => .nip44_decrypt,
     };
-    if (!try localAllowed(self, io, w, client_name, method, -1, "", "cipher")) return;
+    if (!try localAllowed(self, io, w, method, -1, "", "cipher")) return;
 
     var signer = nostr.keys.Signer.init();
     defer signer.deinit();
@@ -1154,7 +1140,6 @@ fn handleSignerCipher(
     note(self, io, .{
         .what = "cipher",
         .outcome = "ok",
-        .who = client_name,
         .local = true,
         .method = method.name(),
         .peer = req.peer,
@@ -1303,9 +1288,10 @@ test "parseSince reads the query parameter" {
 /// One `/sign` request body of the shape a client really sends: a complete
 /// event whose id, pubkey and signature are zeroed, since those are the three
 /// things it is asking the daemon to fill in.
-/// The name a test app calls itself. Any app on the machine may claim any
-/// name, which is exactly why the tests use a plain one.
-const test_client = "test-app";
+/// The one local client, for a test that wants to pre-grant something.
+fn localClientForTest() [32]u8 {
+    return local_client;
+}
 
 fn signRequest(gpa: std.mem.Allocator, kind: u16) ![]u8 {
     const unsigned = nostr.event.Event{
@@ -1397,7 +1383,7 @@ test "POST /sign signs with the held key, and refuses a locked one" {
     var broker: Broker = .{};
     // Allowed, so that the thing under test here is the signing and not the
     // permission gate, which has tests of its own.
-    broker.permissions.remember(nostr.signer_ipc.clientId(test_client), .sign_event, 1, true, .always, 0);
+    broker.permissions.remember(localClientForTest(), .sign_event, 1, true, .always, 0);
     // The shape a client actually sends: a complete event with the id, pubkey
     // and signature left zeroed, because those are what it is asking for.
     const req = try signRequest(gpa, 1);
@@ -1410,7 +1396,7 @@ test "POST /sign signs with the held key, and refuses a locked one" {
         var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
@@ -1424,7 +1410,7 @@ test "POST /sign signs with the held key, and refuses a locked one" {
         var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "409") != null);
@@ -1457,7 +1443,7 @@ test "a gift-wrap rumor is never signed, locked or not" {
 
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "422") != null);
@@ -1706,7 +1692,7 @@ test "an app nobody has answered for is refused, and asks once" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);
@@ -1717,7 +1703,9 @@ test "an app nobody has answered for is refused, and asks once" {
     var queue: [Broker.capacity]Pending = undefined;
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
     try testing.expect(queue[0].local);
-    try testing.expectEqualStrings(test_client, queue[0].client());
+    // No name on the row, because there is nothing to name: the one client is
+    // whoever started this daemon, and the window says so.
+    try testing.expectEqual(@as(usize, 0), queue[0].client().len);
     try testing.expectEqualStrings("sign_event", queue[0].method());
     try testing.expectEqual(@as(i32, 1), queue[0].kind);
     // What is being signed, not just what shape it is.
@@ -1729,7 +1717,7 @@ test "an app nobody has answered for is refused, and asks once" {
     for (0..10) |_| {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
     }
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
 }
@@ -1756,7 +1744,7 @@ test "an answer given once is not asked again, and frees its slot" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
     }
     var queue: [Broker.capacity]Pending = undefined;
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
@@ -1771,7 +1759,7 @@ test "an answer given once is not asked again, and frees its slot" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
@@ -1794,7 +1782,7 @@ test "a refused app is refused without asking again" {
     var broker: Broker = .{};
     // "No, and stop asking." A denial has to be as durable as a grant, or
     // refusing an app is just asking it to try again in a second.
-    broker.permissions.remember(nostr.signer_ipc.clientId(test_client), .sign_event, 1, false, .always, 0);
+    broker.permissions.remember(localClientForTest(), .sign_event, 1, false, .always, 0);
 
     var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
     gate.preload(kp);
@@ -1804,49 +1792,13 @@ test "a refused app is refused without asking again" {
     defer gpa.free(req);
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try handleSignerSign(&server, io, &out.writer, req, test_client);
+    try handleSignerSign(&server, io, &out.writer, req);
     var body = out.toArrayList();
     defer body.deinit(gpa);
     try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);
     // Refused for good, not queued for a person: the two say different things
     // to a client, and a refused app must not be able to raise a prompt.
     try testing.expect(std.mem.indexOf(u8, body.items, nostr.signer_ipc.reason_refused) != null);
-    var queue: [Broker.capacity]Pending = undefined;
-    try testing.expectEqual(@as(usize, 0), broker.snapshot(&queue));
-}
-
-test "an app that will not name itself gets nothing, and raises nothing" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    var signer = nostr.keys.Signer.init();
-    defer signer.deinit();
-    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
-    const kp = try signer.keyPairFromSecretKey(secret);
-
-    var broker: Broker = .{};
-    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
-    gate.preload(kp);
-    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
-
-    const req = try signRequest(gpa, 1);
-    defer gpa.free(req);
-
-    // No name at all, and a name that could rewrite the row it is shown on.
-    // Neither may raise a prompt: an app that cannot be named cannot be
-    // answered for, so a queue entry for one is a question with no subject.
-    for ([_][]const u8{ "", "app\nname", "an app name with spaces in it" }) |name| {
-        var out = std.Io.Writer.Allocating.init(gpa);
-        defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, name);
-        var body = out.toArrayList();
-        defer body.deinit(gpa);
-        try testing.expect(std.mem.indexOf(u8, body.items, "400") != null);
-        try testing.expect(std.mem.indexOf(u8, body.items, nostr.signer_ipc.reason_unnamed) != null);
-        try testing.expect(std.mem.indexOf(u8, body.items, "\"sig\"") == null);
-    }
     var queue: [Broker.capacity]Pending = undefined;
     try testing.expectEqual(@as(usize, 0), broker.snapshot(&queue));
 }
@@ -1865,7 +1817,7 @@ test "writing a message and reading one are answered separately" {
     var broker: Broker = .{};
     // Allowed to encrypt. Says nothing about decrypting, which is the one that
     // reads somebody's messages back.
-    broker.permissions.remember(nostr.signer_ipc.clientId(test_client), .nip44_encrypt, -1, true, .always, 0);
+    broker.permissions.remember(localClientForTest(), .nip44_encrypt, -1, true, .always, 0);
 
     var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
     gate.preload(kp);
@@ -1878,7 +1830,7 @@ test "writing a message and reading one are answered separately" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerCipher(&server, io, &out.writer, body_json, test_client, .encrypt);
+        try handleSignerCipher(&server, io, &out.writer, body_json, .encrypt);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
@@ -1886,7 +1838,7 @@ test "writing a message and reading one are answered separately" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerCipher(&server, io, &out.writer, body_json, test_client, .decrypt);
+        try handleSignerCipher(&server, io, &out.writer, body_json, .decrypt);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);
@@ -1908,7 +1860,7 @@ test "a locked daemon says so rather than asking for permission it cannot use" {
     defer gpa.free(req);
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
-    try handleSignerSign(&server, io, &out.writer, req, test_client);
+    try handleSignerSign(&server, io, &out.writer, req);
     var body = out.toArrayList();
     defer body.deinit(gpa);
 
@@ -1990,7 +1942,7 @@ test "what the key did is written down, and what it was told in confidence is no
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
     }
     var queue: [Broker.capacity]Pending = undefined;
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
@@ -2004,7 +1956,7 @@ test "what the key did is written down, and what it was told in confidence is no
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
@@ -2018,8 +1970,9 @@ test "what the key did is written down, and what it was told in confidence is no
     try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"decision\"") != null);
     try testing.expect(std.mem.indexOf(u8, written, "\"remember\":\"always\"") != null);
     try testing.expect(std.mem.indexOf(u8, written, "\"outcome\":\"ok\"") != null);
-    // Which app, and what it signed, by an id that finds the note again.
-    try testing.expect(std.mem.indexOf(u8, written, "\"who\":\"test-app\"") != null);
+    // Marked as local, so a reader can tell it from a request that came over a
+    // relay, and what it signed by an id that finds the note again.
+    try testing.expect(std.mem.indexOf(u8, written, "\"local\":true") != null);
     try testing.expect(std.mem.indexOf(u8, written, "\"kind\":1") != null);
     try testing.expect(std.mem.indexOf(u8, written, "\"id\":\"") != null);
 
@@ -2180,7 +2133,7 @@ test "Allow once actually lets one request through, and only one" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
     }
     var queue: [Broker.capacity]Pending = undefined;
     try testing.expectEqual(@as(usize, 1), broker.snapshot(&queue));
@@ -2198,7 +2151,7 @@ test "Allow once actually lets one request through, and only one" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
@@ -2210,7 +2163,7 @@ test "Allow once actually lets one request through, and only one" {
     {
         var out = std.Io.Writer.Allocating.init(gpa);
         defer out.deinit();
-        try handleSignerSign(&server, io, &out.writer, req, test_client);
+        try handleSignerSign(&server, io, &out.writer, req);
         var body = out.toArrayList();
         defer body.deinit(gpa);
         try testing.expect(std.mem.indexOf(u8, body.items, "403") != null);

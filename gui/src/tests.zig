@@ -63,100 +63,53 @@ fn expectByLabel(widget: canvas.Widget, kind: canvas.WidgetKind, label: []const 
 
 // ------------------------------------------------------------- parsing
 
-test "a window looks for a daemon before starting one" {
-    // The daemon is shared. It outlives the window that spawned it (only
-    // `/lock` ends it), another app on this machine may have started it, and
-    // the reader may have opened that app first. A window that spawned
-    // unconditionally would put a second daemon on a port the first holds
-    // exclusively: the loser exits, and this window waits for something that is
-    // never coming while a perfectly good daemon is already serving.
+test "a window starts its own daemon, once, and never looks for somebody else's" {
+    // The daemon used to be shared, so this had to connect first and spawn only
+    // if nothing answered. It is not shared any more: it has no well-known
+    // address and no credential on disk, so it is not something another app
+    // could be running and not something this window could attach to. It is
+    // this window's child or it does not exist.
 
-    // Nothing is answering and this window has started nothing: its turn, once
-    // one attempt has actually come back empty. Not on the very first tick,
-    // when the first connect may still be in flight.
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connecting));
-    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .connecting));
-    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .disconnected));
+    // Managed and nothing started yet: its turn.
+    try testing.expect(main.shouldStartDaemonForTest(true, false, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, .disconnected));
 
-    // But a window that ATTACHED to somebody else's daemon must not start a
-    // second one over a single dropped poll: the new one loses the race for a
-    // port the first holds exclusively and exits, for no reason a reader could
-    // see. It waits for the same run of silence as one that spawned.
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 1, .disconnected));
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 2, .disconnected));
-    try testing.expect(main.shouldStartDaemonForTest(true, false, true, 3, .disconnected));
+    // Already started one. A second would be a second daemon holding the same
+    // key, which is two passphrase prompts and two things to lock.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, .connecting));
 
-    // Something IS answering. Attaching to a daemon somebody else started is
-    // the ordinary case, not a fallback.
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connected));
+    // Already connected: nothing to do.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, .connected));
 
-    // Already started one. A second races the first onto a port held
-    // exclusively, and the loser exits.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 0, .connecting));
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .connecting));
-
-    // Attached mode was pointed at somebody else's daemon on purpose.
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .connecting));
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .disconnected));
+    // Attached mode was pointed at a daemon somebody runs by hand, on purpose.
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, .disconnected));
 }
 
-test "a detached daemon that dies is noticed by silence, since nothing reports it" {
-    // The daemon this window starts forks itself out of the window's process
-    // group, so that closing this window does not take the signer away from
-    // every other app using it. The price is that its death is no longer
-    // reported here: it is not a child any more, and `.daemon_exited` arrived
-    // seconds after it STARTED.
-    //
-    // So a run of ticks that reached nothing is the only evidence there is,
-    // and without this the window would retry a dead address forever while
-    // refusing to start a replacement, because it had started one once.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .disconnected));
-    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 3, .disconnected));
-    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 200, .disconnected));
+test "the secret is minted fresh and never leaves this process except down the pipe" {
+    // The whole design rests on this one being true. Measured on this machine:
+    // another program running as the same user can read a process's argv
+    // (`ps -o args=` printed a token planted there) and its environment
+    // (`ps -Eww` printed one), and could always read a 0600 token file, because
+    // file permissions separate USERS and not apps. A pipe to a child has no
+    // name and no path, so there is nothing to open.
+    var a = Model{};
+    var b = Model{};
+    a.mintDaemonSecret();
+    b.mintDaemonSecret();
 
-    // Still not while something is answering, however long the run was.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 200, .connected));
-    // And still never in attached mode: that daemon is somebody else's.
-    try testing.expect(!main.shouldStartDaemonForTest(false, true, false, 200, .disconnected));
-}
+    // Long enough to be worth minting, and terminated so the daemon's read has
+    // something to stop on.
+    try testing.expect(a.daemonSecret().len >= 32);
+    try testing.expectEqual(@as(u8, '\n'), a.daemonSecret()[a.daemonSecret().len - 1]);
 
-test "the window does not report a stopped signer when the daemon merely detached" {
-    // Drives the message rather than the predicate. The predicate had a test
-    // and the wiring did not, so removing the guard changed nothing anybody
-    // could see: this is the assertion that the window still shows a working
-    // signer after the exit that every successful start produces.
-    var m = Model{};
-    m.phase = .connecting;
-    m.managed = true;
-    m.spawned = true;
-    main.update(&m, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 0 } }, undefined);
-    try testing.expect(m.phase != .daemon_exited);
-    try testing.expectEqual(main.Phase.connecting, m.phase);
+    // Fresh per spawn: two windows, or one window restarting its daemon, must
+    // not end up sharing a credential.
+    try testing.expect(!std.mem.eql(u8, a.daemonSecret(), b.daemonSecret()));
 
-    // A real failure still is one. The daemon binds before it forks so that a
-    // port it could not get lands here, while somebody is watching.
-    var bad = Model{};
-    bad.phase = .connecting;
-    bad.managed = true;
-    bad.spawned = true;
-    main.update(&bad, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 1 } }, undefined);
-    try testing.expectEqual(main.Phase.daemon_exited, bad.phase);
-}
-
-test "a daemon that detached is not a daemon that failed" {
-    // A detaching daemon's first process exits 0 the moment it has forked, so
-    // this arrives after every successful start. Reading it as a crash would
-    // put the window into "Signer stopped" with a Restart button, seconds
-    // after the daemon came up perfectly.
-    try testing.expect(main.daemonDetachedForTest(.exited, 0));
-
-    // Everything else is real. The daemon binds its port BEFORE it forks
-    // precisely so a port it could not get still lands here, where somebody
-    // can be told, instead of vanishing into a process nobody is attached to.
-    try testing.expect(!main.daemonDetachedForTest(.exited, 1));
-    try testing.expect(!main.daemonDetachedForTest(.signaled, 0));
-    try testing.expect(!main.daemonDetachedForTest(.spawn_failed, 0));
-    try testing.expect(!main.daemonDetachedForTest(.rejected, 0));
+    // And the header presents it without the terminator.
+    try testing.expect(std.mem.endsWith(u8, a.auth(), a.daemonSecret()[0 .. a.daemonSecret().len - 1]));
+    try testing.expect(std.mem.startsWith(u8, a.auth(), "Bearer "));
 }
 
 test "parseInfo fills the header fields" {
@@ -846,21 +799,16 @@ test "one status line, and it says the phase before there is a queue to count" {
     try testing.expectEqualStrings("0 pending", fresh.footer(arena));
 }
 
-test "the app declares the filesystem permission it needs to read the token" {
-    // Regression guard. SDK 0.9.1 began confining raw file effects to the app's
-    // own directories unless `filesystem` is declared. The GUI reads the
-    // daemon's bearer token from $HOME, which is outside every one of them, so
-    // without this permission `fx.readFile` is REJECTED SILENTLY: `.token_read`
-    // arrives as `.rejected`, the retry arms, the phase never leaves
-    // `.connecting`, and the app sits on "Connecting to the signer…" forever
-    // looking exactly like a network fault. It shipped working only because the
-    // release pinned an older CLI, and nothing here caught it, because every
-    // check passes on an app that cannot reach its own daemon.
-    //
-    // `native check`, `native test` and `native build` all pass without it, so
-    // this test is the only thing standing between that bug and a release.
-    try testing.expect(native_sdk.security.hasPermission(
-        &main.app_permissions,
-        native_sdk.security.permission_filesystem,
-    ));
+test "the app asks for no file access at all" {
+    // It used to need `filesystem`, to read the daemon's bearer token out of
+    // $HOME. There is no token: this window mints a secret and hands it to the
+    // daemon it starts, down a pipe. So the permission goes, and this is here
+    // because a permission is easy to leave behind once the reason for it is
+    // gone, and an app that can read your files is worth noticing.
+    for (main.app_permissions) |p| {
+        if (std.mem.eql(u8, p, native_sdk.security.permission_filesystem)) {
+            std.debug.print("the window still asks for file access it no longer uses\n", .{});
+            return error.UnusedPermission;
+        }
+    }
 }
