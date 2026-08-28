@@ -1,9 +1,9 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.10.4
+### What's new in v0.10.5
 
-**Fixed: turning off "answering your other devices" looked like it did nothing.** The switch wrote the setting correctly, but the window reads its state back from the daemon, and the daemon kept answering with the value it read when it started. So the switch flipped back a moment later and the setting looked dead, when it had in fact been saved.
+**Fixed: opening this window from an app left you unlocking the wrong keyholder.** An app that ships Notary starts its own keyholder and asks it to sign. This window went looking for a keyholder of its own instead: a well-known port when there was nothing there, and inside a packaged app a second keyholder started beside the first. So you typed your passphrase, this window said it was unlocked, and the app you opened it from was still sitting there with your key locked. Restarting did the same thing again.
 
-It still takes effect at the next start, because the relay connections are made once, with the key. What changed is that the window now tells you the truth about what it saved.
+An app can now hand this window the keyholder it is already using, and when it does, that one wins. One keyholder, shared, instead of two that cannot see each other.
 
-**And a setting that cannot be written is no longer reported as saved.** That write used to swallow its error and answer as though it had worked.
+The address arrives on the command line and the secret on the window's stdin, which is the same pair the keyholder itself takes and for the same reason: an address is not a secret, and a secret has no business on a command line where any program running as you can read it.

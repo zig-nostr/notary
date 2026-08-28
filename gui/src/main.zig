@@ -1797,6 +1797,44 @@ pub fn chooseDaemonBin(env_bin: ?[]const u8, bundled: ?[]const u8) ?[]const u8 {
     return bundled;
 }
 
+/// The keyholder an app that started this window handed over, if it did.
+///
+/// `--approval-http <addr>` on argv, and the bearer secret for it on stdin.
+/// Both or neither: an address with no secret cannot be used (every request
+/// needs the token), and a secret with no address has nothing to reach.
+///
+/// Reading stdin is gated on the flag ON PURPOSE. Started from Finder or a
+/// terminal there is nothing on stdin, and a read would block this window
+/// before it drew anything.
+const AttachedTo = struct { address: []const u8, secret: []const u8 };
+
+var g_attach_addr_buf: [128]u8 = undefined;
+var g_attach_secret_buf: [256]u8 = undefined;
+
+fn attachedAddress(io: std.Io, raw_args: anytype) ?AttachedTo {
+    var args = std.process.Args.Iterator.init(raw_args);
+    _ = args.skip(); // argv[0]
+    var addr: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--approval-http")) addr = args.next();
+    }
+    const a = addr orelse return null;
+    if (a.len == 0 or a.len > g_attach_addr_buf.len) return null;
+    @memcpy(g_attach_addr_buf[0..a.len], a);
+
+    var r = std.Io.File.stdin().reader(io, &g_attach_secret_buf);
+    const line = r.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        // The parent wrote the whole secret and closed, with no newline.
+        error.EndOfStream => r.interface.buffered(),
+        else => return null,
+    };
+    const secret = std.mem.trim(u8, line, " \t\r\n");
+    // Too short to be a secret anybody minted. Refusing beats attaching to a
+    // keyholder we cannot authenticate to and showing "connecting" forever.
+    if (secret.len < 16) return null;
+    return .{ .address = g_attach_addr_buf[0..a.len], .secret = secret };
+}
+
 /// Absolute path to a runnable `signer` sitting next to this executable, the
 /// layout a packaged app has (`…/Contents/MacOS/signer` beside the GUI binary),
 /// so a single download is self-contained. Returns null when there is no
@@ -1819,7 +1857,28 @@ fn bundledDaemonPath(io: std.Io, buf: []u8) ?[]const u8 {
 /// a `signer` bundled beside the app, or an overriding `SIGNER_BIN`. The token
 /// *contents* are read later through the effects channel, so a managed daemon
 /// that writes the file after we launch is picked up on retry.
-fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map) void {
+fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map, raw_args: anytype) void {
+    // An app that starts this window can hand it the keyholder it is ALREADY
+    // talking to, and when it does that keyholder wins over everything below.
+    //
+    // Without this the window went looking for a keyholder of its own: a
+    // well-known port in the dev tree, and in a packaged app a second daemon
+    // spawned beside the first. Either way it was never the one the app that
+    // opened it had the key in, so unlocking here unlocked nothing the app
+    // could use, and the app sat in guest mode with the key right there. A
+    // restart did it again. Reported from a real install.
+    //
+    // The address on argv, the secret on stdin: the same pair the daemon
+    // itself takes, and for the same reason. An address is not a secret, and a
+    // secret has no business in argv where `ps` prints it.
+    if (attachedAddress(io, raw_args)) |addr| {
+        model.setBaseUrl(addr.address);
+        model.setAuth(addr.secret);
+        model.managed = false;
+        model.port_known = true;
+        return;
+    }
+
     const address = environ.get("SIGNER_APPROVAL_HTTP") orelse default_address;
     model.setBaseUrl(address);
 
@@ -1848,7 +1907,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModel();
-    loadConfig(&app_state.model, init.io, init.environ_map);
+    loadConfig(&app_state.model, init.io, init.environ_map, init.minimal.args);
 
     try runner.runWithOptions(app_state.app(), .{
         .app_name = "notary",
