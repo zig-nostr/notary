@@ -102,8 +102,6 @@ const usage =
     \\  SIGNER_INIT            if set, create/import an encrypted key file and exit
     \\  SIGNER_LOG_FILE        where uses of the key are written down (default:
     \\                         $HOME/.zig-nostr-signer.log; empty turns it off)
-    \\  SIGNER_DETACH          if set, leave the starting app's process group, so
-    \\                         the daemon outlives it and can be shared
     \\  SIGNER_IDLE_EXIT_MS    exit after this long with no request (default:
     \\                         900000, fifteen minutes; 0 stays up forever)
     \\
@@ -156,14 +154,33 @@ pub fn main(init: std.process.Init) !void {
     // `SIGNER_APPROVAL_HTTP`. Parse argv here so the slice lives for the process
     // (GUI/relay mode never returns).
     var approval_addr = getEnv("SIGNER_APPROVAL_HTTP");
+    // `--serve-relays` is what separates the two things this daemon can be.
+    //
+    // EMBEDDED, without it: the private keyholder of the one app that started
+    // it, reachable only down the pipe it was handed, and on no relay at all.
+    // Nothing outside that app can ask it for anything.
+    //
+    // STANDALONE, with it: a bunker on real relays, where clients are NIP-46
+    // clients and prove who they are with their own keypair. That is the only
+    // place a stranger's request belongs, and it is the only mode that needs a
+    // network.
+    //
+    // Being both at once is what this flag exists to prevent. A daemon serving
+    // relays AND a local app is a keyholder with a public door, which is the
+    // shape nobody has made safe on the desktop.
+    var serve_relays = false;
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // argv[0]
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--approval-http")) approval_addr = args.next();
+        if (std.mem.eql(u8, arg, "--approval-http")) {
+            approval_addr = args.next();
+        } else if (std.mem.eql(u8, arg, "--serve-relays")) {
+            serve_relays = true;
+        }
     }
 
     if (approval_addr) |addr| {
-        runGuiMode(gpa, addr, conn_secret, &policy_config);
+        runGuiMode(gpa, addr, conn_secret, &policy_config, serve_relays);
     }
 
     // Headless mode: the key must already be available (from an encrypted key
@@ -186,17 +203,17 @@ pub fn main(init: std.process.Init) !void {
 /// first-run key onboarding over it, then serve with the resulting key. The
 /// broker and server live in this frame, which never returns (it tail-calls the
 /// forever-serving `runRelays`), so their addresses are stable for the process.
-fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig) noreturn {
+fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig, serve_relays: bool) noreturn {
     const hp = parseHostPort(addr) orelse
         fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:0");
 
     // Turnkey defaults so a fresh download needs no configuration.
     const key_file = getEnv("SIGNER_KEY_FILE") orelse resolveHome(gpa, default_key_file);
-    const relays_env = getEnv("SIGNER_RELAYS") orelse default_gui_relays;
-
     var relays: std.ArrayList([]const u8) = .empty;
-    parseRelays(gpa, &relays, relays_env);
-    if (relays.items.len == 0) fail("SIGNER_RELAYS contained no relay URLs");
+    if (serve_relays) {
+        parseRelays(gpa, &relays, getEnv("SIGNER_RELAYS") orelse default_gui_relays);
+        if (relays.items.len == 0) fail("SIGNER_RELAYS contained no relay URLs");
+    }
 
     var startup = std.Io.Threaded.init(gpa, .{});
     defer startup.deinit();
@@ -290,6 +307,13 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
     // preconfigured key was loaded above), then serve with it. The broker is
     // already live, so approvals work the moment serving starts.
     const secret_key = gate.waitUnlocked(io);
+    if (!serve_relays) {
+        // Embedded. There is nothing to serve but the app that started this,
+        // and that is already being served on the other thread. Park here so
+        // the process lives as long as its parent does rather than falling out
+        // of a function that promised never to return.
+        while (true) io.sleep(std.Io.Duration.fromSeconds(3600), .awake) catch {};
+    }
     runRelays(gpa, relays.items, secret_key, conn_secret, policy_config, &broker_storage, relay_status);
 }
 

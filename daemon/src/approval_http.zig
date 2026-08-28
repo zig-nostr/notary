@@ -860,6 +860,10 @@ fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
         return switch (err) {
             error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
             error.NotLocked => respond(w, 409, "{\"error\":\"not locked\"}"),
+            // Not the reader's mistake, and not something a passphrase fixes.
+            // Another Notary on this Mac has this key open; two processes
+            // cannot share a decrypted key, so one of them has to close.
+            error.AlreadyOpenElsewhere => respond(w, 409, "{\"error\":\"another Notary already has this key open\"}"),
             else => respond(w, 500, "{\"error\":\"could not unlock\"}"),
         };
     };

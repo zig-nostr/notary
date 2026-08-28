@@ -77,9 +77,22 @@ Notary is split into two processes on purpose, so the secret key stays isolated
 from the user interface:
 
 - **[`daemon/`](daemon)**: the headless NIP-46 signer ("bunker"). It holds the
-  encrypted key, connects to your relays, and in GUI mode serves a
-  **loopback-only** approval API. It runs standalone as a CLI for advanced users,
-  or supervised by the GUI.
+  encrypted key and is one of two things, never both:
+
+  **Standalone**, run by this app: a bunker on real relays, where a client
+  proves who it is with its own keypair. That is where a request from another
+  machine, or from somebody else's client, belongs.
+
+  **Embedded**, started by an app that ships Notary: the private keyholder of
+  that one app. It talks to its parent down a pipe it was handed at startup, on
+  a port the kernel chose, and connects to no relay. Nothing else on the machine
+  can reach it, because there is no name, no path and no well-known port to
+  reach.
+
+  Not both at once, deliberately. A keyholder that any local app can reach has
+  to answer "which app is this", and on the desktop nothing can: file
+  permissions separate users, not apps, so a credential in a file is readable by
+  every app you run.
 - **[`gui/`](gui)**: the native desktop approver, built with the
   [Native SDK](https://github.com/vercel-labs/native) (declarative markup plus
   Zig, rendered natively: no WebView, no Electron). It shows each pending

@@ -33,7 +33,13 @@ pub const State = enum(u8) {
 };
 
 pub const SetupError = error{ AlreadyInitialized, EmptyPassphrase, InvalidSecretKey, EncryptFailed, WriteFailed };
-pub const UnlockError = error{ NotLocked, BadPassphrase, ReadFailed };
+pub const UnlockError = error{
+    /// Another daemon on this machine already holds this key open.
+    AlreadyOpenElsewhere,
+    NotLocked,
+    BadPassphrase,
+    ReadFailed,
+};
 
 /// Coordinates the key-less boot with the setup/unlock handlers. Lives in the
 /// daemon's `main` frame (which never returns), so the HTTP server may hold a
@@ -44,6 +50,10 @@ pub const Gate = struct {
     dir: Dir,
     /// Encrypted key-file path within `dir`.
     key_file: []const u8,
+    /// Held open while this daemon has the key unlocked, so a second daemon
+    /// cannot open the same key. Released by the OS when this process ends,
+    /// however it ends.
+    lock_file: ?std.Io.File = null,
 
     /// `State` as a plain integer for atomic access.
     state: std.atomic.Value(u8),
@@ -116,8 +126,34 @@ pub const Gate = struct {
     /// Decrypts the existing key file with `passphrase`. On success the gate is
     /// `unlocked` and holds the key + public key. Only valid from the `locked`
     /// state; a wrong passphrase leaves it `locked` for a retry.
+    /// Whether some OTHER daemon already holds this key unlocked.
+    ///
+    /// One keyholder per key, and the reason is not tidiness. A standalone
+    /// Notary serving relays and an embedded one serving an app are two
+    /// processes, so they cannot share a decrypted key: each would ask for the
+    /// passphrase, each would hold a copy in memory, and the reader would have
+    /// no way to tell which one a prompt came from.
+    ///
+    /// An advisory lock on the key file, taken while the key is open and
+    /// released when the process ends, however it ends. Advisory is enough: the
+    /// thing it coordinates is our own two modes, not an attacker, and an
+    /// attacker with the run of this machine was never held off by a lock.
+    fn takeKeyLock(self: *Gate, io: std.Io) bool {
+        if (self.lock_file != null) return true;
+        const f = self.dir.createFile(io, self.key_file, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch return false;
+        self.lock_file = f;
+        return true;
+    }
+
     pub fn unlock(self: *Gate, io: std.Io, passphrase: []const u8) UnlockError!void {
         if (self.current() != .locked) return error.NotLocked;
+        // Before the passphrase is even checked, so somebody who typed it
+        // correctly is not told it was wrong.
+        if (!self.takeKeyLock(io)) return error.AlreadyOpenElsewhere;
 
         const ncryptsec = keystore.readKeyFile(self.gpa, io, self.dir, self.key_file) catch
             return error.ReadFailed;
@@ -384,4 +420,37 @@ test "rescan never moves a gate that already holds a key" {
     var locked = Gate.init(gpa, tmp.dir, key_name, .locked);
     locked.rescan(io);
     try testing.expectEqual(State.locked, locked.current());
+}
+
+test "two daemons cannot hold one key open" {
+    // A standalone Notary serving relays and an embedded one serving an app are
+    // two processes, so they cannot share a decrypted key. Without this each
+    // would ask for the passphrase, each would hold a copy in memory, and a
+    // prompt would give the reader no way to tell which one it came from.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const secret = [_]u8{0xC1} ** 32;
+    const passphrase = "correct horse battery staple";
+    const ncryptsec = try keystore.encryptKey(gpa, io, secret, passphrase, .known_secure);
+    defer gpa.free(ncryptsec);
+    try keystore.writeNewKeyFile(io, tmp.dir, "key.ncryptsec", ncryptsec);
+
+    var first = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    try first.unlock(io, passphrase);
+    try testing.expectEqual(State.unlocked, first.current());
+
+    // The second is refused, and for the RIGHT reason: the passphrase is
+    // correct, so saying it was wrong would send somebody hunting for a
+    // password that is fine.
+    var second = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    try testing.expectError(error.AlreadyOpenElsewhere, second.unlock(io, passphrase));
+    try testing.expectEqual(State.locked, second.current());
+
+    // The check runs BEFORE the passphrase is read, so a wrong one gets the
+    // same answer rather than telling a caller which of the two it got wrong.
+    var third = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    try testing.expectError(error.AlreadyOpenElsewhere, third.unlock(io, "not the passphrase"));
 }
