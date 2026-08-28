@@ -315,11 +315,17 @@ test "a populated view renders rows and dispatches typed approve/deny" {
         else => return error.WrongMessage,
     }
 
-    const always = try expectByText(tree.root, .button, "Always");
+    // "Until locked", not "Always". Answers live in the daemon's memory and
+    // nothing writes them down, so every one of them ends when the key does.
+    // A button that promised forever would be describing a durability this
+    // does not have, on the screen where somebody is deciding how much to
+    // trust an app.
+    const always = try expectByText(tree.root, .button, "Until locked");
     switch (tree.msgForPointer(always.id, .up).?) {
         .approve_always => |id| try testing.expectEqual(@as(u64, 42), id),
         else => return error.WrongMessage,
     }
+    try testing.expect(findByText(tree.root, .button, "Always") == null);
 
     const deny = try expectByText(tree.root, .button, "Deny");
     switch (tree.msgForPointer(deny.id, .up).?) {

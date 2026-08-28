@@ -141,11 +141,20 @@ pub const Broker = struct {
     timeout_ms: u64 = 120_000,
     /// What the operator has already answered, and for how long.
     ///
-    /// The library's, shared with Plaza's signer so the two cannot drift on what
-    /// a permission means. Until this, Notary prompted for every request
-    /// forever: there was no way to say "always allow this app to post notes"
-    /// and no way to say "stop asking", which is the prompt fatigue that teaches
-    /// people to approve without reading.
+    /// The library's, so no product carries a second idea of what a permission
+    /// means. Before it, Notary prompted for every request forever: there was
+    /// no way to say "let this app post notes" and no way to say "stop
+    /// asking", which is the prompt fatigue that teaches people to approve
+    /// without reading.
+    ///
+    /// IN MEMORY, and nothing writes it down, which is why the longest answer
+    /// the window offers reads "until locked" rather than "always". That is
+    /// not an omission waiting to be filled in with a file. A file of
+    /// permissions is a file that grants signing, and anything running as this
+    /// user could add itself a line and never be asked again, which turns the
+    /// operator's attention from the last defence into no defence at all.
+    /// Persisting these means binding them to the key, not writing them beside
+    /// it.
     permissions: nip46.Permissions = .{},
 
     fn acquire(self: *Broker) void {
