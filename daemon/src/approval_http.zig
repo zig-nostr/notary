@@ -77,6 +77,22 @@ pub const Server = struct {
     host: []const u8,
     port: u16,
 
+    /// Filled by `bind`, consumed by `run`. Null until bound.
+    listener: ?net.Server = null,
+
+    /// When the last authorized request arrived, or when the daemon bound its
+    /// port if none has.
+    ///
+    /// Every request touches it, including the polls both windows run while
+    /// they are open, which is what makes it a usable measure of "is anybody
+    /// there": a reader looking at either window is a steady stream of
+    /// requests, and silence means every app that was using this daemon has
+    /// gone.
+    last_request_ms: std.atomic.Value(i64) = .init(0),
+    /// How long that silence may last before the daemon exits. Zero stays up
+    /// forever.
+    idle_exit_ms: i64 = 0,
+
     active: std.atomic.Value(u32) = .init(0),
     /// Filled once the listener is up. With `port` 0 this is the only place the
     /// real port exists.
@@ -159,9 +175,30 @@ pub const Server = struct {
     ///
     /// Without the flag a duplicate bind fails, this listener refuses to start,
     /// and the daemon exits instead of leaving a hole open.
-    pub fn run(self: *Server, io: std.Io) !void {
+    /// Takes the address, and nothing else.
+    ///
+    /// Separate from `run` because of WHEN it has to happen. A daemon that
+    /// detaches from whoever started it has to fork; a fork must happen while
+    /// only one thread exists, since only the calling thread survives one; and
+    /// the spawner has to be told whether the port was obtained before its
+    /// child disappears. That ordering is only expressible if binding is its
+    /// own step: bind, report, fork, then serve. The listening socket survives
+    /// the fork, which is the whole reason this works.
+    pub fn bind(self: *Server, io: std.Io) !void {
         const addr = try net.IpAddress.parseIp4(self.host, self.port);
-        var server = try addr.listen(io, .{});
+        self.listener = try addr.listen(io, .{});
+        self.bound_port.store(boundPort(self.listener.?), .release);
+        // The idle clock starts now, so a daemon nobody ever reaches still
+        // goes. Measured live: with the clock starting at the first request
+        // instead, a daemon that was only ever knocked on by something without
+        // the token stayed up indefinitely.
+        self.last_request_ms.store(std.Io.Timestamp.now(io, .awake).toMilliseconds(), .monotonic);
+    }
+
+    /// Serves forever on the calling thread, binding first if nobody has.
+    pub fn run(self: *Server, io: std.Io) !void {
+        if (self.listener == null) try self.bind(io);
+        var server = self.listener.?;
         // Watches the connections the handlers hold and cuts off any that stops
         // making progress. There are only eight handler threads, and a peer
         // that opened a socket and wrote half a request line held one forever:
@@ -192,12 +229,6 @@ pub const Server = struct {
         // child's stderr outright (`.stderr = ... else .ignore`), so the
         // ordinary `std.debug.print` banner below would be dropped on the
         // floor and the GUI would wait forever for a port it was never told.
-        self.bound_port.store(boundPort(server), .release);
-        var out_buf: [64]u8 = undefined;
-        var stdout = std.Io.File.stdout().writer(io, &out_buf);
-        stdout.interface.print("{s} {d}\n", .{ port_line_prefix, self.bound_port.load(.acquire) }) catch {};
-        stdout.interface.flush() catch {};
-
         while (true) {
             const stream = server.accept(io) catch continue;
             if (self.active.load(.monotonic) >= max_conns) {
@@ -230,15 +261,58 @@ fn boundPort(server: net.Server) u16 {
     return std.mem.bigToNative(u16, sa.port);
 }
 
-/// Wakes once a second and cuts off connections that have stopped progressing.
+/// Wakes once a second, cuts off connections that have stopped progressing,
+/// and clocks the daemon out once nothing is using it.
 fn runReaper(self: *Server) void {
     var threaded = std.Io.Threaded.init(self.gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     while (true) {
         io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
-        self.reapStale(io, std.Io.Timestamp.now(io, .awake).toMilliseconds());
+        const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
+        self.reapStale(io, now);
+        if (idleExpired(self.idle_exit_ms, self.last_request_ms.load(.monotonic), now))
+            exitIdle(self, io);
     }
+}
+
+/// Whether a daemon that has answered nobody for this long should go.
+///
+/// Pure, because the alternative is testing it by waiting and the interesting
+/// cases are a quarter of an hour apart.
+///
+/// The clock starts at STARTUP, not at the first request, and that is the
+/// whole subtlety. Treating "nobody has asked yet" as a reason to stay meant a
+/// daemon nobody ever reached lived forever: started by an app that then died,
+/// or knocked on only by something without the token, it sat there indefinitely
+/// waiting for a first request that was never coming. Measuring from startup
+/// covers the gap between starting and the app connecting just as well, because
+/// the gap is seconds and the window is a quarter of an hour.
+///
+/// Zero disables it.
+pub fn idleExpired(idle_exit_ms: i64, last_request_ms: i64, now_ms: i64) bool {
+    if (idle_exit_ms <= 0) return false;
+    return now_ms - last_request_ms >= idle_exit_ms;
+}
+
+/// Goes, because nothing is using the key any more.
+///
+/// This daemon deliberately outlives whoever started it, so that closing one
+/// app does not take the signer away from the others. The cost of that is that
+/// nothing ends it, and a keyholder nothing ends is a decrypted key sitting in
+/// memory until the machine is turned off.
+///
+/// Exit rather than lock in place, because exiting hands the pages back;
+/// a locked daemon still holds them. Whoever wants it next starts it again and
+/// it comes up locked, which is the right state for somebody returning to a
+/// machine they walked away from.
+fn exitIdle(self: *Server, io: std.Io) noreturn {
+    note(self, io, .{ .what = "lock", .outcome = "idle" });
+    // Same care as `/lock`: an authorization granted before this must not be
+    // recognised by whatever daemon comes next.
+    if (self.clients) |c| c.clear();
+    self.broker.reset();
+    std.process.exit(0);
 }
 
 /// One connection on its own thread with its own io (for the long-poll sleep).
@@ -303,6 +377,11 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     }
 
     if (!authOk(auth, self.token)) return respond(w, 401, "{\"error\":\"unauthorized\"}");
+
+    // Somebody is here. Stamped AFTER the credential check, so a stranger
+    // cannot keep the key alive by knocking: the clock means "the apps allowed
+    // to use this are still around", and failed attempts are not those apps.
+    self.last_request_ms.store(std.Io.Timestamp.now(io, .awake).toMilliseconds(), .monotonic);
 
     // Assemble the body: bytes already read after the head, plus any remainder.
     var body_storage: [4096]u8 = undefined;
@@ -1944,4 +2023,49 @@ test "the key leaving the machine is written down, in the form it left as" {
     try testing.expect(std.mem.indexOf(u8, written, "nsec1") == null);
     try testing.expect(std.mem.indexOf(u8, written, passphrase) == null);
     try testing.expect(std.mem.indexOf(u8, written, "wrong") == null);
+}
+
+test "a daemon nobody is using clocks out, and one nobody has reached yet does not" {
+    const minute = 60 * 1000;
+    const idle = 15 * minute;
+
+    // Nothing has ever asked, and the clock runs from startup, so this daemon
+    // goes too. Measured live: with a first-request clock, a daemon that was
+    // only ever knocked on by something WITHOUT the token stayed up
+    // indefinitely, because the knocks never counted and the clock never
+    // started. Nobody was ever coming.
+    try testing.expect(!idleExpired(idle, 1_000_000, 1_000_000 + minute));
+    try testing.expect(idleExpired(idle, 1_000_000, 1_000_000 + idle));
+
+    // Somebody asked a minute ago. Both windows poll while they are open, so
+    // this is what "a reader is looking at it" measures as.
+    try testing.expect(!idleExpired(idle, 1_000_000, 1_000_000 + minute));
+    try testing.expect(!idleExpired(idle, 1_000_000, 1_000_000 + idle - 1));
+
+    // Nobody for the whole window: every app that was using the key has gone,
+    // and the key must not outlast them.
+    try testing.expect(idleExpired(idle, 1_000_000, 1_000_000 + idle));
+    try testing.expect(idleExpired(idle, 1_000_000, 1_000_000 + 60 * minute));
+
+    // Turned off, for a headless bunker with no window to poll it, where
+    // silence is the normal state rather than a sign that everyone left.
+    try testing.expect(!idleExpired(0, 1_000_000, 1_000_000 + 60 * minute));
+    try testing.expect(!idleExpired(-1, 1_000_000, 1_000_000 + 60 * minute));
+}
+
+test "the idle clock is only wound by a caller that presented the token" {
+    // A stranger knocking must not keep the key alive. The clock means "the
+    // apps allowed to use this are still around", and failed attempts are not
+    // those apps. Asserted on the source's own ordering, because the
+    // alternative is a live server and a fifteen-minute wait.
+    const src = @embedFile("approval_http.zig");
+    const auth_at = std.mem.indexOf(u8, src, "if (!authOk(auth, self.token)) return respond").?;
+    // The request handler's stamp, not `bind`'s: both write the same field,
+    // and only one of them is on the path a caller can reach.
+    const stamp_at = std.mem.indexOfPos(u8, src, auth_at, "self.last_request_ms.store(").?;
+    try testing.expect(auth_at < stamp_at);
+    // And there is no OTHER stamp between the head being read and the check,
+    // which is where an unauthorized caller would slip one in.
+    const head_at = std.mem.indexOf(u8, src, "const request_line = lines.next()").?;
+    try testing.expect(std.mem.indexOfPos(u8, src, head_at, "self.last_request_ms.store(").? == stamp_at);
 }

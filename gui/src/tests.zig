@@ -72,20 +72,80 @@ test "a window looks for a daemon before starting one" {
     // never coming while a perfectly good daemon is already serving.
 
     // Nothing is answering and this window has started nothing: its turn.
-    try testing.expect(main.shouldStartDaemonForTest(true, false, .connecting));
-    try testing.expect(main.shouldStartDaemonForTest(true, false, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, 0, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, 0, .disconnected));
 
     // Something IS answering. Attaching to a daemon somebody else started is
     // the ordinary case, not a fallback.
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, .connected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, 0, .connected));
 
     // Already started one. A second races the first onto a port held
     // exclusively, and the loser exits.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, 2, .connecting));
 
     // Attached mode was pointed at somebody else's daemon on purpose.
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, .connecting));
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, 0, .disconnected));
+}
+
+test "a detached daemon that dies is noticed by silence, since nothing reports it" {
+    // The daemon this window starts forks itself out of the window's process
+    // group, so that closing this window does not take the signer away from
+    // every other app using it. The price is that its death is no longer
+    // reported here: it is not a child any more, and `.daemon_exited` arrived
+    // seconds after it STARTED.
+    //
+    // So a run of ticks that reached nothing is the only evidence there is,
+    // and without this the window would retry a dead address forever while
+    // refusing to start a replacement, because it had started one once.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, 2, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, 3, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, 200, .disconnected));
+
+    // Still not while something is answering, however long the run was.
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, 200, .connected));
+    // And still never in attached mode: that daemon is somebody else's.
+    try testing.expect(!main.shouldStartDaemonForTest(false, true, 200, .disconnected));
+}
+
+test "the window does not report a stopped signer when the daemon merely detached" {
+    // Drives the message rather than the predicate. The predicate had a test
+    // and the wiring did not, so removing the guard changed nothing anybody
+    // could see: this is the assertion that the window still shows a working
+    // signer after the exit that every successful start produces.
+    var m = Model{};
+    m.phase = .connecting;
+    m.managed = true;
+    m.spawned = true;
+    main.update(&m, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 0 } }, undefined);
+    try testing.expect(m.phase != .daemon_exited);
+    try testing.expectEqual(main.Phase.connecting, m.phase);
+
+    // A real failure still is one. The daemon binds before it forks so that a
+    // port it could not get lands here, while somebody is watching.
+    var bad = Model{};
+    bad.phase = .connecting;
+    bad.managed = true;
+    bad.spawned = true;
+    main.update(&bad, main.Msg{ .daemon_exited = .{ .key = 1, .reason = .exited, .code = 1 } }, undefined);
+    try testing.expectEqual(main.Phase.daemon_exited, bad.phase);
+}
+
+test "a daemon that detached is not a daemon that failed" {
+    // A detaching daemon's first process exits 0 the moment it has forked, so
+    // this arrives after every successful start. Reading it as a crash would
+    // put the window into "Signer stopped" with a Restart button, seconds
+    // after the daemon came up perfectly.
+    try testing.expect(main.daemonDetachedForTest(.exited, 0));
+
+    // Everything else is real. The daemon binds its port BEFORE it forks
+    // precisely so a port it could not get still lands here, where somebody
+    // can be told, instead of vanishing into a process nobody is attached to.
+    try testing.expect(!main.daemonDetachedForTest(.exited, 1));
+    try testing.expect(!main.daemonDetachedForTest(.signaled, 0));
+    try testing.expect(!main.daemonDetachedForTest(.spawn_failed, 0));
+    try testing.expect(!main.daemonDetachedForTest(.rejected, 0));
 }
 
 test "parseInfo fills the header fields" {

@@ -414,6 +414,12 @@ pub const Model = struct {
     /// as "is one running": another app may have started the one we are talking
     /// to, and that is the ordinary case rather than a fallback.
     spawned: bool = false,
+    /// Retry ticks in a row that have not reached a daemon.
+    ///
+    /// The only evidence this window gets that a DETACHED daemon has died. It
+    /// is no longer a child, so nothing reports its exit; a socket that stops
+    /// answering is the whole signal.
+    connect_failures: u8 = 0,
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -970,13 +976,49 @@ const managed_bind_address = "127.0.0.1:8787";
 ///   - connected: something is already serving, which is the ordinary case now
 ///     rather than a fallback. Another app may have started it, or the reader
 ///     may have opened Notary before Plaza.
-fn shouldStartDaemon(managed: bool, spawned: bool, phase: Phase) bool {
-    if (!managed or spawned) return false;
-    return phase != .connected;
+fn shouldStartDaemon(managed: bool, spawned: bool, failures: u8, phase: Phase) bool {
+    if (!managed) return false;
+    if (phase == .connected) return false;
+    if (!spawned) return true;
+    // One was started from here, and it detached, so its death is not reported
+    // to this window any more: it stopped being a child the moment it forked.
+    // A run of ticks that reached nothing is the only evidence there is, and
+    // waiting for a run rather than acting on one failure is what keeps a
+    // daemon that is merely slow to bind from being raced by a second.
+    return failures >= respawn_after_failures;
 }
 
-pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, phase: Phase) bool {
-    return shouldStartDaemon(managed, spawned, phase);
+/// How many silent retry ticks amount to "there is no daemon there".
+///
+/// Three, against a retry that backs off, so a daemon still starting is not
+/// competed with. The cost of guessing wrong is small in one direction only:
+/// the bind is exclusive, so a redundant daemon exits at once instead of
+/// quietly taking over the address.
+const respawn_after_failures: u8 = 3;
+
+pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, failures: u8, phase: Phase) bool {
+    return shouldStartDaemon(managed, spawned, failures, phase);
+}
+
+/// Whether this exit is a daemon that detached, rather than one that failed.
+///
+/// A detaching daemon forks and its first process exits 0 immediately, so this
+/// arrives seconds after every successful start and means the opposite of what
+/// it looks like: the daemon is up, it is simply no longer this window's child.
+///
+/// A clean exit is therefore not news. Anything else is: the daemon binds its
+/// port BEFORE it forks, precisely so a port it could not get still fails here,
+/// while somebody is watching, instead of vanishing into a process nobody is
+/// attached to.
+///
+/// Liveness after this point is the HTTP connection, which is the honest
+/// measure anyway. The process being alive never meant it was answering.
+fn daemonDetached(exit: native_sdk.EffectExit) bool {
+    return exit.reason == .exited and exit.code == 0;
+}
+
+pub fn daemonDetachedForTest(reason: native_sdk.EffectExitReason, code: i32) bool {
+    return daemonDetached(.{ .key = 0, .reason = reason, .code = code });
 }
 
 fn spawnDaemon(model: *Model, fx: *Effects) void {
@@ -988,10 +1030,22 @@ fn spawnDaemon(model: *Model, fx: *Effects) void {
     model.spawned = true;
     fx.spawn(.{
         .key = daemon_key,
-        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address },
+        // `--detach` is what makes this a shared service rather than this
+        // window's child. The SDK group-kills what it spawns when the app
+        // quits, which is right for a private helper and wrong here: close
+        // this window and every other app using the key would lose its signer
+        // mid-sentence, with nothing to see but a socket that stopped
+        // answering. The daemon forks itself out of reach instead, and ends
+        // itself when nobody has asked it for anything in a while.
+        .argv = &.{ model.daemonBin(), "--approval-http", managed_bind_address, "--detach" },
         .on_line = Effects.lineMsg(.daemon_line),
         .on_exit = Effects.exitMsg(.daemon_exited),
     });
+}
+
+/// Counts an attempt that reached nothing, and forgets the run once one lands.
+fn noteConnectFailure(model: *Model) void {
+    if (model.connect_failures < 255) model.connect_failures += 1;
 }
 
 /// One connection attempt: (re-)read the token file, then poll. Re-reading on
@@ -1285,6 +1339,13 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // A cancel we initiated (restart / app quit) reports `.cancelled`.
             // That is expected teardown, not a crash to report.
             if (exit.reason == .cancelled) return;
+            // A detaching daemon exits its FIRST process the moment it has
+            // forked, and that exit is the success signal, not a failure: the
+            // daemon it left behind is the one now listening. Only a non-zero
+            // code says something actually went wrong, and the daemon is
+            // careful to bind before it forks so a bad port still lands here
+            // where somebody can be told about it.
+            if (daemonDetached(exit)) return;
             model.phase = .daemon_exited;
             model.setExitNote(exit);
             model.setAuth("");
@@ -1330,6 +1391,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 onUnauthorized(model, fx);
             } else {
                 // The daemon may still be coming up; try again shortly.
+                noteConnectFailure(model);
                 armRetry(fx);
             }
         },
@@ -1338,12 +1400,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .ok => switch (r.status) {
                 200 => {
                     model.phase = .connected;
+                    model.connect_failures = 0; // something answered
                     parsePending(model, r.body);
                     pollPending(model, fx); // re-arm the long-poll chain
                 },
                 401 => onUnauthorized(model, fx),
                 else => {
                     model.phase = .disconnected;
+                    noteConnectFailure(model);
                     armRetry(fx);
                 },
             },
@@ -1352,6 +1416,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .rejected => armRetry(fx),
             else => {
                 if (model.phase == .connected) model.phase = .disconnected;
+                noteConnectFailure(model);
                 armRetry(fx);
             },
         },
@@ -1366,8 +1431,10 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // to attach to and this window may start one. Only in managed mode,
             // and only once: attached mode was pointed at somebody else's
             // daemon on purpose, and a second spawn would race the first.
-            if (shouldStartDaemon(model.managed, model.spawned, model.phase))
+            if (shouldStartDaemon(model.managed, model.spawned, model.connect_failures, model.phase)) {
+                model.connect_failures = 0; // this attempt gets its own run
                 spawnDaemon(model, fx);
+            }
             // A full reconnect attempt: re-read the token, then poll.
             attemptConnect(model, fx);
         },
