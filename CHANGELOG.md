@@ -7,6 +7,64 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-28
+
+Notary can now sign for the app it is shipped inside, not only for clients that
+reach it over a relay. The two are deliberately not the same daemon.
+
+### Added
+
+- **Signing for an app on this machine.** Notary serves `nostr.signer_ipc` on
+  the same loopback channel its window already used, so an app that ships Notary
+  can ask for a signature without a relay round trip.
+
+  Which app may ask is settled by construction rather than by a credential. The
+  daemon is started BY the app it signs for and is handed a one-time secret on
+  stdin. That channel has no name, no path and no port, so nothing else on the
+  machine can reach it, and holding it is the whole of the proof.
+
+  This replaces a bearer token in a `0600` file. Measured on a Mac: a file like
+  that separates USERS, not apps, so every app you run could read it; a
+  process's argv and environment leak the same way; a pipe from a parent does
+  not.
+
+- **Two modes, never both.** `--serve-relays` makes the daemon a bunker on real
+  relays, where a client proves who it is with its own keypair. Without it the
+  daemon serves only the app that started it and connects to no relay. A
+  keyholder that any local app can reach would have to answer "which app is
+  this", and on the desktop nothing can.
+
+- **One key, one keyholder.** Two processes cannot share a decrypted key, so a
+  second daemon is refused rather than asking for the passphrase again. The
+  refusal is decided before the passphrase is read, so a correct one is never
+  reported as wrong.
+
+- **Per-app answers on the local path**, by method and by event kind. Signing a
+  note and signing a contact list are different risks. "Allow once" grants
+  exactly one request and is spent on collection.
+
+- **An audit log**, beside the key and readable only by you. Every use of the
+  key, wrong passphrases, exports and adopted clients. By the id of what was
+  signed, never its content; by peer and count for a cipher batch, never the
+  messages.
+
+### Fixed
+
+- **`/setup` could mint a key over an import.** It inferred create-versus-import
+  from an empty secret, so a client that meant to import and sent nothing was
+  given a brand new identity. It takes an explicit method now.
+
+- **Kinds 14 and 15 are refused on every path.** They are the unsigned rumors
+  inside a NIP-59 gift wrap, and a signature on one destroys the deniability the
+  scheme exists for. The relay path used to show that request to a person
+  instead, which is worse than refusing it.
+
+- Unanswered local questions expire, so they cannot fill the approval queue and
+  stop every other question, relay requests included.
+
+- A failed audit-log rollover no longer writes over the oldest entries.
+
+
 ## [0.9.2] - 2026-08-27
 
 ### Fixed
