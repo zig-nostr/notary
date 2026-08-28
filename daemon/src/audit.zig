@@ -100,12 +100,24 @@ pub const Log = struct {
         // that was supposed to answer a question comes up empty.
         if (end + bytes.len > max_bytes) {
             file.close(io);
-            self.roll(io);
+            if (!self.roll(io)) {
+                // The rename did not happen, so the old file is still there and
+                // still full. Assuming otherwise and writing at offset zero
+                // would paint this line over the START of the history, which is
+                // the worst possible outcome for a log: not a gap, a forgery.
+                // Better to lose this line than to corrupt the ones before it.
+                return;
+            }
             file = self.dir.createFile(io, self.path, .{
                 .truncate = false,
                 .permissions = std.Io.File.Permissions.fromMode(0o600),
             }) catch return;
-            end = 0;
+            // Re-read rather than assume. The rename succeeded, but between it
+            // and this open anything could have put a file back.
+            end = if (file.stat(io)) |st| st.size else |_| {
+                file.close(io);
+                return;
+            };
         }
         defer file.close(io);
 
@@ -116,11 +128,13 @@ pub const Log = struct {
         w.interface.flush() catch return;
     }
 
-    fn roll(self: *Log, io: std.Io) void {
+    /// Moves the full log aside, saying whether it actually happened.
+    fn roll(self: *Log, io: std.Io) bool {
         var old: [1024]u8 = undefined;
-        if (self.path.len + 2 > old.len) return;
-        const prev = std.fmt.bufPrint(&old, "{s}.1", .{self.path}) catch return;
-        self.dir.rename(self.path, self.dir, prev, io) catch {};
+        if (self.path.len + 2 > old.len) return false;
+        const prev = std.fmt.bufPrint(&old, "{s}.1", .{self.path}) catch return false;
+        self.dir.rename(self.path, self.dir, prev, io) catch return false;
+        return true;
     }
 };
 
@@ -287,4 +301,38 @@ test "a full log is rolled to one side, not thrown away" {
     const kept = try tmp.dir.readFileAlloc(io, "audit.log.1", gpa, .unlimited);
     defer gpa.free(kept);
     try testing.expectEqual(max_bytes, kept.len);
+}
+
+test "a rollover that did not happen never writes over the history" {
+    // The failure this exists for is not a gap, it is a forgery. If the rename
+    // is refused and the code assumes it worked, the next line lands at offset
+    // zero, on top of the OLDEST entries, and the file still parses. A reader
+    // would be looking at a log whose beginning is somebody else's afternoon.
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const filler = try gpa.alloc(u8, max_bytes);
+    defer gpa.free(filler);
+    @memset(filler, 'x');
+    // A recognisable head, so overwriting it is visible rather than inferred.
+    @memcpy(filler[0..5], "HEAD.");
+    try tmp.dir.writeFile(io, .{ .sub_path = "audit.log", .data = filler });
+
+    // A DIRECTORY where the rolled-aside file would go. Renaming a file onto a
+    // directory is refused by the OS, which is the failure without simulating
+    // one.
+    try tmp.dir.createDirPath(io, "audit.log.1");
+
+    var log = Log{ .dir = tmp.dir, .path = "audit.log" };
+    log.note(io, 9, .{ .what = "sign", .outcome = "ok" });
+
+    const after = try tmp.dir.readFileAlloc(io, "audit.log", gpa, .unlimited);
+    defer gpa.free(after);
+    try testing.expectEqual(max_bytes, after.len);
+    try testing.expectEqualStrings("HEAD.", after[0..5]);
+    // And the line that could not be filed is simply absent, rather than
+    // sitting where the history used to be.
+    try testing.expect(std.mem.indexOf(u8, after, "\"what\":\"sign\"") == null);
 }

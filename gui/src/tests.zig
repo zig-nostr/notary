@@ -71,22 +71,33 @@ test "a window looks for a daemon before starting one" {
     // exclusively: the loser exits, and this window waits for something that is
     // never coming while a perfectly good daemon is already serving.
 
-    // Nothing is answering and this window has started nothing: its turn.
-    try testing.expect(main.shouldStartDaemonForTest(true, false, 0, .connecting));
-    try testing.expect(main.shouldStartDaemonForTest(true, false, 0, .disconnected));
+    // Nothing is answering and this window has started nothing: its turn, once
+    // one attempt has actually come back empty. Not on the very first tick,
+    // when the first connect may still be in flight.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .connecting));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, false, 1, .disconnected));
+
+    // But a window that ATTACHED to somebody else's daemon must not start a
+    // second one over a single dropped poll: the new one loses the race for a
+    // port the first holds exclusively and exits, for no reason a reader could
+    // see. It waits for the same run of silence as one that spawned.
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 1, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, true, 2, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, false, true, 3, .disconnected));
 
     // Something IS answering. Attaching to a daemon somebody else started is
     // the ordinary case, not a fallback.
-    try testing.expect(!main.shouldStartDaemonForTest(true, false, 0, .connected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, false, false, 0, .connected));
 
     // Already started one. A second races the first onto a port held
     // exclusively, and the loser exits.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, 0, .connecting));
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, 2, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .connecting));
 
     // Attached mode was pointed at somebody else's daemon on purpose.
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, 0, .connecting));
-    try testing.expect(!main.shouldStartDaemonForTest(false, false, 0, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .connecting));
+    try testing.expect(!main.shouldStartDaemonForTest(false, false, false, 0, .disconnected));
 }
 
 test "a detached daemon that dies is noticed by silence, since nothing reports it" {
@@ -99,14 +110,14 @@ test "a detached daemon that dies is noticed by silence, since nothing reports i
     // So a run of ticks that reached nothing is the only evidence there is,
     // and without this the window would retry a dead address forever while
     // refusing to start a replacement, because it had started one once.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, 2, .disconnected));
-    try testing.expect(main.shouldStartDaemonForTest(true, true, 3, .disconnected));
-    try testing.expect(main.shouldStartDaemonForTest(true, true, 200, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 2, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 3, .disconnected));
+    try testing.expect(main.shouldStartDaemonForTest(true, true, false, 200, .disconnected));
 
     // Still not while something is answering, however long the run was.
-    try testing.expect(!main.shouldStartDaemonForTest(true, true, 200, .connected));
+    try testing.expect(!main.shouldStartDaemonForTest(true, true, false, 200, .connected));
     // And still never in attached mode: that daemon is somebody else's.
-    try testing.expect(!main.shouldStartDaemonForTest(false, true, 200, .disconnected));
+    try testing.expect(!main.shouldStartDaemonForTest(false, true, false, 200, .disconnected));
 }
 
 test "the window does not report a stopped signer when the daemon merely detached" {

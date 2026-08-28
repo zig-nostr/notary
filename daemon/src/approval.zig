@@ -196,7 +196,19 @@ pub const Broker = struct {
     /// Persisting these means binding them to the key, not writing them beside
     /// it.
     permissions: nip46.Permissions = .{},
+    /// When this daemon last did something for somebody, in milliseconds.
+    ///
+    /// Lives here rather than on the loopback server because BOTH ways in have
+    /// to wind it. It was on the server, counting only local traffic, which
+    /// meant a daemon serving a phone over relays with no window open looked
+    /// idle no matter how much signing it was doing, and would clock out in the
+    /// middle of it. Relays are the other half of what this daemon is for.
+    last_request_ms: std.atomic.Value(i64) = .init(0),
     one_shots: [8]OneShot = [_]OneShot{.{}} ** 8,
+
+    pub fn touch(self: *Broker, now_ms: i64) void {
+        self.last_request_ms.store(now_ms, .monotonic);
+    }
 
     fn acquire(self: *Broker) void {
         while (self.lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
@@ -316,7 +328,11 @@ pub const Broker = struct {
     /// Deduplicated on exactly what an answer covers, because a client that
     /// retries every second would otherwise fill all thirty-two slots with one
     /// question inside a minute, and bury every other app's under it.
-    pub fn knock(self: *Broker, info: Pending) bool {
+    /// Says whether this call FILED the question or found it already there.
+    /// The caller uses that to decide whether anything is worth writing down:
+    /// a retry is not news, and a client whose every retry produced a line
+    /// could roll the audit log away simply by asking often enough.
+    pub fn knock(self: *Broker, info: Pending) Knock {
         self.acquire();
         for (&self.slots) |*slot| {
             if (!slot.in_use or slot.decision.load(.monotonic) != .pending) continue;
@@ -325,11 +341,41 @@ pub const Broker = struct {
                 std.mem.eql(u8, &slot.info.client_id, &info.client_id))
             {
                 self.release();
-                return true;
+                return .already_asked;
             }
         }
         self.release();
-        return self.claim(info, false) != null;
+        return if (self.claim(info, false) != null) .filed else .no_room;
+    }
+
+    pub const Knock = enum { filed, already_asked, no_room };
+
+    /// Drops questions from the local protocol that nobody has answered.
+    ///
+    /// A relay request cannot leave one behind: the thread that asked is
+    /// parked on the slot and frees it when the broker times out. A local one
+    /// has nobody, so an unanswered question stayed in the queue for good, and
+    /// thirty-two of them filled it permanently. An app can raise a distinct
+    /// question per event KIND, so getting there costs one badly-behaved app a
+    /// few seconds, and once the queue is full nothing else can be asked about
+    /// either, relay requests included: the signer stops asking and starts
+    /// refusing.
+    ///
+    /// The same clock a waiting relay thread uses, so both kinds of question
+    /// have the same patience.
+    pub fn expireUnanswered(self: *Broker, now_s: i64) void {
+        const limit_s = @as(i64, @intCast(self.timeout_ms / 1000));
+        self.acquire();
+        var dropped = false;
+        for (&self.slots) |*slot| {
+            if (!slot.in_use or slot.waiter) continue;
+            if (slot.decision.load(.monotonic) != .pending) continue;
+            if (now_s - slot.info.created_at < limit_s) continue;
+            slot.in_use = false;
+            dropped = true;
+        }
+        self.release();
+        if (dropped) _ = self.version.fetchAdd(1, .monotonic);
     }
 
     fn claim(self: *Broker, info: Pending, waiter: bool) ?usize {
@@ -476,12 +522,29 @@ fn touchesKey(method_name: []const u8) bool {
 fn decide(ctx: ?*anyopaque, request: *const nip46.Request, client: [32]u8) nip46.Decision {
     const self: *const Interactive = @ptrCast(@alignCast(ctx.?));
 
+    // Somebody is using this daemon, even though nothing on this machine is.
+    // Without it a bunker serving a phone reads as abandoned and clocks out
+    // mid-conversation.
+    self.broker.touch(std.Io.Timestamp.now(self.io, .awake).toMilliseconds());
+
     // The static allowlist is the first gate: a disallowed request is denied
     // outright and never bothers the human.
     if (self.config.policy().decide(request, client) == .reject) return .reject;
 
     // Only a request that uses the key is worth waking somebody up for.
     if (!touchesKey(request.method)) return .approve;
+
+    // Kinds 14 and 15 are the UNSIGNED rumors inside a NIP-59 gift wrap, and a
+    // signature on one destroys the deniability the whole scheme exists for.
+    // The local protocol refused them from the day it was written; this side
+    // did not, so a client that reached the same key over a relay could still
+    // ask, and the answer was a prompt rather than a refusal. Refused before
+    // the human, because it is not a judgement call: there is no circumstance
+    // in which the right answer is yes, and putting it on the queue teaches
+    // somebody to approve the one request that should never have been shown.
+    if (nostr.nip46.signEventKind(self.gpa, request)) |k| {
+        if (k == 14 or k == 15) return .reject;
+    }
 
     // Already answered, and the answer has not lapsed. This is what stops
     // Notary asking about the same thing forever: the operator says "always" or
@@ -840,7 +903,7 @@ test "answered local questions do not fill the queue for good" {
     for (0..Broker.capacity * 2) |i| {
         var info = Pending{ .local = true, .kind = @intCast(i), .method_id = .sign_event };
         info.client_id = [_]u8{7} ** 32;
-        try testing.expect(broker.knock(info));
+        try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
         // One at a time, so a slot that was not freed is the only way to run out.
         try testing.expectEqual(@as(usize, 1), broker.snapshot(&q));
         // `.once` is never written down, so every turn is a fresh question
@@ -848,4 +911,89 @@ test "answered local questions do not fill the queue for good" {
         try testing.expect(broker.resolveFor(q[0].id, .reject, .once, 0));
         try testing.expectEqual(@as(usize, 0), broker.snapshot(&q));
     }
+}
+
+test "one app cannot fill the queue and stop every other question" {
+    // A local question has nobody parked on it to time it out, so it stayed in
+    // the queue for good. An app raises a distinct question per event KIND, so
+    // thirty-two of them costs a badly-behaved app a few seconds, and once the
+    // queue is full nothing can be asked about at all: relay requests included,
+    // because they share these slots. The signer stops asking and starts
+    // refusing, which looks exactly like a signer that is working.
+    var broker = Broker{ .timeout_ms = 120_000 };
+    const start: i64 = 1_700_000_000;
+
+    for (0..Broker.capacity) |i| {
+        var info = Pending{
+            .local = true,
+            .kind = @intCast(i),
+            .method_id = .sign_event,
+            .client_id = [_]u8{9} ** 32,
+            .created_at = start,
+        };
+        info.client_len = 0;
+        try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
+    }
+
+    // Full, and a relay request cannot get in. This is the wedge.
+    var q: [Broker.capacity]Pending = undefined;
+    try testing.expectEqual(Broker.capacity, broker.snapshot(&q));
+    const relay = Pending{ .kind = 1, .method_id = .sign_event, .client_id = [_]u8{1} ** 32, .created_at = start };
+    try testing.expectEqual(Broker.Knock.no_room, broker.knock(relay));
+
+    // Nothing expires before the same patience a waiting relay thread gets.
+    broker.expireUnanswered(start + 119);
+    try testing.expectEqual(Broker.capacity, broker.snapshot(&q));
+
+    // And then they all go, because nobody answered any of them.
+    broker.expireUnanswered(start + 120);
+    try testing.expectEqual(@as(usize, 0), broker.snapshot(&q));
+    try testing.expectEqual(Broker.Knock.filed, broker.knock(relay));
+}
+
+test "a question somebody is waiting on is never expired out from under them" {
+    // The relay path frees its own slots when the broker times out, and that
+    // thread is still parked reading the decision off this slot. Dropping it
+    // here would hand the same slot to somebody else while a relay thread is
+    // still looking at it.
+    var broker = Broker{ .timeout_ms = 1000 };
+    const start: i64 = 1_700_000_000;
+    const idx = broker.claim(.{ .kind = 1, .created_at = start }, true).?;
+    broker.expireUnanswered(start + 10_000);
+    try testing.expect(broker.slots[idx].in_use);
+}
+
+test "a gift-wrap rumor is refused over a relay too, without asking anybody" {
+    // The local protocol refused kinds 14 and 15 from the day it was written.
+    // This side did not, so a client that reached the same key over a relay
+    // could still ask for one, and what it got was a PROMPT. That is worse
+    // than a hole: it teaches somebody to approve the one request that should
+    // never have been shown to them.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker = Broker{ .timeout_ms = 400 };
+    var cfg = PolicyConfig{ .gpa = testing.allocator };
+    const inter = Interactive{ .broker = &broker, .config = &cfg, .io = io, .gpa = testing.allocator };
+    const p = inter.asPolicy();
+    const client = [_]u8{4} ** 32;
+
+    for ([_]u16{ 14, 15 }) |kind| {
+        var buf: [128]u8 = undefined;
+        const tmpl = try std.fmt.bufPrint(&buf, "{{\"kind\":{d},\"content\":\"hi\",\"tags\":[],\"created_at\":1}}", .{kind});
+        const req = nip46.Request{ .id = "1", .method = "sign_event", .params = &[_][]const u8{tmpl} };
+        const before = broker.version.load(.monotonic);
+        try testing.expectEqual(nip46.Decision.reject, p.decide(&req, client));
+        // And nobody was woken up about it.
+        try testing.expectEqual(before, broker.version.load(.monotonic));
+    }
+
+    // An ordinary note still reaches the queue, so this is a refusal of two
+    // kinds rather than of signing.
+    const ok_tmpl = "{\"kind\":1,\"content\":\"hi\",\"tags\":[],\"created_at\":1}";
+    const ok_req = nip46.Request{ .id = "2", .method = "sign_event", .params = &[_][]const u8{ok_tmpl} };
+    const before = broker.version.load(.monotonic);
+    _ = p.decide(&ok_req, client); // times out into a reject; the queue is the point
+    try testing.expect(broker.version.load(.monotonic) != before);
 }

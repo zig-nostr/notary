@@ -80,15 +80,6 @@ pub const Server = struct {
     /// Filled by `bind`, consumed by `run`. Null until bound.
     listener: ?net.Server = null,
 
-    /// When the last authorized request arrived, or when the daemon bound its
-    /// port if none has.
-    ///
-    /// Every request touches it, including the polls both windows run while
-    /// they are open, which is what makes it a usable measure of "is anybody
-    /// there": a reader looking at either window is a steady stream of
-    /// requests, and silence means every app that was using this daemon has
-    /// gone.
-    last_request_ms: std.atomic.Value(i64) = .init(0),
     /// How long that silence may last before the daemon exits. Zero stays up
     /// forever.
     idle_exit_ms: i64 = 0,
@@ -192,7 +183,7 @@ pub const Server = struct {
         // goes. Measured live: with the clock starting at the first request
         // instead, a daemon that was only ever knocked on by something without
         // the token stayed up indefinitely.
-        self.last_request_ms.store(std.Io.Timestamp.now(io, .awake).toMilliseconds(), .monotonic);
+        self.broker.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
     }
 
     /// Serves forever on the calling thread, binding first if nobody has.
@@ -271,7 +262,11 @@ fn runReaper(self: *Server) void {
         io.sleep(std.Io.Duration.fromSeconds(1), .awake) catch {};
         const now = std.Io.Timestamp.now(io, .awake).toMilliseconds();
         self.reapStale(io, now);
-        if (idleExpired(self.idle_exit_ms, self.last_request_ms.load(.monotonic), now))
+        // Questions from the local protocol have nobody waiting to time them
+        // out, so this is where they go. Without it, thirty-two unanswered
+        // ones fill the queue for good and nothing can be asked about again.
+        self.broker.expireUnanswered(std.Io.Timestamp.now(io, .real).toSeconds());
+        if (idleExpired(self.idle_exit_ms, self.broker.last_request_ms.load(.monotonic), now))
             exitIdle(self, io);
     }
 }
@@ -381,7 +376,7 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
     // Somebody is here. Stamped AFTER the credential check, so a stranger
     // cannot keep the key alive by knocking: the clock means "the apps allowed
     // to use this are still around", and failed attempts are not those apps.
-    self.last_request_ms.store(std.Io.Timestamp.now(io, .awake).toMilliseconds(), .monotonic);
+    self.broker.touch(std.Io.Timestamp.now(io, .awake).toMilliseconds());
 
     // Assemble the body: bytes already read after the head, plus any remainder.
     //
@@ -986,9 +981,25 @@ fn localAllowed(
     @memcpy(info.client_buf[0..name.len], name);
     info.client_len = @intCast(name.len);
     info.preview_len = approval.previewOf(preview, &info.preview_buf);
-    _ = self.broker.knock(info);
+    // Only a question actually FILED is worth a line. A client that retries
+    // every second is not news, and one whose every retry wrote a line could
+    // roll the audit log away by asking often enough.
+    switch (self.broker.knock(info)) {
+        .filed => note(self, io, .{ .what = what, .outcome = "awaiting", .who = name, .local = true, .method = method.name(), .kind = kind }),
+        .already_asked => {},
+        // The queue is full, so nobody will ever see this question. Answering
+        // "awaiting approval" would send the client away to wait for something
+        // that was never asked.
+        // The queue is full, so nobody will ever see this question. Answering
+        // "awaiting approval" would send the client away to wait for something
+        // that was never asked.
+        .no_room => {
+            note(self, io, .{ .what = what, .outcome = "no room", .who = name, .local = true, .method = method.name(), .kind = kind });
+            try respondIpcError(self, w, 503, ipc.reason_refused);
+            return false;
+        },
+    }
 
-    note(self, io, .{ .what = what, .outcome = "awaiting", .who = name, .local = true, .method = method.name(), .kind = kind });
     try respondIpcError(self, w, 403, ipc.reason_awaiting_approval);
     return false;
 }
@@ -1909,7 +1920,7 @@ test "an app cannot name itself out of the queue's JSON" {
     info.method_len = 10;
     @memcpy(info.client_buf[0..hostile.len], hostile);
     info.client_len = @intCast(hostile.len);
-    try testing.expect(broker.knock(info));
+    try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
 
     var out = std.Io.Writer.Allocating.init(gpa);
     defer out.deinit();
@@ -2110,12 +2121,12 @@ test "the idle clock is only wound by a caller that presented the token" {
     const auth_at = std.mem.indexOf(u8, src, "if (!authOk(auth, self.token)) return respond").?;
     // The request handler's stamp, not `bind`'s: both write the same field,
     // and only one of them is on the path a caller can reach.
-    const stamp_at = std.mem.indexOfPos(u8, src, auth_at, "self.last_request_ms.store(").?;
+    const stamp_at = std.mem.indexOfPos(u8, src, auth_at, "self.broker.touch(").?;
     try testing.expect(auth_at < stamp_at);
     // And there is no OTHER stamp between the head being read and the check,
     // which is where an unauthorized caller would slip one in.
     const head_at = std.mem.indexOf(u8, src, "const request_line = lines.next()").?;
-    try testing.expect(std.mem.indexOfPos(u8, src, head_at, "self.last_request_ms.store(").? == stamp_at);
+    try testing.expect(std.mem.indexOfPos(u8, src, head_at, "self.broker.touch(").? == stamp_at);
 }
 
 test "Allow once actually lets one request through, and only one" {
@@ -2193,7 +2204,7 @@ test "a one-shot answer covers only the question it answered" {
     const other = nostr.signer_ipc.clientId("something-else");
 
     var info = Pending{ .local = true, .kind = 1, .method_id = .sign_event, .client_id = plaza };
-    try testing.expect(broker.knock(info));
+    try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
     var q: [Broker.capacity]Pending = undefined;
     _ = broker.snapshot(&q);
     try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
@@ -2212,7 +2223,7 @@ test "a one-shot answer covers only the question it answered" {
     // An answer nobody came back for lapses, so it cannot be spent by whatever
     // asks next: the app it was given to may have been closed in between.
     info.kind = 7;
-    try testing.expect(broker.knock(info));
+    try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
     _ = broker.snapshot(&q);
     try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
     try testing.expect(broker.takeOneShot(plaza, .sign_event, 7, 1_000_000 + Broker.one_shot_ms) == null);

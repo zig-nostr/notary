@@ -420,6 +420,12 @@ pub const Model = struct {
     /// is no longer a child, so nothing reports its exit; a socket that stops
     /// answering is the whole signal.
     connect_failures: u8 = 0,
+    /// Whether anything has ever answered on this address.
+    ///
+    /// Separates "there is no daemon here" from "the daemon I was talking to
+    /// went quiet for a moment". Those need opposite responses and looked
+    /// identical to a window that had not spawned anything itself.
+    ever_connected: bool = false,
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
     onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
@@ -976,15 +982,21 @@ const managed_bind_address = "127.0.0.1:8787";
 ///   - connected: something is already serving, which is the ordinary case now
 ///     rather than a fallback. Another app may have started it, or the reader
 ///     may have opened Notary before Plaza.
-fn shouldStartDaemon(managed: bool, spawned: bool, failures: u8, phase: Phase) bool {
+fn shouldStartDaemon(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
     if (!managed) return false;
     if (phase == .connected) return false;
-    if (!spawned) return true;
-    // One was started from here, and it detached, so its death is not reported
-    // to this window any more: it stopped being a child the moment it forked.
-    // A run of ticks that reached nothing is the only evidence there is, and
-    // waiting for a run rather than acting on one failure is what keeps a
-    // daemon that is merely slow to bind from being raced by a second.
+    // Nothing has ever answered here and this window has started nothing: its
+    // turn, once an attempt has actually come back empty.
+    if (!spawned and !ever_connected) return failures >= 1;
+    // Otherwise something WAS there: either this window started it, or it
+    // attached to a daemon somebody else did. Either way its death is not
+    // reported here, because a detached daemon is nobody's child, so a run of
+    // ticks that reached nothing is the only evidence there is.
+    //
+    // Waiting for the run matters most in the ATTACHED case. A single dropped
+    // poll against a perfectly healthy daemon would otherwise start a second
+    // one, which loses the race for a port the first holds exclusively and
+    // exits, for no reason the reader could see.
     return failures >= respawn_after_failures;
 }
 
@@ -996,8 +1008,8 @@ fn shouldStartDaemon(managed: bool, spawned: bool, failures: u8, phase: Phase) b
 /// quietly taking over the address.
 const respawn_after_failures: u8 = 3;
 
-pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, failures: u8, phase: Phase) bool {
-    return shouldStartDaemon(managed, spawned, failures, phase);
+pub fn shouldStartDaemonForTest(managed: bool, spawned: bool, ever_connected: bool, failures: u8, phase: Phase) bool {
+    return shouldStartDaemon(managed, spawned, ever_connected, failures, phase);
 }
 
 /// Whether this exit is a daemon that detached, rather than one that failed.
@@ -1401,6 +1413,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 200 => {
                     model.phase = .connected;
                     model.connect_failures = 0; // something answered
+                    model.ever_connected = true;
                     parsePending(model, r.body);
                     pollPending(model, fx); // re-arm the long-poll chain
                 },
@@ -1431,7 +1444,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // to attach to and this window may start one. Only in managed mode,
             // and only once: attached mode was pointed at somebody else's
             // daemon on purpose, and a second spawn would race the first.
-            if (shouldStartDaemon(model.managed, model.spawned, model.connect_failures, model.phase)) {
+            if (shouldStartDaemon(model.managed, model.spawned, model.ever_connected, model.connect_failures, model.phase)) {
                 model.connect_failures = 0; // this attempt gets its own run
                 spawnDaemon(model, fx);
             }
