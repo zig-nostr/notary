@@ -620,11 +620,21 @@ fn handleExport(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     if (!raw and !eql(parsed.value.form, "ncryptsec"))
         return respond(w, 400, "{\"error\":\"form must be ncryptsec or nsec\"}");
 
-    const key = self.gate.exportKey(io, self.gpa, parsed.value.passphrase, raw) catch |err| return switch (err) {
-        error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
-        error.NotInitialized => respond(w, 409, "{\"error\":\"no key\"}"),
-        else => respond(w, 500, "{\"error\":\"could not read the key\"}"),
+    const key = self.gate.exportKey(io, self.gpa, parsed.value.passphrase, raw) catch |err| {
+        // A refused export is worth as much as an allowed one. Somebody
+        // guessing at the passphrase is guessing at the key itself, and this
+        // is the endpoint that hands it over whole.
+        note(self, io, .{ .what = "export", .outcome = if (err == error.BadPassphrase) "bad" else "error", .method = parsed.value.form });
+        return switch (err) {
+            error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
+            error.NotInitialized => respond(w, 409, "{\"error\":\"no key\"}"),
+            else => respond(w, 500, "{\"error\":\"could not read the key\"}"),
+        };
     };
+    // The key left this machine. Nothing else the daemon does compares, and
+    // until now the only record of it was the operator's memory. Which FORM,
+    // too: an ncryptsec is still behind the passphrase, an nsec is not.
+    note(self, io, .{ .what = "export", .outcome = "ok", .method = parsed.value.form });
     defer {
         std.crypto.secureZero(u8, key);
         self.gpa.free(key);
@@ -730,6 +740,12 @@ fn handleNostrConnect(self: *Server, io: std.Io, w: *std.Io.Writer, body: []cons
     // AFTER it is out, not before. Authorizing a client we failed to answer
     // leaves a grant standing for a connection that never happened.
     clients.authorize(uri.value.client_pubkey);
+    // Which key was let in, and when. Adopting a client is the moment somebody
+    // else gains the ability to ask this daemon for signatures; the requests
+    // that follow are all downstream of this line.
+    var who: [64]u8 = undefined;
+    _ = std.fmt.bufPrint(&who, "{x}", .{uri.value.client_pubkey}) catch unreachable;
+    note(self, io, .{ .what = "connect", .outcome = "ok", .who = &who, .local = false });
     return respond(w, 200, "{\"ok\":true}");
 }
 
@@ -1873,4 +1889,59 @@ test "a wrong passphrase is written down, because a run of them is the only warn
     try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"unlock\"") != null);
     // The attempt, never the attempt's passphrase.
     try testing.expect(std.mem.indexOf(u8, written, "hunter2") == null);
+}
+
+test "the key leaving the machine is written down, in the form it left as" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A real encrypted key file, so the export is the real path rather than an
+    // early refusal that would prove nothing about it.
+    const secret = [_]u8{0xab} ** 32;
+    const passphrase = "correct horse battery staple";
+    const ncryptsec = try nostr.keystore.encryptKey(gpa, io, secret, passphrase, .known_secure);
+    defer gpa.free(ncryptsec);
+    try nostr.keystore.writeNewKeyFile(io, tmp.dir, "key.ncryptsec", ncryptsec);
+
+    var log = audit.Log{ .dir = tmp.dir, .path = "audit.log" };
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .log = &log, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    // Wrong passphrase first: somebody guessing at the passphrase is guessing
+    // at the key, and this endpoint hands it over whole.
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleExport(&server, io, &out.writer, "{\"passphrase\":\"wrong\",\"form\":\"nsec\"}");
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "401") != null);
+    }
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        const req = try std.fmt.allocPrint(gpa, "{{\"passphrase\":\"{s}\",\"form\":\"nsec\"}}", .{passphrase});
+        defer gpa.free(req);
+        try handleExport(&server, io, &out.writer, req);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"ok\":true") != null);
+    }
+
+    const written = try tmp.dir.readFileAlloc(io, "audit.log", gpa, .unlimited);
+    defer gpa.free(written);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, written, "\n"));
+    try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"export\",\"outcome\":\"bad\"") != null);
+    // The form matters: an ncryptsec that leaves is still behind the
+    // passphrase, an nsec is not, and a reader of this log needs to know which
+    // of those is loose.
+    try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"export\",\"outcome\":\"ok\",\"method\":\"nsec\"") != null);
+
+    // Never the key, and never the passphrase that opened it.
+    try testing.expect(std.mem.indexOf(u8, written, "nsec1") == null);
+    try testing.expect(std.mem.indexOf(u8, written, passphrase) == null);
+    try testing.expect(std.mem.indexOf(u8, written, "wrong") == null);
 }
