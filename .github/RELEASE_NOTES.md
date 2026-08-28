@@ -1,12 +1,22 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
-### What's new in v0.9.2
+### What's new in v0.10.1
 
-**The passphrase field no longer shows the passphrase.** Both setup screens and the backup panel drew every character as you typed it, which is the wrong default for something people type in a cafe, on a call, or into a screen recording. They draw stars now, with an eye beside the field for the times you want to read back what you typed.
+**Notary can sign for the app it is shipped inside**, not only for clients that reach it over a relay. The two are deliberately not the same daemon.
 
-It starts hidden every launch, and goes back to hidden after each send. Hiding it also keeps the characters out of the name the window publishes for that field, which is where anything on your Mac with accessibility access could have read them.
+Which app may ask is settled by construction rather than by a credential. The daemon is started *by* the app it signs for and handed a one-time secret on its stdin. That channel has no name, no path and no port, so nothing else on your Mac can reach it, and holding it is the whole of the proof.
 
-One rough edge, and it belongs to the toolkit rather than to Notary: replacing selected text with exactly as many characters leaves the typed ones on screen until your next keystroke. Reveal the field if you want to edit the middle of a passphrase.
+This replaces a token in a `0600` file. Measured on a Mac: a file like that separates *users*, not apps, so every app you run could read it. A process's arguments and its environment leak the same way. A pipe from a parent does not.
+
+**Two modes, never both.** Run Notary on its own and it is a bunker on real relays, where a client proves who it is with its own keypair. Started by an app that ships it, it serves only that app and connects to no relay. A keyholder that any local app can reach would have to answer "which app is this", and on the desktop nothing can.
+
+Whether it *also* answers your other devices is Notary's own setting, in Notary's window, stored beside the key. The app that starts it has no say and stores nothing.
+
+**One key, one keyholder.** Two processes cannot share a decrypted key, so a second Notary is refused instead of asking for your passphrase again. The refusal is decided before the passphrase is read, so a correct one is never reported as wrong.
+
+**An audit log**, beside the key and readable only by you: every use of the key, wrong passphrases, exports, and clients you let in. By the id of what was signed, never its content; by peer and count for a batch of messages, never the messages.
+
+**Fixed:** setup could mint a new key over an import that arrived empty, giving you a brand new identity instead of the one you meant to bring. Gift-wrap rumors (kinds 14 and 15) were refused on one path and shown to you as a prompt on the other. Unanswered local requests could fill the approval queue and stop every other request, including those from relays.
 
 ### Install
 
