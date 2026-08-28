@@ -74,6 +74,17 @@
     </column>
     <separator/>
   </if>
+  <if test="{show_serving}">
+    <column gap="6" padding="16">
+      <text foreground="text_muted">Other devices</text>
+      <row gap="8" cross="center">
+        <text grow="1" wrap="true">{serve_relays_line}</text>
+        <button on-press="toggle_relays">{serve_relays_action}</button>
+      </row>
+      <text foreground="text_muted" wrap="true">{serve_relays_hint}</text>
+    </column>
+    <separator/>
+  </if>
   <if test="{show_relays}">
     <column gap="6" padding="16">
       <text foreground="text_muted">Relays</text>

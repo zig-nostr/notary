@@ -4,7 +4,8 @@
 //! Deliberately tiny (fixed routes, no keep-alive, no chunked encoding) to keep
 //! the key-holding daemon's attack surface small:
 //!
-//!   GET  /info              {"state":..,"pubkey":..,"bunker":..,"relays":[{"url":..,"status":..}],"timeout_ms":N}
+//!   GET  /info              {"state":..,"pubkey":..,"bunker":..,"serve_relays":bool,"relays":[..],"timeout_ms":N}
+//!   POST /relays            {"on":bool} → whether to answer clients over relays
 //!   POST /setup             {"passphrase":..,"secret":..?} → create/import a key
 //!   POST /unlock            {"passphrase":..} → decrypt the key file
 //!   POST /lock              → clear sessions and exit, keeping the key
@@ -54,6 +55,12 @@ pub const Info = struct {
     /// Live per-relay status, parallel to `relays` (the relay threads update it,
     /// `/info` reads it). Null in headless mode, where nothing serves `/info`.
     relay_status: ?[]std.atomic.Value(u8) = null,
+    /// Whether this daemon answers clients over relays, and where that answer
+    /// is written down. The setting belongs to the KEYHOLDER: an app that
+    /// embeds Notary starts it and asks for nothing, because whether the key
+    /// serves other devices is not a client's decision.
+    serve_relays: bool = false,
+    conf_file: []const u8 = "",
 };
 
 pub const Server = struct {
@@ -423,6 +430,8 @@ fn handleConn(self: *Server, io: std.Io, stream: net.Stream) !void {
         return handleSetup(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/forget"))
         return handleForget(self, io, w, body);
+    if (eql(method, "POST") and eql(path, "/relays"))
+        return handleRelays(self, io, w, body);
     if (eql(method, "POST") and eql(path, "/lock"))
         return handleLock(self, io, w);
     if (eql(method, "POST") and eql(path, "/export"))
@@ -567,6 +576,54 @@ fn handleDecision(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8
     return respond(w, 200, j);
 }
 
+/// Whether the reader has asked this keyholder to answer other devices.
+///
+/// One line in a file this daemon owns, beside the key. Off when the file is
+/// missing or unreadable, because the safe reading of "I could not tell" is not
+/// to put the process holding a key on the network.
+pub fn readServeRelays(gpa: std.mem.Allocator, io: std.Io, path: []const u8) bool {
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, std.Io.Limit.limited(4096)) catch return false;
+    defer gpa.free(raw);
+    var lines = std.mem.splitScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        if (!std.mem.eql(u8, std.mem.trim(u8, line[0..eq], " \t"), "serve_relays")) continue;
+        return std.mem.eql(u8, std.mem.trim(u8, line[eq + 1 ..], " \t\r"), "on");
+    }
+    return false;
+}
+
+/// Writes that answer back. Best effort: a setting that cannot be saved is
+/// still worth honouring for this run, and saying so is the window's job.
+pub fn writeServeRelays(io: std.Io, path: []const u8, on: bool) void {
+    std.Io.Dir.cwd().writeFile(io, .{
+        .sub_path = path,
+        .data = if (on) "serve_relays=on\n" else "serve_relays=off\n",
+        .flags = .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
+    }) catch {};
+}
+
+/// POST /relays: whether this keyholder answers clients over relays.
+///
+/// The setting belongs here rather than in whatever app started this daemon. An
+/// app that embeds Notary is a client, and whether the key serves other devices
+/// is not a client's decision to make or to store.
+///
+/// Written now, applied on the next start: relay threads are created once, with
+/// the key, so a running daemon cannot grow or drop them. The window says so
+/// rather than pretending the switch was immediate.
+fn handleRelays(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !void {
+    const Body = struct { on: bool = false };
+    const parsed = std.json.parseFromSlice(Body, self.gpa, body, .{ .ignore_unknown_fields = true }) catch
+        return respond(w, 400, bad_request);
+    defer parsed.deinit();
+
+    if (self.info.conf_file.len == 0) return respond(w, 409, "{\"error\":\"no config file\"}");
+    writeServeRelays(io, self.info.conf_file, parsed.value.on);
+    note(self, io, .{ .what = "relays", .outcome = if (parsed.value.on) "on" else "off" });
+    return respond(w, 200, if (parsed.value.on) "{\"ok\":true,\"on\":true}" else "{\"ok\":true,\"on\":false}");
+}
+
 fn handleInfo(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
     // Ask the disk before answering. This is the poll the window sits on while
     // it is waiting to be set up or unlocked, so it is the one place that can
@@ -595,7 +652,7 @@ fn handleInfo(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
     defer json.deinit(self.gpa);
     // Relay URLs and the bunker URI carry no JSON metacharacters (the URI
     // percent-encodes relay params), so they are emitted without escaping.
-    const head = try std.fmt.allocPrint(self.gpa, "{{\"state\":\"{s}\",\"pubkey\":\"{s}\",\"bunker\":\"{s}\",\"timeout_ms\":{d},\"relays\":[", .{ state_str, pubkey, bunker, self.info.timeout_ms });
+    const head = try std.fmt.allocPrint(self.gpa, "{{\"state\":\"{s}\",\"pubkey\":\"{s}\",\"bunker\":\"{s}\",\"timeout_ms\":{d},\"serve_relays\":{s},\"relays\":[", .{ state_str, pubkey, bunker, self.info.timeout_ms, if (self.info.serve_relays) "true" else "false" });
     defer self.gpa.free(head);
     try json.appendSlice(self.gpa, head);
     for (self.info.relays, 0..) |relay, i| {
@@ -2205,4 +2262,37 @@ test "a one-shot answer covers only the question it answered" {
     _ = broker.snapshot(&q);
     try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
     try testing.expect(broker.takeOneShot(plaza, .sign_event, 7, 1_000_000 + Broker.one_shot_ms) == null);
+}
+
+test "the keyholder owns whether it answers other devices" {
+    // The setting used to live in the app that started this daemon, which made
+    // a client responsible for a keyholder's policy. It belongs here: an app
+    // that embeds Notary spawns it and asks for nothing.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/signer.conf", .{tmp.sub_path});
+    defer gpa.free(path);
+
+    // Missing means off. The safe reading of "I could not tell" is not to put
+    // the process holding a key on the network.
+    try testing.expect(!readServeRelays(gpa, io, path));
+
+    writeServeRelays(io, path, true);
+    try testing.expect(readServeRelays(gpa, io, path));
+    writeServeRelays(io, path, false);
+    try testing.expect(!readServeRelays(gpa, io, path));
+
+    // Only this user reads what the keyholder was told to do.
+    writeServeRelays(io, path, true);
+    const st = try std.Io.Dir.cwd().statFile(io, path, .{});
+    try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
+
+    // Anything unrecognised is off, not "probably on".
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "serve_relays=yes please\n" });
+    try testing.expect(!readServeRelays(gpa, io, path));
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "something_else=on\n" });
+    try testing.expect(!readServeRelays(gpa, io, path));
 }

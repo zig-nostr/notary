@@ -130,6 +130,7 @@ const clipboard_key: u64 = 7;
 /// rejected while the first is still in flight.
 const command_clipboard_key: u64 = 17;
 const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
+const relays_key: u64 = 17; // POST /relays
 const decision_key_base: u64 = 8;
 const decision_key_slots: u64 = 8;
 const retry_timer_key: u64 = 100;
@@ -310,6 +311,11 @@ pub const Model = struct {
     daemon_bin_len: usize = 0,
     /// True when `SIGNER_BIN` is set: the app spawns and supervises the daemon.
     managed: bool = false,
+    /// Whether this keyholder answers clients over relays, as the daemon
+    /// reports it. The setting lives with the key rather than with whatever app
+    /// started the daemon: an app that embeds Notary is a client, and whether
+    /// the key serves other devices is not a client's decision.
+    serve_relays: bool = false,
 
     // The bearer header value, built from the secret this window minted.
     auth_buf: [96]u8 = [_]u8{0} ** 96,
@@ -736,6 +742,25 @@ pub const Model = struct {
         return std.fmt.allocPrint(arena, "{s}…{s}", .{ pk[0..10], pk[pk.len - 8 ..] }) catch pk[0..20];
     }
 
+    pub fn serve_relays_line(self: *const Model) []const u8 {
+        return if (self.serve_relays)
+            "Answering your other devices over relays."
+        else
+            "Signing only for the app that started me.";
+    }
+
+    pub fn serve_relays_action(self: *const Model) []const u8 {
+        return if (self.serve_relays) "Stop" else "Start";
+    }
+
+    /// Says WHEN, because relay threads are created once with the key, so a
+    /// running daemon cannot grow or drop them. A switch that looks like it did
+    /// something and did not is worse than one that says so.
+    pub fn serve_relays_hint(self: *const Model) []const u8 {
+        _ = self;
+        return "Takes effect the next time the signer starts. Your other clients connect with the link above.";
+    }
+
     fn setPubkey(self: *Model, pk: []const u8) void {
         const n = @min(pk.len, self.pubkey_buf.len);
         @memcpy(self.pubkey_buf[0..n], pk[0..n]);
@@ -879,6 +904,10 @@ pub const Msg = union(enum) {
     info: native_sdk.EffectResponse,
     pending: native_sdk.EffectResponse,
     decided: native_sdk.EffectResponse,
+    /// The reader asked this keyholder to start, or stop, answering other
+    /// devices over relays.
+    toggle_relays,
+    relays_set: native_sdk.EffectResponse,
     tick: native_sdk.EffectTimer,
     // Four answers rather than two, Amber's shape: "not now", "for a while"
     // and "stop asking" are each one press, because a prompt with only yes and
@@ -1056,6 +1085,27 @@ fn pollPending(model: *Model, fx: *Effects) void {
         .headers = &headers,
         .timeout_ms = 35_000,
         .on_response = Effects.responseMsg(.pending),
+    });
+}
+
+/// Tells the daemon whether to answer clients over relays.
+fn sendServeRelays(model: *Model, fx: *Effects, on: bool) void {
+    var url_buf: [128]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "{s}/relays", .{model.baseUrl()}) catch return;
+    var body_buf: [24]u8 = undefined;
+    const body = std.fmt.bufPrint(&body_buf, "{{\"on\":{s}}}", .{if (on) "true" else "false"}) catch return;
+    const headers = [_]std.http.Header{
+        .{ .name = "authorization", .value = model.auth() },
+        .{ .name = "content-type", .value = "application/json" },
+    };
+    fx.fetch(.{
+        .key = relays_key,
+        .method = .POST,
+        .url = url,
+        .headers = &headers,
+        .body = body,
+        .timeout_ms = 5_000,
+        .on_response = Effects.responseMsg(.relays_set),
     });
 }
 
@@ -1341,6 +1391,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         },
 
         // The poll chain reflects the removal; nothing else to do on ack.
+        .toggle_relays => {
+            const want = !model.serve_relays;
+            model.serve_relays = want; // optimistic; the next /info confirms it
+            sendServeRelays(model, fx, want);
+        },
+        // The daemon owns the answer; this only re-reads it.
+        .relays_set => fetchInfo(model, fx),
+
         .decided => {},
 
         .tick => |t| {
@@ -1654,6 +1712,7 @@ pub fn parseInfo(model: *Model, body: []const u8) void {
         pubkey: []const u8 = "",
         bunker: []const u8 = "",
         timeout_ms: u64 = 0,
+        serve_relays: bool = false,
         relays: []const struct { url: []const u8 = "", status: []const u8 = "" } = &.{},
     };
     const parsed = std.json.parseFromSliceLeaky(Info, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return;
@@ -1661,6 +1720,7 @@ pub fn parseInfo(model: *Model, body: []const u8) void {
     model.setPubkey(parsed.pubkey);
     model.setBunker(parsed.bunker);
     model.setRelays(parsed.relays);
+    model.serve_relays = parsed.serve_relays;
     model.timeout_ms = parsed.timeout_ms;
 }
 
