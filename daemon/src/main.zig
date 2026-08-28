@@ -52,6 +52,7 @@ fn idleExitMs() i64 {
 }
 
 const default_key_file = ".zig-nostr-signer.key";
+const default_conf_file = ".zig-nostr-signer.conf";
 // What the GUI serves on when the reader has not chosen. THREE, not one.
 //
 // A signer on a single relay is a signer that stops signing when that relay
@@ -154,20 +155,19 @@ pub fn main(init: std.process.Init) !void {
     // `SIGNER_APPROVAL_HTTP`. Parse argv here so the slice lives for the process
     // (GUI/relay mode never returns).
     var approval_addr = getEnv("SIGNER_APPROVAL_HTTP");
-    // `--serve-relays` is what separates the two things this daemon can be.
+    // Whether this daemon also answers clients over relays.
     //
-    // EMBEDDED, without it: the private keyholder of the one app that started
-    // it, reachable only down the pipe it was handed, and on no relay at all.
-    // Nothing outside that app can ask it for anything.
+    // The FLAG is an override for a terminal. The answer normally comes from
+    // this daemon's own config file, and that is the point rather than a
+    // convenience: whether the keyholder serves other devices is the
+    // keyholder's decision, not something the app that happened to start it
+    // gets to choose. An app embedding Notary spawns it and asks for nothing.
     //
-    // STANDALONE, with it: a bunker on real relays, where clients are NIP-46
-    // clients and prove who they are with their own keypair. That is the only
-    // place a stranger's request belongs, and it is the only mode that needs a
-    // network.
-    //
-    // Being both at once is what this flag exists to prevent. A daemon serving
-    // relays AND a local app is a keyholder with a public door, which is the
-    // shape nobody has made safe on the desktop.
+    // Serving relays is not a second door to guard. A client that reaches this
+    // over a relay is a NIP-46 client and proves who it is with its own
+    // keypair, which is the one identity here that cannot be forged. What the
+    // setting is really about is that turning it on puts the process holding
+    // the key on the network at all.
     var serve_relays = false;
     var args = std.process.Args.Iterator.init(init.minimal.args);
     _ = args.skip(); // argv[0]
@@ -203,21 +203,27 @@ pub fn main(init: std.process.Init) !void {
 /// first-run key onboarding over it, then serve with the resulting key. The
 /// broker and server live in this frame, which never returns (it tail-calls the
 /// forever-serving `runRelays`), so their addresses are stable for the process.
-fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig, serve_relays: bool) noreturn {
+fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8, policy_config: *const PolicyConfig, forced_relays: bool) noreturn {
     const hp = parseHostPort(addr) orelse
         fail("SIGNER_APPROVAL_HTTP must be host:port, e.g. 127.0.0.1:0");
 
     // Turnkey defaults so a fresh download needs no configuration.
     const key_file = getEnv("SIGNER_KEY_FILE") orelse resolveHome(gpa, default_key_file);
+    // The flag forces it on; otherwise this daemon's own config decides. An app
+    // that embeds Notary passes nothing and gets whatever the reader chose in
+    // Notary's window, which is where a question about signing belongs.
+    const conf_path = getEnv("SIGNER_CONF_FILE") orelse resolveHome(gpa, default_conf_file);
+
+    var startup = std.Io.Threaded.init(gpa, .{});
+    defer startup.deinit();
+    const io = startup.io();
+
+    const serve_relays = forced_relays or approval_http.readServeRelays(gpa, io, conf_path);
     var relays: std.ArrayList([]const u8) = .empty;
     if (serve_relays) {
         parseRelays(gpa, &relays, getEnv("SIGNER_RELAYS") orelse default_gui_relays);
         if (relays.items.len == 0) fail("SIGNER_RELAYS contained no relay URLs");
     }
-
-    var startup = std.Io.Threaded.init(gpa, .{});
-    defer startup.deinit();
-    const io = startup.io();
 
     // No key file yet → the GUI must create one; an encrypted file present →
     // the GUI must unlock it.
@@ -261,7 +267,7 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .token = secret,
         .log = &g_audit,
         .idle_exit_ms = idleExitMs(),
-        .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status },
+        .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status, .serve_relays = serve_relays, .conf_file = conf_path },
         .clients = &g_authorized_clients,
         .host = hp.host,
         .port = hp.port,
