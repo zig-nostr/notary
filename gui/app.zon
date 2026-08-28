@@ -3,7 +3,7 @@
     .name = "notary",
     .display_name = "Notary",
     .description = "Notary: approve or deny Nostr signing requests; your key stays in the signer daemon.",
-    .version = "0.10.3",
+    .version = "0.10.4",
     .icons = .{"assets/icon.png"},
     .platforms = .{"macos"},
     .permissions = .{ "view", "command", "clipboard" },

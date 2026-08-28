@@ -610,14 +610,19 @@ pub fn readServeRelays(gpa: std.mem.Allocator, io: std.Io, path: []const u8) boo
     return false;
 }
 
-/// Writes that answer back. Best effort: a setting that cannot be saved is
-/// still worth honouring for this run, and saying so is the window's job.
-pub fn writeServeRelays(io: std.Io, path: []const u8, on: bool) void {
+/// Writes that answer back, reporting whether it landed.
+///
+/// It used to swallow the error and its comment said the setting was "still
+/// worth honouring for this run". Neither half was true: this setting only ever
+/// applies at the next start, so a write that failed changes nothing at all,
+/// and the window was told 200 either way.
+pub fn writeServeRelays(io: std.Io, path: []const u8, on: bool) bool {
     std.Io.Dir.cwd().writeFile(io, .{
         .sub_path = path,
         .data = if (on) "serve_relays=on\n" else "serve_relays=off\n",
         .flags = .{ .truncate = true, .permissions = std.Io.File.Permissions.fromMode(0o600) },
-    }) catch {};
+    }) catch return false;
+    return true;
 }
 
 /// POST /relays: whether this keyholder answers clients over relays.
@@ -636,7 +641,15 @@ fn handleRelays(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
     defer parsed.deinit();
 
     if (self.info.conf_file.len == 0) return respond(w, 409, "{\"error\":\"no config file\"}");
-    writeServeRelays(io, self.info.conf_file, parsed.value.on);
+    if (!writeServeRelays(io, self.info.conf_file, parsed.value.on)) {
+        note(self, io, .{ .what = "relays", .outcome = "not saved" });
+        return respond(w, 500, "{\"error\":\"could not save that setting\"}");
+    }
+    // What /info reports from here on. Without this it kept answering with the
+    // value read at STARTUP, so the window asked, was told the old answer, and
+    // put its switch back: the setting really was saved and the reader was
+    // shown that it was not.
+    self.info.serve_relays = parsed.value.on;
     note(self, io, .{ .what = "relays", .outcome = if (parsed.value.on) "on" else "off" });
     return respond(w, 200, if (parsed.value.on) "{\"ok\":true,\"on\":true}" else "{\"ok\":true,\"on\":false}");
 }
@@ -2369,6 +2382,86 @@ test "a one-shot answer covers only the question it answered" {
     try testing.expect(broker.takeOneShot(plaza, .sign_event, 7, 1_000_000 + Broker.one_shot_ms) == null);
 }
 
+test "turning the relay answer off is what /info says next" {
+    // The window shows its switch from /info. That used to answer with the
+    // value read at STARTUP, so pressing Stop wrote the file, the window asked,
+    // was told the old answer, and put the switch back. The setting really was
+    // saved and the reader was shown that it was not.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}/signer.conf", .{tmp.sub_path});
+    defer gpa.free(path);
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    var server = Server{
+        .gpa = gpa,
+        .broker = &broker,
+        .gate = &gate,
+        .token = "t",
+        // Started with it on, which is the state the bug needed.
+        .info = .{ .relays = &.{}, .timeout_ms = 1000, .serve_relays = true, .conf_file = path },
+        .host = "127.0.0.1",
+        .port = 0,
+    };
+
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleRelays(&server, io, &out.writer, "{\"on\":false}");
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "200") != null);
+    }
+
+    // On disk, for the next start.
+    try testing.expect(!readServeRelays(gpa, io, path));
+
+    // AND in what the window is about to be told.
+    {
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleInfo(&server, io, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"serve_relays\":false") != null);
+    }
+}
+
+test "a setting that could not be saved is not reported as saved" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    var server = Server{
+        .gpa = gpa,
+        .broker = &broker,
+        .gate = &gate,
+        .token = "t",
+        // A directory that is not there, so the write cannot land.
+        .info = .{ .relays = &.{}, .timeout_ms = 1000, .serve_relays = true, .conf_file = ".zig-cache/tmp/nope-not-here/signer.conf" },
+        .host = "127.0.0.1",
+        .port = 0,
+    };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleRelays(&server, io, &out.writer, "{\"on\":false}");
+    var body = out.toArrayList();
+    defer body.deinit(gpa);
+    try testing.expect(std.mem.indexOf(u8, body.items, "500") != null);
+    // And the daemon did not quietly change its mind either.
+    try testing.expect(server.info.serve_relays);
+}
+
 test "the keyholder owns whether it answers other devices" {
     // The setting used to live in the app that started this daemon, which made
     // a client responsible for a keyholder's policy. It belongs here: an app
@@ -2385,13 +2478,13 @@ test "the keyholder owns whether it answers other devices" {
     // the process holding a key on the network.
     try testing.expect(!readServeRelays(gpa, io, path));
 
-    writeServeRelays(io, path, true);
+    _ = writeServeRelays(io, path, true);
     try testing.expect(readServeRelays(gpa, io, path));
-    writeServeRelays(io, path, false);
+    _ = writeServeRelays(io, path, false);
     try testing.expect(!readServeRelays(gpa, io, path));
 
     // Only this user reads what the keyholder was told to do.
-    writeServeRelays(io, path, true);
+    _ = writeServeRelays(io, path, true);
     const st = try std.Io.Dir.cwd().statFile(io, path, .{});
     try testing.expectEqual(@as(std.posix.mode_t, 0), st.permissions.toMode() & 0o077);
 
