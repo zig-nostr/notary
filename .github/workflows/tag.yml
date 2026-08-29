@@ -1,0 +1,60 @@
+name: Tag
+
+# Cuts the release tag from the commit that bumped the version, and nothing
+# else.
+#
+# This exists because I tagged by hand and got it wrong: a wait pulled `main` a
+# second before a squash-merge landed, so `git tag` named the previous commit.
+# The tag said v0.10.6 and pointed at v0.10.5's tree.
+#
+# The release build below refused it, which is what its version check is for.
+# What that check could not protect was PLAZA, which had already built against
+# the same tag and shipped a release carrying the previous window. A tag here is
+# a build input over there, so one that is right by name and wrong by content is
+# not a local mistake.
+#
+# The fix is not a better wait. No local checkout is involved: the tag is created
+# on ${{ github.sha }}, which IS the commit that carried the bump.
+on:
+  push:
+    branches: [main]
+    paths: ["gui/app.zon"]
+
+permissions:
+  contents: write # create the tag
+  actions: write # and start the release build for it
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # so an existing tag can be seen
+
+      - name: Tag the version this commit declares
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' gui/app.zon | head -1)"
+          [ -n "$version" ] || { echo "no version found in gui/app.zon" >&2; exit 1; }
+          tag="v$version"
+
+          # Idempotent: this fires on every push touching gui/app.zon, and most
+          # of those do not move the version.
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "$tag already exists; nothing to do"
+            exit 0
+          fi
+
+          git config user.name "sepehr-safari"
+          git config user.email "safari.sepehr@gmail.com"
+          # On this exact commit, named explicitly. The whole point.
+          git tag -a "$tag" -m "Notary $tag" "$GITHUB_SHA"
+          git push origin "$tag"
+          echo "tagged $tag at $GITHUB_SHA"
+
+          # A tag pushed with the default token starts no other workflow, so the
+          # release is asked for by name, against the tag ref.
+          gh workflow run release.yml --ref "$tag"
+          echo "asked release.yml to build $tag"
