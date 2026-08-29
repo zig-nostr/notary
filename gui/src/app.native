@@ -30,6 +30,16 @@
       <if test="{has_nostrconnect_error}">
         <text foreground="destructive">{nostrconnect_error}</text>
       </if>
+    </column>
+    <separator/>
+  </if>
+  <!-- Signing out and backing up have nothing to do with having a connection
+       string to hand out, and they used to sit INSIDE the bunker card's `if`.
+       The moment a keyholder stopped publishing a URI it could not be reached
+       on, both of them disappeared with it and there was no way to sign out at
+       all. Two different questions, two blocks. -->
+  <if test="{show_key_actions}">
+    <column gap="6" padding="16">
       <row gap="8">
         <button variant="secondary" on-press="sign_out">Sign out</button>
         <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this Mac and needs its passphrase again.</text>
@@ -76,7 +86,7 @@
   </if>
   <if test="{show_serving}">
     <column gap="6" padding="16">
-      <text foreground="text_muted">Other devices</text>
+      <text foreground="text_muted">Other apps</text>
       <row gap="8" cross="center">
         <text grow="1" wrap="true">{serve_relays_line}</text>
         <button on-press="toggle_relays">{serve_relays_action}</button>

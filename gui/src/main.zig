@@ -765,21 +765,27 @@ pub const Model = struct {
 
     pub fn serve_relays_line(self: *const Model) []const u8 {
         return if (self.serve_relays)
-            "Answering your other devices over relays."
+            "Other apps can use this key, over relays."
         else
-            "Signing only for the app that started me.";
+            "This key signs only for the app that started it.";
     }
 
     pub fn serve_relays_action(self: *const Model) []const u8 {
-        return if (self.serve_relays) "Stop" else "Start";
+        // "Turn off" rather than "Stop": nothing is running to stop, and the
+        // change only lands at the next start, which "Stop" reads as denying.
+        return if (self.serve_relays) "Turn off" else "Turn on";
     }
 
     /// Says WHEN, because relay threads are created once with the key, so a
     /// running daemon cannot grow or drop them. A switch that looks like it did
     /// something and did not is worse than one that says so.
+    /// Different in each state, because it used to promise "the link above" when
+    /// the reader was in the state that has no link.
     pub fn serve_relays_hint(self: *const Model) []const u8 {
-        _ = self;
-        return "Takes effect the next time the signer starts. Your other clients connect with the link above.";
+        return if (self.serve_relays)
+            "Other clients connect with the link above. Takes effect the next time this keyholder starts."
+        else
+            "Turn this on to sign in to other Nostr apps from here. Takes effect the next time this keyholder starts.";
     }
 
     fn setPubkey(self: *Model, pk: []const u8) void {
@@ -799,11 +805,16 @@ pub const Model = struct {
     /// not the one showing: an empty one still takes its share of the window,
     /// and on the unlock screen it pushed the heading half way down.
     pub fn show_serving(self: *const Model) bool {
-        return self.show_bunker() or self.show_relays() or self.show_empty();
+        return self.show_bunker() or self.show_key_actions() or self.show_relays() or self.show_empty();
     }
 
     pub fn show_bunker(self: *const Model) bool {
         return self.phase == .connected and self.bunker_len > 0;
+    }
+    /// Signing out and backing up the key: available whenever there is a key in
+    /// hand, whether or not this keyholder answers anybody over relays.
+    pub fn show_key_actions(self: *const Model) bool {
+        return self.phase == .connected;
     }
     /// Copy-button label, confirming briefly after a successful copy.
     pub fn copy_label(self: *const Model) []const u8 {
@@ -1595,7 +1606,14 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             // sign out parked at "Starting the signer…" until the app was
             // restarted. `/lock` keeps the key; `/forget` is the one that
             // removes it.
-            if (!model.managed) return;
+            // This used to refuse whenever the window had not started the
+            // daemon, which meant a dead button in the one place most readers
+            // ever see this window: opened from an app. The press did nothing
+            // and said nothing.
+            //
+            // It is safe now because the app that owns this keyholder starts
+            // another when it ends, and that one comes up locked, which is what
+            // signing out means here.
             model.clearOnboardError();
             model.submitting = false;
             sendLock(model, fx);
@@ -1609,8 +1627,15 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clearBunker();
             model.clearRelays();
             model.clearSecrets();
-            spawnDaemon(model, fx);
-            attemptConnect(model, fx);
+            // Ours to restart, or somebody else's to. An app that handed its
+            // keyholder over starts the replacement itself; starting a second
+            // one here would leave two processes wanting the same key.
+            if (model.managed) {
+                spawnDaemon(model, fx);
+                attemptConnect(model, fx);
+            } else {
+                std.process.exit(0);
+            }
         },
         .forget_edit => |e| {
             model.forget_buf.apply(e);
@@ -1635,6 +1660,19 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
                 model.setAuth("");
                 model.clearRows();
                 model.clearSecrets();
+                // Ours to replace, or not ours at all.
+                //
+                // Unguarded, this started a keyholder of our own over the top of
+                // the app's, with `--serve-relays`, and `mintDaemonSecret`
+                // replaced the app's bearer secret in this model so this window
+                // could never reach the real one again. It used to fail loudly
+                // because the path was empty; resolving the path correctly is
+                // what would have turned it into a silent second signer with a
+                // public door.
+                //
+                // The app that owns this keyholder starts the replacement, and
+                // that one comes up with no key, which is what deleting it means.
+                if (!model.managed) std.process.exit(0);
                 spawnDaemon(model, fx);
                 attemptConnect(model, fx);
                 return;
@@ -1689,11 +1727,33 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
     }
 }
 
-const OnboardKind = enum { setup, unlock };
+pub const OnboardKind = enum { setup, unlock };
 
 /// Applies a `/setup` or `/unlock` response. On success the key is loaded and
 /// the daemon is serving, so clear the secrets and switch to the approvals
 /// queue; on failure keep what the user typed and show why.
+/// What this window tells the app that started it, by the only channel it has.
+///
+/// The app watches this window's exit code to learn whether a key was MINTED
+/// here, which is not the same as one being brought: a key made a moment ago
+/// provably has no history, and the app uses that to write a first contact list
+/// without reading one back first. Claiming a mint for an import would let it
+/// publish over a real list; the reverse only loses the name beat.
+///
+/// Nothing ever produced this code before. This window had no exit path at all,
+/// so the app's `created` test was false for every mint and its whole
+/// minted-here branch was dead code.
+const ceremony_created_code: u8 = 9;
+
+pub fn exitCodeForTest(model: *const Model, kind: OnboardKind) u8 {
+    return exitCodeFor(model, kind);
+}
+
+fn exitCodeFor(model: *const Model, kind: OnboardKind) u8 {
+    if (kind != .setup) return 0; // an unlock made no key
+    return if (model.import_mode) 0 else ceremony_created_code;
+}
+
 fn onOnboardResponse(model: *Model, fx: *Effects, r: native_sdk.EffectResponse, kind: OnboardKind) void {
     model.submitting = false;
     if (r.outcome == .ok and r.status == 200) {
@@ -1702,6 +1762,18 @@ fn onOnboardResponse(model: *Model, fx: *Effects, r: native_sdk.EffectResponse, 
         model.clearOnboardError();
         model.version = 0; // a fresh serving session; poll the queue from the start
         model.phase = .connected;
+        // Opened by an app for one thing, and that thing just worked, so this
+        // window is done. It used to sit there afterwards showing a serving
+        // view for a keyholder the reader never asked to administer, and they
+        // had to close it by hand before getting back to what they were doing.
+        //
+        // Exiting IS closing for a window like this, and the app that started
+        // it is already watching for that: it learns the ceremony finished from
+        // the exit and nowhere else.
+        //
+        // Only when an app opened it. Run on its own, this window is the whole
+        // application and quitting after an unlock would be absurd.
+        if (!model.managed) std.process.exit(exitCodeFor(model, kind));
         // Pull /info so we learn the bunker:// URI to show the user; its handler
         // arms the pending-queue poll once it confirms the unlocked state.
         fetchInfo(model, fx);
@@ -1806,7 +1878,11 @@ pub fn chooseDaemonBin(env_bin: ?[]const u8, bundled: ?[]const u8) ?[]const u8 {
 /// Reading stdin is gated on the flag ON PURPOSE. Started from Finder or a
 /// terminal there is nothing on stdin, and a read would block this window
 /// before it drew anything.
-const AttachedTo = struct { address: []const u8, secret: []const u8 };
+pub const AttachedTo = struct { address: []const u8, secret: []const u8 };
+
+pub fn resolveConfigForTest(attached: ?AttachedTo, bin: ?[]const u8, env_addr: ?[]const u8) Resolved {
+    return resolveConfig(attached, bin, env_addr);
+}
 
 var g_attach_addr_buf: [128]u8 = undefined;
 var g_attach_secret_buf: [256]u8 = undefined;
@@ -1852,6 +1928,45 @@ fn bundledDaemonPath(io: std.Io, buf: []u8) ?[]const u8 {
 }
 
 /// Resolves the daemon address, token-file path, and (optional) daemon binary.
+/// What this window decided from what it found, with no IO in it.
+///
+/// Split out because the bug that made it necessary was a control-flow one: an
+/// early return in the attached branch skipped resolving the signer's path, and
+/// nothing could catch that because the whole decision was tangled with reading
+/// argv, stdin and the filesystem. This half is a function of its inputs, so a
+/// test can say what it must decide.
+pub const Resolved = struct {
+    base_url: []const u8,
+    auth: ?[]const u8,
+    /// Where the binary is. Known in BOTH modes: the terminal card names it and
+    /// a restart needs it, neither of which is about who started it.
+    daemon_bin: ?[]const u8,
+    /// Whether this window is the one that starts it. A keyholder handed over
+    /// by an app is not ours to start, stop or replace.
+    managed: bool,
+    port_known: bool,
+};
+
+fn resolveConfig(attached: ?AttachedTo, bin: ?[]const u8, env_addr: ?[]const u8) Resolved {
+    if (attached) |a| return .{
+        .base_url = a.address,
+        .auth = a.secret,
+        .daemon_bin = bin,
+        .managed = false,
+        .port_known = true,
+    };
+    const managed = bin != null;
+    return .{
+        .base_url = env_addr orelse default_address,
+        .auth = null,
+        .daemon_bin = bin,
+        .managed = managed,
+        // In managed mode there is nothing to know yet: the daemon takes a
+        // kernel-chosen port and prints it back.
+        .port_known = !managed,
+    };
+}
+
 /// `SIGNER_APPROVAL_HTTP` defaults to 127.0.0.1:8787; the token-file path
 /// defaults to `$HOME/.zig-nostr-signer.token`. Managed mode is switched on by
 /// a `signer` bundled beside the app, or an overriding `SIGNER_BIN`. The token
@@ -1871,29 +1986,25 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
     // The address on argv, the secret on stdin: the same pair the daemon
     // itself takes, and for the same reason. An address is not a secret, and a
     // secret has no business in argv where `ps` prints it.
-    if (attachedAddress(io, raw_args)) |addr| {
-        model.setBaseUrl(addr.address);
-        model.setAuth(addr.secret);
-        model.managed = false;
-        model.port_known = true;
-        return;
-    }
-
-    const address = environ.get("SIGNER_APPROVAL_HTTP") orelse default_address;
-    model.setBaseUrl(address);
-
+    // WHERE the signer is, resolved first and in both modes. (see resolveConfig)
+    //
+    // Two different things used to be tangled in this one field: where the
+    // binary is, which the terminal card names and a restart needs, and whether
+    // this window is the one that starts it. Only the second is `managed`.
+    // Returning early from the attached branch skipped this and cost both: the
+    // card went back to naming an app the reader may not have installed, and
+    // anything needing the path said "check SIGNER_BIN". Reported within the
+    // hour, on the release that fixed the other half.
     var bundled_buf: [1024]u8 = undefined;
     const bundled = bundledDaemonPath(io, &bundled_buf);
-    if (chooseDaemonBin(environ.get("SIGNER_BIN"), bundled)) |bin| {
-        model.setDaemonBin(bin);
-        model.managed = true;
-    }
-    // The address is known in BOTH modes now. Attached mode talks to whatever
-    // the operator pointed us at. In managed mode there is nothing to know
-    // yet: the daemon takes a kernel-chosen port and prints it back, which is
-    // what removes the well-known address anything else could have been
-    // sitting on.
-    model.port_known = !model.managed;
+    const bin = chooseDaemonBin(environ.get("SIGNER_BIN"), bundled);
+
+    const r = resolveConfig(attachedAddress(io, raw_args), bin, environ.get("SIGNER_APPROVAL_HTTP"));
+    model.setBaseUrl(r.base_url);
+    if (r.auth) |secret| model.setAuth(secret);
+    if (r.daemon_bin) |b| model.setDaemonBin(b);
+    model.managed = r.managed;
+    model.port_known = r.port_known;
 }
 
 pub fn main(init: std.process.Init) !void {
