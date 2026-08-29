@@ -7,6 +7,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # How the Tag workflow asks for a build: a tag it pushed with the default
+  # token cannot start this one on its own. Run against the tag ref, so
+  # `github.ref_name` reads exactly as a tag push would give it.
+  workflow_dispatch:
 
 permissions:
   contents: write # create the release and upload the .app
