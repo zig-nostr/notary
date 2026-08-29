@@ -776,6 +776,80 @@ test "the terminal path is offered beside the paste field, not instead of it" {
     }
 }
 
+test "signing out and backing up do not depend on having a bunker link" {
+    // Both controls used to live INSIDE the bunker card's `if`. The moment a
+    // keyholder stopped publishing a URI it could not be reached on, which is
+    // every keyholder an app starts, the reader lost the only way to sign out
+    // and the only way to back up their key. Reported from a real install: "the
+    // only way is to use delete my key".
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var model = main.initialModel();
+    model.phase = .connected;
+    // No relays, so no connection string. Exactly what an app's keyholder is.
+    try testing.expect(!model.show_bunker());
+
+    // Asserted on the TREE, not on the predicate. The predicate was right while
+    // the markup still had both controls inside the bunker card's `if`, so a
+    // test of the predicate passes on the broken build. Only rendering catches
+    // where a control actually lives.
+    const tree = try buildTree(arena_state.allocator(), &model);
+    _ = try expectByText(tree.root, .button, "Sign out");
+    _ = try expectByText(tree.root, .button, "Back up your key");
+    // And no link is offered for a keyholder nothing can reach.
+    try testing.expect(findByText(tree.root, .button, "Copy") == null);
+}
+
+test "the exit code says whether a key was made or brought" {
+    // The app that opens this window learns from the exit code whether a key
+    // was MINTED here, and uses that to write a first contact list without
+    // reading one back. Saying "minted" for an import would let it publish over
+    // a real list.
+    var model = main.initialModel();
+
+    model.import_mode = false;
+    try testing.expectEqual(@as(u8, 9), main.exitCodeForTest(&model, .setup));
+
+    model.import_mode = true;
+    try testing.expectEqual(@as(u8, 0), main.exitCodeForTest(&model, .setup));
+
+    // An unlock made no key, whichever screen it came from.
+    model.import_mode = false;
+    try testing.expectEqual(@as(u8, 0), main.exitCodeForTest(&model, .unlock));
+}
+
+test "a handed-over keyholder still tells us where the signer is" {
+    // The regression this exists for: the attached branch returned early and
+    // skipped resolving the binary's path. Two things broke at once, on the
+    // release that fixed the other half. The terminal card went back to naming
+    // an app the reader may not have installed, and everything needing the path
+    // said "check SIGNER_BIN".
+    //
+    // Where the binary IS and whether we START it are different questions. Only
+    // the second is `managed`.
+    const bin = "/Applications/Plaza.app/Contents/MacOS/signer";
+    const handed = main.AttachedTo{ .address = "127.0.0.1:56945", .secret = "0123456789abcdef0123" };
+
+    const attached = main.resolveConfigForTest(handed, bin, null);
+    try testing.expectEqualStrings("127.0.0.1:56945", attached.base_url);
+    try testing.expectEqualStrings(bin, attached.daemon_bin.?);
+    // Handed over, so not ours to start, stop or replace.
+    try testing.expect(!attached.managed);
+    try testing.expect(attached.port_known);
+
+    // On its own it starts one, and still knows the same path.
+    const own = main.resolveConfigForTest(null, bin, null);
+    try testing.expectEqualStrings(bin, own.daemon_bin.?);
+    try testing.expect(own.managed);
+    try testing.expect(!own.port_known);
+
+    // And with no signer anywhere it manages nothing.
+    const none = main.resolveConfigForTest(null, null, null);
+    try testing.expect(none.daemon_bin == null);
+    try testing.expect(!none.managed);
+}
+
 test "the terminal card names the signer this window actually ships with" {
     // This window ships inside Plaza too. Started from there, the signer beside
     // it is Plaza's, and naming Notary's sent a reader to a path that is not on

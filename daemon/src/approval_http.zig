@@ -671,7 +671,13 @@ fn handleInfo(self: *Server, io: std.Io, w: *std.Io.Writer) !void {
     // the GUI shows and copies it, building it here keeps the canonical NIP-46
     // format (and the connection secret) in the daemon.
     const pubkey = if (state == .unlocked) self.gate.pubkeyHex() else "";
-    const bunker_uri: ?[]u8 = if (state == .unlocked)
+    // A bunker URI NAMES the relays a client should reach this keyholder on, so
+    // one built from an empty list names nothing: `bunker://<pubkey>` and no way
+    // to get there. It was still being handed to the window, which showed it as
+    // though it were a link worth copying. A keyholder that answers no relays
+    // has no connection string, and saying so by sending none is the honest
+    // form: the window already hides the card when there is nothing to show.
+    const bunker_uri: ?[]u8 = if (state == .unlocked and self.info.relays.len > 0)
         nip46.buildBunkerUri(self.gpa, self.gate.pubkey(), self.info.relays, self.info.secret) catch null
     else
         null;
@@ -2380,6 +2386,68 @@ test "a one-shot answer covers only the question it answered" {
     _ = broker.snapshot(&q);
     try testing.expect(broker.resolveFor(q[0].id, .approve, .once, 1_000_000));
     try testing.expect(broker.takeOneShot(plaza, .sign_event, 7, 1_000_000 + Broker.one_shot_ms) == null);
+}
+
+test "a keyholder on no relays offers no connection string" {
+    // `bunker://<pubkey>` with no relay after it is not a link, it is a pubkey
+    // with a scheme on the front. Nothing can reach a signer with it. The window
+    // was showing it as something to copy, on a keyholder started by an app,
+    // which is the one case where there are no relays by design.
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const secret = try nostr.hex.decodeFixed(32, "b7e151628aed2a6abf7158809cf4f3c762e7160f38b4da56a784d9045190cfef");
+    const kp = try signer.keyPairFromSecretKey(secret);
+
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "unused.ncryptsec", .uninitialized);
+    gate.preload(kp);
+
+    // Unlocked, holding the key, and answering nobody over relays.
+    {
+        var server = Server{
+            .gpa = gpa,
+            .broker = &broker,
+            .gate = &gate,
+            .token = "t",
+            .info = .{ .relays = &.{}, .timeout_ms = 1000 },
+            .host = "127.0.0.1",
+            .port = 0,
+        };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleInfo(&server, io, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"bunker\":\"\"") != null);
+        // The pubkey is still reported: whose key it is was never the secret.
+        try testing.expect(std.mem.indexOf(u8, body.items, "\"pubkey\":\"dff1d77f") != null);
+    }
+
+    // And with a relay to name, the link comes back.
+    {
+        const relays = [_][]const u8{"wss://relay.example.com"};
+        var server = Server{
+            .gpa = gpa,
+            .broker = &broker,
+            .gate = &gate,
+            .token = "t",
+            .info = .{ .relays = &relays, .timeout_ms = 1000 },
+            .host = "127.0.0.1",
+            .port = 0,
+        };
+        var out = std.Io.Writer.Allocating.init(gpa);
+        defer out.deinit();
+        try handleInfo(&server, io, &out.writer);
+        var body = out.toArrayList();
+        defer body.deinit(gpa);
+        try testing.expect(std.mem.indexOf(u8, body.items, "bunker://dff1d77f") != null);
+        try testing.expect(std.mem.indexOf(u8, body.items, "relay.example.com") != null);
+    }
 }
 
 test "turning the relay answer off is what /info says next" {
