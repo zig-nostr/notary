@@ -456,10 +456,17 @@ pub const Model = struct {
     /// place it cannot.
     pub fn mintDaemonSecret(self: *Model) void {
         var raw: [24]u8 = undefined;
-        // The OS CSPRNG, reached directly because this runs in a Model method
-        // that has no `io` to hand. macOS guarantees `arc4random_buf` never
-        // fails and needs no seeding.
-        std.c.arc4random_buf(&raw, raw.len);
+        // The OS CSPRNG through `io`, which this reaches by way of a module
+        // global because a Model method has none to hand.
+        //
+        // It used to call `std.c.arc4random_buf` directly, which is a macOS
+        // guarantee and not a portable one: Zig declares that symbol as `void`
+        // on musl and on glibc below 2.36, so the call is a COMPILE error, not a
+        // link error, on Ubuntu 22.04, Debian 11, RHEL 9 and every static build.
+        // `std.crypto.random` and `std.posix.getrandom` are both gone in 0.16,
+        // so this is the remaining way to ask.
+        const io = g_io orelse return;
+        io.randomSecure(&raw) catch return;
         const hexed = std.fmt.bufPrint(&self.daemon_secret_buf, "{x}\n", .{raw}) catch return;
         self.daemon_secret_len = hexed.len;
         self.setAuth(hexed[0 .. hexed.len - 1]); // the header wants it without the newline
@@ -1884,6 +1891,14 @@ pub fn resolveConfigForTest(attached: ?AttachedTo, bin: ?[]const u8, env_addr: ?
     return resolveConfig(attached, bin, env_addr);
 }
 
+/// The process `Io`, for the one place that needs the OS CSPRNG from inside a
+/// Model method. Set once at startup, and by the test that mints a secret.
+var g_io: ?std.Io = null;
+
+pub fn setIoForTest(io: std.Io) void {
+    g_io = io;
+}
+
 var g_attach_addr_buf: [128]u8 = undefined;
 var g_attach_secret_buf: [256]u8 = undefined;
 
@@ -2018,6 +2033,7 @@ pub fn main(init: std.process.Init) !void {
     });
     defer app_state.destroy();
     app_state.model = initialModel();
+    g_io = init.io;
     loadConfig(&app_state.model, init.io, init.environ_map, init.minimal.args);
 
     try runner.runWithOptions(app_state.app(), .{

@@ -93,6 +93,11 @@ test "the secret is minted fresh and never leaves this process except down the p
     // (`ps -Eww` printed one), and could always read a 0600 token file, because
     // file permissions separate USERS and not apps. A pipe to a child has no
     // name and no path, so there is nothing to open.
+    // The mint reaches the OS CSPRNG through `io`, so the test provides one.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    main.setIoForTest(threaded.io());
+
     var a = Model{};
     var b = Model{};
     a.mintDaemonSecret();
