@@ -42,7 +42,7 @@
     <column gap="6" padding="16">
       <row gap="8">
         <button variant="secondary" on-press="sign_out">Sign out</button>
-        <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this Mac and needs its passphrase again.</text>
+        <text grow="1" foreground="text_muted" wrap="true">Locks the signer. Your key stays on this computer and needs its passphrase again.</text>
       </row>
       <separator/>
       <if test="{backup_closed}">
@@ -185,7 +185,7 @@
         <button variant="destructive" on-press="reveal_forget">Use another key</button>
       </if>
       <if test="{forget_open}">
-        <text foreground="text_muted" wrap="true">Signing in as somebody else removes this key from this Mac. It is the only copy here, so make sure you have its nsec written down first. Type "delete my key" to confirm.</text>
+        <text foreground="text_muted" wrap="true">Signing in as somebody else removes this key from this computer. It is the only copy here, so make sure you have its nsec written down first. Type "delete my key" to confirm.</text>
         <row><text-field text="{forget_confirm}" placeholder="delete my key" on-input="forget_edit" grow="1"/></row>
         <row gap="8">
           <button grow="1" on-press="cancel_forget">Cancel</button>

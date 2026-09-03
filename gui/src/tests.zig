@@ -310,7 +310,7 @@ test "an approval row says who is asking and what would be signed" {
         \\"local":true,"client":"plaza","preview":"gm"}]}
     );
     const here_tree = try buildTree(arena_state.allocator(), &here);
-    _ = try expectByText(here_tree.root, .text, "an app on this Mac calling itself \"plaza\"");
+    _ = try expectByText(here_tree.root, .text, "an app on this computer calling itself \"plaza\"");
 
     // And it must not be dressed up as proof of who is asking.
     try testing.expect(findByText(here_tree.root, .text, "from plaza") == null);

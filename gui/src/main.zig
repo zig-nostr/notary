@@ -156,7 +156,7 @@ pub const Row = struct {
     /// The requesting client's pubkey, hex.
     client_buf: [64]u8 = [_]u8{0} ** 64,
     client_len: u8 = 0,
-    /// Whether `client_buf` holds a name an app on this Mac chose for itself,
+    /// Whether `client_buf` holds a name an app on this computer chose for itself,
     /// rather than the pubkey of whoever signed a request over a relay.
     ///
     /// The two are not the same kind of fact and the row must not read as
@@ -218,7 +218,7 @@ pub const Row = struct {
     /// word, and eight characters of each end is what makes it comparable at
     /// all, since nobody reads sixty-four.
     ///
-    /// A request from an app on this Mac carries a name the app chose. Any
+    /// A request from an app on this computer carries a name the app chose. Any
     /// program running as this user can read the daemon's token and claim any
     /// name, so "from Plaza" would state something nobody checked, on the one
     /// row in this application where a person is being asked to check
@@ -227,7 +227,7 @@ pub const Row = struct {
         const c = self.client();
         if (c.len == 0) return "unknown client";
         if (self.local)
-            return std.fmt.allocPrint(arena, "an app on this Mac calling itself \"{s}\"", .{c}) catch c;
+            return std.fmt.allocPrint(arena, "an app on this computer calling itself \"{s}\"", .{c}) catch c;
         if (c.len < 20) return c;
         return std.fmt.allocPrint(arena, "from {s}…{s}", .{ c[0..8], c[c.len - 8 ..] }) catch c;
     }
