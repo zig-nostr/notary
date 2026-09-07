@@ -1,4 +1,16 @@
-**Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
+**Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
+
+### What's new in v0.10.8
+
+**There is a Linux download now.** 0.10.7 said Notary ran on Linux and offered only a macOS app, which was true and useless. This release carries a tarball for x86_64 and aarch64:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-linux.sh | bash
+```
+
+GTK 4 is the one runtime dependency, and the installer says so before it downloads anything rather than after the window fails to open. It verifies the SHA-256, installs into `~/.local` so nothing needs root and nothing lands outside your home directory, puts Notary in the launcher, and starts it. Pass `--archive <file>` to install a tarball you already have.
+
+One download still brings up both halves: the window, and the `signer` daemon it spawns, which is where your key actually lives. They install side by side because the window finds the daemon beside its own executable, exactly as it does inside the `.app` on macOS.
 
 ### What's new in v0.10.7
 
