@@ -67,8 +67,14 @@ stage="$outdir/notary-$version-linux-$arch"
 say "Clearing zig-out so nothing stale or instrumented can be picked up..."
 rm -rf zig-out "$stage" "$outdir/notary-$version-linux-$arch.tar.gz"
 
-say "Building (ReleaseFast, no automation)..."
-native build .
+# `-Dcpu=baseline`, and this is not optional for a release. Zig defaults to the
+# BUILD machine's CPU, so a binary built on a CI runner carries whatever that
+# runner's processor happened to support. Plaza's v0.18.0 aarch64 tarball was
+# built that way and died with SIGILL, immediately and with no output, on Apple
+# Silicon under UTM. Every Linux VM on an Apple machine is that target, and the
+# daemon in this tarball holds somebody's key, so it had better start.
+say "Building (ReleaseFast, baseline CPU, no automation)..."
+native build . -Dcpu=baseline
 
 # `grep -c ... || true`, not `grep -q`: under `set -o pipefail` a matching
 # `grep -q` exits early, `strings` dies of SIGPIPE, and the pipeline reports
