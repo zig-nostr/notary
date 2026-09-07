@@ -1,5 +1,13 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**.
 
+### What's new in v0.10.7
+
+**Notary runs on Linux.** The download on this page is still the macOS app. What changed is that the same window and the same keyholder now build and run on Linux, which is what lets Plaza's Linux build carry a keyholder of its own instead of asking you to bring one.
+
+**Fixed: it would not build at all on distributions with older system libraries.** The daemon secret was minted through a function macOS guarantees and Linux does not, and on musl and on glibc below 2.36 that is a compile error rather than a warning. Ubuntu 22.04, Debian 11, RHEL 9 and every static build could not compile it. It asks the operating system for randomness through a portable route now.
+
+**"This Mac" now reads "this computer"** everywhere it appears, including the sentence you read before allowing a signature under your name.
+
 ### What's new in v0.10.6
 
 **Fixed: signing out and backing up your key had disappeared.** Both controls lived inside the card that shows the connection link, so a keyholder that publishes no link, which is every keyholder an app starts, showed neither. The only key control left was the one that deletes it. They are their own section now: whether you have a link to hand out and whether you can sign out are different questions.
