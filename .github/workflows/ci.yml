@@ -105,3 +105,81 @@ jobs:
 
       - name: Check formatting
         run: zig fmt --check src
+
+  # Packages the Linux tarball on every pull request, for both architectures.
+  #
+  # release.yml builds these on a tag and uploads them into the release, and a
+  # release is the one artifact nobody gets to re-check. So the script runs
+  # here, where a break is a red X on a pull request rather than a published
+  # release missing half its downloads, and the `ubuntu-24.04-arm` label is
+  # proven here before the release path is allowed to depend on it.
+  linux-package:
+    name: linux-package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.9.2
+
+      # gtk4 only. Notary draws on a canvas and declares no web use, so the host
+      # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing
+      # else. Installing WebKit here would hide a regression that made it real.
+      - name: Install the Linux host dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      # The retried fetch: `zig build` dies with "unable to discover remote git
+      # server capabilities: ProtocolError" pulling secp256k1, which this repo
+      # pins by git URL rather than by tarball. Seen on three runners now, and
+      # it failed a release build outright over in Plaza.
+      - name: Fetch the dependency tree
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if (cd daemon && zig build --fetch); then exit 0; fi
+            echo "fetch attempt $attempt failed" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not fetch dependencies in five attempts" >&2
+          exit 1
+
+      - name: Build the daemon
+        run: cd daemon && zig build -Doptimize=ReleaseFast
+
+      - name: Package
+        run: gui/scripts/package-linux.sh --signer daemon/zig-out/bin/signer --output dist
+
+      # The installer derives the file name from `uname -m`, so a tarball named
+      # for the wrong architecture is a 404 for whoever the runner was not.
+      - name: The tarball is for the architecture this runner actually is
+        run: |
+          got="$(ls dist/notary-*-linux-*.tar.gz | head -1)"
+          case "$got" in
+            *-linux-${{ matrix.arch }}.tar.gz) echo "$got" ;;
+            *) echo "expected a ${{ matrix.arch }} tarball, packaged $got" >&2; exit 1 ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notary-linux-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error

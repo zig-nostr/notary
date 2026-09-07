@@ -84,7 +84,108 @@ jobs:
             echo "release exists; replacing its artifact with the one built here"
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
           else
+            # A DRAFT. The Linux tarballs are built by another job that takes
+            # minutes longer, and a release published before they arrive is one
+            # whose Linux installer 404s for exactly as long as that takes. The
+            # `publish` job below lifts the draft once every artifact is up.
             gh release create "$GITHUB_REF_NAME" "$asset" \
+              --draft \
               --title "Notary $GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
           fi
+
+  # The Linux tarball: the window and the daemon it spawns, side by side, the
+  # same two binaries the macOS bundle carries in Contents/MacOS.
+  #
+  # Notary declared Linux support in 0.10.7 and shipped no Linux artifact with
+  # it, so the release page said it ran there and offered a macOS zip.
+  linux-tarball:
+    name: package · publish (${{ matrix.arch }})
+    needs: macos-app
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest, arch: x86_64 }
+          - { runner: ubuntu-24.04-arm, arch: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read Zig version
+        id: zig-version
+        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig-version.outputs.version }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install the Native SDK CLI
+        run: npm install -g @native-sdk/cli@0.9.2
+
+      # gtk4 only. Notary draws on a canvas and declares no web use, so the host
+      # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing
+      # else. Installing WebKit here would hide a regression that made it real.
+      - name: Install the Linux host dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev
+
+      # The retried fetch: `zig build` dies with "unable to discover remote git
+      # server capabilities: ProtocolError" pulling secp256k1, which this repo
+      # pins by git URL rather than by tarball. Seen on three runners now, and
+      # it failed a release build outright over in Plaza. Seconds when it works,
+      # and nothing after it needs the network.
+      - name: Fetch the dependency tree
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if (cd daemon && zig build --fetch); then exit 0; fi
+            echo "fetch attempt $attempt failed" >&2
+            sleep $((attempt * 10))
+          done
+          echo "could not fetch dependencies in five attempts" >&2
+          exit 1
+
+      - name: Build the daemon
+        run: cd daemon && zig build -Doptimize=ReleaseFast
+
+      - name: Package
+        run: gui/scripts/package-linux.sh --signer daemon/zig-out/bin/signer --output dist
+
+      # The installer derives the file name from the release tag and `uname -m`,
+      # so a tarball named for the wrong architecture is a 404 for whoever the
+      # runner was not. Checked rather than trusted.
+      - name: The tarball matches the tag and this architecture
+        run: |
+          want="notary-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}.tar.gz"
+          [ -f "dist/$want" ] || { echo "expected dist/$want, got: $(ls dist)" >&2; exit 1; }
+          [ -f "dist/$want.sha256" ] || { echo "no published digest beside $want" >&2; exit 1; }
+          echo "$want"
+
+      - name: Upload into the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          want="notary-${GITHUB_REF_NAME#v}-linux-${{ matrix.arch }}.tar.gz"
+          gh release upload "$GITHUB_REF_NAME" "dist/$want" "dist/$want.sha256" --clobber
+
+  # Lifts the draft, once and only once every artifact is up. Until this runs
+  # the release is invisible, so there is no window in which the page offers a
+  # Linux install that is not there yet.
+  publish:
+    needs: [macos-app, linux-tarball]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "$GITHUB_REF_NAME" --draft=false
+          echo "published $GITHUB_REF_NAME with:"
+          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
