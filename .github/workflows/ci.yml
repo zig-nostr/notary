@@ -163,7 +163,7 @@ jobs:
           exit 1
 
       - name: Build the daemon
-        run: cd daemon && zig build -Doptimize=ReleaseFast
+        run: cd daemon && zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
       - name: Package
         run: gui/scripts/package-linux.sh --signer daemon/zig-out/bin/signer --output dist
