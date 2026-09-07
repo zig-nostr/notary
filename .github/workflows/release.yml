@@ -35,7 +35,7 @@ jobs:
           node-version: 22
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.9.2
+        run: npm install -g @native-sdk/cli@0.10.1
 
       # The suites run on every pull request, but a tag can be pushed at any
       # commit, and a release is the one artifact nobody gets to re-check. So
@@ -125,7 +125,7 @@ jobs:
           node-version: 22
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.9.2
+        run: npm install -g @native-sdk/cli@0.10.1
 
       # gtk4 only. Notary draws on a canvas and declares no web use, so the host
       # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing

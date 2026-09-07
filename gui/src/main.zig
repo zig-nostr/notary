@@ -35,6 +35,42 @@ pub const panic = std.debug.FullPanic(native_sdk.debug.capturePanic);
 const canvas = native_sdk.canvas;
 const geometry = native_sdk.geometry;
 
+/// The faces this window registers off macOS, and why it needs any.
+///
+/// On macOS CoreText draws the text and cascades to the system's own fonts, so
+/// none of this is embedded there. Everywhere else the toolkit inks every glyph
+/// itself from the faces it has, and two things follow that matter here.
+///
+/// Medium and bold resolve to the REGULAR face, because the toolkit maps a
+/// span's weight onto reserved ids and bundles no face for them. Every heading
+/// and button label in this window was flat on Linux
+/// (vercel-labs/native#423).
+///
+/// And a codepoint no registered face carries is painted as a solid filled
+/// rectangle. The bundled face covers Latin and Cyrillic. That would be
+/// harmless in a window whose own text is English, except that two fields here
+/// are not this window's text: the name of the CLIENT asking for a signature,
+/// which the client chose, and the PREVIEW of the event about to be signed,
+/// which is whatever somebody is posting. A Japanese note would have been a row
+/// of blocks on the screen where you decide whether to sign it, which is the
+/// one screen in this app that has to be readable
+/// (vercel-labs/native#421).
+///
+/// 13 MB of that is the CJK coverage, and it is worth it for the same reason:
+/// a signing prompt you cannot read is not a prompt. Arabic, Hebrew, Thai and
+/// Devanagari are still wrong and no face fixes them, because the renderer has
+/// no shaping.
+const registered_fonts: []const NotaryApp.FontRegistration = if (@import("builtin").os.tag == .macos)
+    &.{}
+else
+    &.{
+        .{ .id = canvas.default_sans_medium_font_id, .name = "Geist-Medium.ttf", .ttf = @embedFile("fonts/Geist-Medium.ttf") },
+        .{ .id = canvas.default_sans_bold_font_id, .name = "Geist-Bold.ttf", .ttf = @embedFile("fonts/Geist-Bold.ttf") },
+        .{ .id = 65, .name = "NotoSans-Regular.ttf", .ttf = @embedFile("fonts/NotoSans-Regular.ttf") },
+        .{ .id = 66, .name = "NotoSansSC-Regular.ttf", .ttf = @embedFile("fonts/NotoSansSC-Regular.ttf") },
+        .{ .id = 67, .name = "NotoSansKR-Hangul.ttf", .ttf = @embedFile("fonts/NotoSansKR-Hangul.ttf") },
+    };
+
 const canvas_label = "main-canvas";
 const window_width: f32 = 460;
 const window_height: f32 = 560;
@@ -2063,6 +2099,9 @@ pub fn main(init: std.process.Init) !void {
         .init_fx = boot,
         .update_fx = update,
         .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        // Empty on macOS, where CoreText draws the text. See
+        // `registered_fonts`.
+        .fonts = registered_fonts,
     });
     defer app_state.destroy();
     app_state.model = initialModel();

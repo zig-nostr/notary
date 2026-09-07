@@ -1,5 +1,15 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.10.11
+
+**The signing prompt can be read in any language.** Off macOS Notary drew every character from the one font it had, which covers Latin and Cyrillic, so anything else was a solid grey rectangle. That is harmless for Notary's own text, which is English. It was not harmless for the two fields that are not Notary's text: the name of the app asking for a signature, and the preview of what it wants signed. A Japanese note came up as a row of blocks on the one screen where you have to read something before you agree to it.
+
+**Headings and buttons are bold again on Linux.** Every weight resolved to the regular face, so the whole window was one flat weight.
+
+**The toolkit underneath is a version newer**, and pinned to a commit rather than to whatever version of the command-line tool happened to be installed on the machine doing the build. A given Notary version now means one thing.
+
+This adds about 13 MB to the Linux downloads and nothing to the macOS one, which does not need any of it: macOS has its own fonts and Notary asks the system to draw text there.
+
 ### What's new in v0.10.10
 
 **Fixed: on Debian the installer never checked for GTK 4.** The check that stops you downloading an app your machine cannot run was gated on finding `ldconfig` on your PATH, and Debian keeps `ldconfig` in `/usr/sbin`, which it does not put on a normal user's PATH. So on Debian the check silently did not happen: a machine without GTK 4 got a verified download, "Installed Notary", and then nothing at all when it started. It looks for `ldconfig` by absolute path now, and searches the library directories if there is none.

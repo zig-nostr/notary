@@ -1,0 +1,45 @@
+.{
+    .name = .notary,
+    .fingerprint = 0x1c66b255a707070,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The Native SDK framework, pinned to a commit. `native eject` wrote a
+        // machine-local `.path` into somebody's npm install here, which is
+        // reproducible on exactly one computer: every CI runner and every
+        // contributor built against whatever CLI version happened to be
+        // installed, and a release was whatever npm served that afternoon.
+        //
+        // Bump this and the CLI version in .github/workflows/*.yml IN THE SAME
+        // COMMIT. The automation harness refuses to read a snapshot when the
+        // CLI and the framework speak different protocol versions, and moving
+        // one alone does not fail the build: it silently breaks every live
+        // test.
+        //
+        // A fork rather than vercel-labs/native, for four patches, all of them
+        // in the renderer Linux presents with. Two of them are Notary's:
+        //
+        //   * medium and bold ink REGULAR outlines off macOS, because the
+        //     toolkit bundles no face for the weight ids it maps spans onto, so
+        //     every heading in this window is flat on Linux
+        //     (vercel-labs/native#423);
+        //   * a codepoint the bundled faces do not carry is painted as a solid
+        //     block, and the approval prompt shows the CLIENT's name, so a
+        //     client named in Japanese would be a row of rectangles on the
+        //     screen where somebody decides whether to sign
+        //     (vercel-labs/native#421).
+        //
+        // The other two are the colour emoji this window does not draw and the
+        // Linux present path's dirty rectangle, which it gets for free.
+        //
+        // PATCHES.md in the fork is the tracker: a row per patch with its
+        // upstream issue and how to drop it when that issue closes. Also
+        // reachable as the tag `plaza-linux-gaps-2`, so this does not depend on
+        // one branch surviving.
+        .native_sdk = .{
+            .url = "git+https://github.com/zig-nostr/native.git#a90ee35d7813dfd5e4d55a053e29067e704c4e7a",
+            .hash = "native_sdk-0.1.0-hzDzQkVysQJeCEkO1f6kfnZt7cQ0YNriPiqOdn_CAYXg",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },
+}
