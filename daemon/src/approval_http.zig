@@ -34,6 +34,7 @@ const ipc = nostr.signer_ipc;
 const Broker = approval.Broker;
 const Pending = approval.Pending;
 const Gate = onboarding.Gate;
+const keystore = nostr.keystore;
 
 /// Live connection state of one relay, reported per relay on `/info`.
 /// A relay connection's live state.
@@ -748,7 +749,7 @@ fn handleSetup(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) !
 }
 
 /// What `/forget` requires in its body before it will delete anything. Typed by
-/// the reader, not clicked: this removes the only copy of a key on this Mac.
+/// the reader, not clicked: this removes the only copy of a key on this machine.
 pub const forget_confirmation = "delete my key";
 
 /// POST /forget, remove the key file so another account can be set up.
@@ -954,7 +955,7 @@ fn handleUnlock(self: *Server, io: std.Io, w: *std.Io.Writer, body: []const u8) 
             error.BadPassphrase => respond(w, 401, "{\"error\":\"bad passphrase\"}"),
             error.NotLocked => respond(w, 409, "{\"error\":\"not locked\"}"),
             // Not the reader's mistake, and not something a passphrase fixes.
-            // Another Notary on this Mac has this key open; two processes
+            // Another Notary on this machine has this key open; two processes
             // cannot share a decrypted key, so one of them has to close.
             error.AlreadyOpenElsewhere => respond(w, 409, "{\"error\":\"another Notary already has this key open\"}"),
             else => respond(w, 500, "{\"error\":\"could not unlock\"}"),
@@ -2174,7 +2175,12 @@ test "a wrong passphrase is written down, because a run of them is the only warn
 
     var log = audit.Log{ .dir = tmp.dir, .path = "audit.log" };
     var broker: Broker = .{};
-    var gate = Gate.init(gpa, std.Io.Dir.cwd(), "no-such-key.ncryptsec", .locked);
+    // The tmp dir, not the CWD. Pointed at the working directory this test read
+    // "no-such-key.ncryptsec" relative to wherever it happened to run, and two
+    // empty files of that name had been committed at the top of this repo and
+    // inside daemon/, so the file the test is named for existed. They are gone,
+    // and this no longer depends on that.
+    var gate = Gate.init(gpa, tmp.dir, "no-such-key.ncryptsec", .locked);
     var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .log = &log, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
 
     var out = std.Io.Writer.Allocating.init(gpa);
@@ -2186,6 +2192,43 @@ test "a wrong passphrase is written down, because a run of them is the only warn
     try testing.expect(std.mem.indexOf(u8, written, "\"what\":\"unlock\"") != null);
     // The attempt, never the attempt's passphrase.
     try testing.expect(std.mem.indexOf(u8, written, "hunter2") == null);
+}
+
+test "a second Notary is told WHY, in the words the window matches on" {
+    // The window reads this body. It shows its own sentence when it finds
+    // "already has this key open" in a 409, and re-syncs silently otherwise,
+    // because 409 also means the benign "initialized out from under us". So the
+    // wording here is a contract between two binaries that cannot import each
+    // other, and changing it silently returns the window to the failure this
+    // fixed: the right passphrase, the spinner stopping, and nothing happening.
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const secret = [_]u8{0xC2} ** 32;
+    const passphrase = "correct horse battery staple";
+    const ncryptsec = try keystore.encryptKey(gpa, io, secret, passphrase, .known_secure);
+    defer gpa.free(ncryptsec);
+    try keystore.writeNewKeyFile(io, tmp.dir, "key.ncryptsec", ncryptsec);
+
+    var holder = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    try holder.unlock(io, passphrase);
+
+    var log = audit.Log{ .dir = tmp.dir, .path = "audit.log" };
+    var broker: Broker = .{};
+    var gate = Gate.init(gpa, tmp.dir, "key.ncryptsec", .locked);
+    var server = Server{ .gpa = gpa, .broker = &broker, .gate = &gate, .token = "t", .log = &log, .info = .{ .relays = &.{}, .timeout_ms = 1000 }, .host = "127.0.0.1", .port = 0 };
+
+    var out = std.Io.Writer.Allocating.init(gpa);
+    defer out.deinit();
+    try handleUnlock(&server, io, &out.writer, "{\"passphrase\":\"correct horse battery staple\"}");
+
+    const written = out.written();
+    try testing.expect(std.mem.indexOf(u8, written, "409") != null);
+    try testing.expect(std.mem.indexOf(u8, written, "already has this key open") != null);
+    // And never as a passphrase problem: the passphrase was right.
+    try testing.expect(std.mem.indexOf(u8, written, "401") == null);
 }
 
 test "the key leaving the machine is written down, in the form it left as" {

@@ -217,7 +217,7 @@ pub const Gate = struct {
     /// onboards a fresh key.
     ///
     /// This is the destructive half of switching accounts, and the key file is
-    /// the only copy of that identity on this Mac. Callers must have said so to
+    /// the only copy of that identity on this machine. Callers must have said so to
     /// the reader FIRST; nothing here can un-delete it.
     ///
     /// The in-memory key is zeroed too, but that is not the whole story and the

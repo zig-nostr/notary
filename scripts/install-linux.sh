@@ -34,12 +34,54 @@ set -euo pipefail
 # `local` is gone by then: under `set -u` the cleanup then dies on its own
 # variable, which is a confusing failure at the end of a successful install.
 workdir=""
-cleanup() { [ -n "$workdir" ] && rm -rf "$workdir"; }
+# `return 0` on purpose. Without it the trap's last command is the failed
+# `[ -n "$workdir" ]` of a run that never made a temp directory, and bash exits
+# with THAT: `--help` reported failure, and so would any early exit that had not
+# reached the download yet.
+cleanup() {
+  [ -n "$workdir" ] && rm -rf "$workdir"
+  return 0
+}
 trap cleanup EXIT
 
 say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33mnote:\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
+
+# Whether GTK 4 is on this machine: `present`, `missing`, or `unknown`.
+#
+# `ldconfig` is the reliable answer and it lives in /usr/sbin, which Debian does
+# NOT put on a normal user's PATH. Gating the whole check on
+# `command -v ldconfig` therefore skipped it entirely on one of the three
+# distributions this script names as supported: a Debian user without GTK 4 got
+# a verified download, a cheerful "Installed Notary", and an app that dies on
+# `libgtk-4.so.1` with the launch output thrown away. For an app that holds a
+# key, "it will not start" is the worst thing to discover in silence. So it is
+# looked for by absolute path too, and if there is no ldconfig at all the
+# library directories are searched directly.
+#
+# `grep -c ... || true`, NOT `grep -q`. Under `set -o pipefail` a matching
+# `grep -q` exits at once, `ldconfig` dies of SIGPIPE, and the pipeline reports
+# THAT rather than the match, so the guard fires on a machine that HAS GTK. It
+# fires on one that does not either, because grep exits 1 there, which makes it
+# a check that can never pass. `grep -c` drains its input instead.
+gtkStatus() {
+  local ldc hits d
+  for ldc in ldconfig /usr/sbin/ldconfig /sbin/ldconfig; do
+    command -v "$ldc" >/dev/null 2>&1 || [ -x "$ldc" ] || continue
+    hits="$("$ldc" -p 2>/dev/null | grep -c 'libgtk-4\.so' || true)"
+    if [ "$hits" = "0" ]; then printf 'missing\n'; else printf 'present\n'; fi
+    return
+  done
+  for d in /usr/lib /usr/lib64 /lib /lib64 /usr/local/lib /usr/lib/*-linux-gnu*; do
+    [ -d "$d" ] || continue
+    if compgen -G "$d/libgtk-4.so*" >/dev/null 2>&1; then printf 'present\n'; return; fi
+  done
+  # No ldconfig and nothing in the usual places. Refusing here would turn an
+  # unusual layout into a refused install, so this reports that it cannot tell
+  # and the caller warns rather than dies.
+  printf 'unknown\n'
+}
 
 # All work happens inside main(), invoked on the very last line, so bash runs
 # nothing until the whole script has been read. A truncated `curl | bash` (a
@@ -54,7 +96,12 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --archive) archive="${2:?--archive needs a path}"; shift 2 ;;
-      *) die "unknown argument: $1" ;;
+      -h | --help)
+        printf 'usage: install-linux.sh [--archive <file>]\n\n'
+        printf '  --archive <file>  install this tarball instead of the latest release\n'
+        exit 0
+        ;;
+      *) die "unknown argument: $1 (try --help)" ;;
     esac
   done
 
@@ -65,33 +112,18 @@ main() {
     command -v "$tool" >/dev/null 2>&1 || die "$tool is required and is not on PATH."
   done
 
-  # GTK 4 is the one runtime dependency, and finding out it is missing when the
-  # window fails to open is worse than being told now. Checked by loader rather
-  # than by package name, because the package is called libgtk-4-1 on Debian and
-  # Ubuntu, gtk4 on Fedora and Arch, and something else again elsewhere.
-  #
-  # `grep -c ... || true`, NOT `grep -q`. Under `set -o pipefail` a matching
-  # `grep -q` exits at once, `ldconfig` dies of SIGPIPE, and the pipeline reports
-  # THAT rather than the match, so the guard fires on a machine that has GTK. It
-  # fires on one that does not either, because grep exits 1 there, which makes it
-  # a check that can never pass. `package-linux.sh` carries a comment about this
-  # exact trap and I wrote it here anyway.
-  if command -v ldconfig >/dev/null 2>&1; then
-    local gtk
-    gtk="$(ldconfig -p 2>/dev/null | grep -c "libgtk-4\.so" || true)"
-    [ "$gtk" != "0" ] || die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4."
-  fi
-
   # The distribution floor, checked BEFORE downloading anything or writing files.
   # Without this an Ubuntu 22.04 user gets a clean install, a verified digest, a
   # cheerful "Installed Notary", and then `version GLIBC_2.38 not found` the
   # first time they open it. For an app that holds a key, "it will not start"
   # should never be something you discover after trusting it with one.
   #
-  # glibc is the proxy for both floors. The real constraints are glibc 2.38 (the
-  # binaries are built on Ubuntu 24.04) and GTK 4.10 (the toolkit's own declared
-  # floor), and every distribution that has one has the other, so one check
-  # answers both and needs no -dev package to run.
+  # glibc is the proxy for the DISTRIBUTION GENERATION, not a statement about
+  # these binaries. Notary's own two binaries need only glibc 2.36; what needs a
+  # newer system is GTK 4.10, the toolkit's declared floor, and there is no way
+  # to read GTK's minor version without a -dev package. Every distribution
+  # carrying glibc 2.38 carries GTK 4.10, so this reads the one that is always
+  # legible and gates on it.
   local glibc
   glibc="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+$' || true)"
   if [ -n "$glibc" ]; then
@@ -99,12 +131,23 @@ main() {
     major="${glibc%%.*}"
     minor="${glibc##*.}"
     if [ "$major" -lt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -lt 38 ]; }; then
-      die "this build needs glibc 2.38 or newer and GTK 4.10 or newer; you have glibc $glibc.
+      die "this build needs GTK 4.10 or newer, which means a system newer than yours (glibc $glibc).
        That means Ubuntu 23.10+, Debian 13+, or Fedora 39+. Ubuntu 22.04 and
        Debian 12 are too old for it. Building from source on your own system
        works if its GTK is 4.10 or newer: https://github.com/zig-nostr/notary#build"
     fi
   fi
+
+  # GTK 4 itself, AFTER the floor above. The order matters: an Ubuntu 22.04 user
+  # has GTK 4.6, so a GTK-presence check passes and then tells them nothing,
+  # while the floor tells them the true reason their machine cannot run this.
+  # Checked by loader rather than by package name, because the package is called
+  # libgtk-4-1 on Debian and Ubuntu, gtk4 on Fedora and Arch, and something else
+  # again elsewhere.
+  case "$(gtkStatus)" in
+    missing) die "GTK 4 is missing. Install it first: apt install libgtk-4-1, dnf install gtk4, or pacman -S gtk4." ;;
+    unknown) warn "could not tell whether GTK 4 is installed on this system. If Notary does not open, that is the first thing to check." ;;
+  esac
 
   local arch
   arch="$(uname -m)"
@@ -157,15 +200,24 @@ main() {
   # The digest is published beside the tarball rather than read out of the API
   # body, so a release whose notes were edited cannot change what this compares
   # against.
-  if curl -fsSL -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null; then
-    local want got
-    want="$(awk '{print $1}' "$tmp/$asset.sha256")"
-    got="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
-    [ "$want" = "$got" ] || die "the download does not match its published SHA-256. Not installing it."
-    say "SHA-256 verified."
-  else
-    warn "no published SHA-256 for this release, so the download could not be verified."
-  fi
+  # Required, not best-effort. It used to warn and install anyway when the
+  # sidecar could not be fetched, which is a verification step that any
+  # transient failure switches off. On an app that holds a key that is not a
+  # trade-off worth making: every published release has a digest, so a missing
+  # one is a reason to stop.
+  curl -fsSL --retry 2 --retry-all-errors -o "$tmp/$asset.sha256" "$url.sha256" 2>/dev/null ||
+    die "could not fetch the published SHA-256 for $asset, so the download cannot be verified. Not installing it.
+       Try again, or download the tarball and its .sha256 by hand and pass --archive."
+  local want got
+  want="$(awk '{print $1}' "$tmp/$asset.sha256")"
+  # An empty expected digest compares equal to an empty computed one, and the
+  # whole check then reports success over nothing at all. Both sides are
+  # required to exist before either is trusted.
+  [ -n "$want" ] || die "the published SHA-256 for $asset is empty. Not installing it."
+  got="$(sha256sum "$tmp/$asset" | awk '{print $1}')"
+  [ -n "$got" ] || die "could not compute the SHA-256 of the download. Not installing it."
+  [ "$want" = "$got" ] || die "the download does not match its published SHA-256. Not installing it."
+  say "SHA-256 verified."
 
   installFrom "$tmp" "$asset" "$tag"
 }
@@ -175,7 +227,8 @@ main() {
 installFrom() {
   local tmp="$1" asset="$2" tag="$3"
   say "Unpacking..."
-  tar -C "$tmp" -xzf "$tmp/$asset"
+  tar -C "$tmp" -xzf "$tmp/$asset" 2>/dev/null ||
+    die "the archive could not be unpacked. The download may be incomplete, or the file passed to --archive may not be a Notary tarball."
   local src
   src="$(find "$tmp" -maxdepth 1 -type d -name 'notary-*-linux-*' | head -1)"
   [ -n "$src" ] || die "the archive did not contain what was expected."
@@ -229,10 +282,28 @@ installFrom() {
     *) warn "$prefix/bin is not on your PATH. Add it to run 'notary' from a terminal; the desktop entry works either way." ;;
   esac
 
-  say "Installed Notary $tag."
+  if [ "$tag" = "local" ]; then
+    say "Installed Notary from $asset."
+  else
+    say "Installed Notary $tag."
+  fi
+
+  # Started with its output kept, briefly. It used to go to /dev/null, so a
+  # first run that died on a missing library was indistinguishable from a
+  # working install: the script said "Starting it...", nothing appeared, and
+  # nothing anywhere said why. On the app that holds your key, that silence is
+  # the worst possible failure mode. If it is still alive a moment later the log
+  # is dropped and it is left to run.
   say "Starting it..."
-  "$prefix/bin/notary" >/dev/null 2>&1 &
+  local log pid
+  log="$tmp/first-run.log"
+  "$prefix/bin/notary" >"$log" 2>&1 &
+  pid=$!
   disown 2>/dev/null || true
+  sleep 2
+  kill -0 "$pid" 2>/dev/null && return
+  warn "Notary exited immediately. It is installed at $prefix/bin/notary. This is what it said:"
+  sed 's/^/       /' "$log" >&2 || true
 }
 
 main "$@"

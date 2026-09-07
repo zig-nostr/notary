@@ -7,6 +7,60 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.10.10] - 2026-09-07
+
+### Fixed
+
+- The Linux installer's GTK 4 check was skipped entirely on Debian. It was
+  gated on `command -v ldconfig`, and Debian does not put `/usr/sbin` on a
+  normal user's PATH, so on one of the three distributions this project names
+  as supported the check silently did not run: a machine without GTK 4 got a
+  verified download, a cheerful "Installed Notary", and an app that died on
+  `libgtk-4.so.1`. It looks for `ldconfig` by absolute path too, and falls back
+  to searching the library directories.
+
+- The installer launched Notary with its output discarded, so a first run that
+  failed looked exactly like one that succeeded. It reports what the app said
+  if it exits immediately.
+
+- The SHA-256 check installed anyway when the published digest could not be
+  fetched. It now refuses, and it requires both digests to be non-empty before
+  comparing them: two empty strings compare equal, and the check then reports
+  success over nothing at all.
+
+- The distribution floor is now checked before GTK presence. An Ubuntu 22.04
+  machine has GTK 4.6, so a presence check passes there and says nothing useful
+  while the floor is the actual reason it cannot run this.
+
+- A second Notary on the same key left the unlock screen silent. The daemon
+  answers 409 with "another Notary already has this key open", and the window
+  discarded it and re-synced, so the right passphrase produced no error and no
+  progress. Two ordinary paths reach it: installing Plaza and then Notary, and
+  re-running the installer while Notary is open.
+
+- `exit_note_buf` and `onboard_error_buf` were too small for the messages
+  written into them. `setExitNote` formats with `catch return`, so a message one
+  byte too long was not truncated but dropped entirely, leaving a dead window
+  with no explanation at all.
+
+- "This Mac holds the only copy" next to the backup button now says "this
+  computer". 0.10.7 claimed that sweep covered everywhere it appeared; it had
+  missed the one sentence a Linux user reads about losing their identity.
+
+- A signer that fails to start no longer tells the reader to check `SIGNER_BIN`,
+  a developer override documented only in `gui/README.md`.
+
+- `tar` failures, unknown arguments and `--help` now produce messages and the
+  right exit codes. The `EXIT` trap returned the status of its own failed test
+  when no temp directory had been made, so `--help` exited 1.
+
+### Removed
+
+- Two committed empty files named `no-such-key.ncryptsec`, at the repository
+  root and in `daemon/`. A test opens that path expecting it to be absent, and
+  it was reading the working directory, so the file the test is named for
+  existed. The test now uses its own temp directory.
+
 ## [0.10.9] - 2026-09-07
 
 ### Changed
