@@ -71,6 +71,20 @@ release is built by CI from a tagged commit
 trust nothing you didn't run? Read the
 [installer](scripts/install-macos.sh) and [build from source](#build).
 
+**Linux (x86_64 and aarch64):**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-linux.sh | bash
+```
+
+GTK 4 is the one runtime dependency, and the installer says so before it
+downloads anything rather than after the window fails to open. It verifies the
+SHA-256, installs into `~/.local` so nothing needs root and nothing lands
+outside your home directory, puts Notary in the launcher, and starts it. Pass
+`--archive <file>` to install a tarball you already have, which needs no
+network. There is nothing to sign or notarise here, and the trust anchor is the
+same: a build you can reproduce.
+
 ## Two components, one product
 
 Notary is split into two processes on purpose, so the secret key stays isolated
@@ -102,7 +116,9 @@ from the user interface:
   screen. `signer import` reads it from the terminal instead, so it never
   touches the window at all.
 
-Packaged together, one download brings up both as a single macOS `.app`.
+Packaged together, so one download brings up both: a single `.app` on macOS, and
+a tarball carrying the two binaries side by side on Linux. The window finds the
+daemon beside its own executable either way.
 
 ## Build
 
