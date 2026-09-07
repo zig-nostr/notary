@@ -26,6 +26,10 @@ set -euo pipefail
 say() { printf '\033[1m==>\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31merror:\033[0m %s\n' "$1" >&2; exit 1; }
 
+# The caller's directory, captured BEFORE anything cds, because a relative
+# --output or --signer means "relative to where you typed it" and this script
+# moves to gui/ before using either.
+caller_pwd="$PWD"
 gui_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 outdir="$gui_root/dist"
 signer="${SIGNER_BIN:-$gui_root/../daemon/zig-out/bin/signer}"
@@ -40,12 +44,14 @@ done
 [ "$(uname -s)" = "Linux" ] || die "packaging for Linux needs Linux (the gtk4 link does not cross)."
 command -v native >/dev/null 2>&1 || die "the Native SDK CLI is not on PATH (npm install -g @native-sdk/cli)."
 pkg-config --exists gtk4 2>/dev/null || die "gtk4 development files are missing (apt install libgtk-4-dev)."
-[ -x "$signer" ] || die "no signer daemon at '$signer'. Build it: (cd daemon && zig build -Doptimize=ReleaseFast)"
+# Both made absolute against the caller's directory, or they silently become
+# paths relative to gui/ once this cds. --signer failed loudly, after the build
+# had already run. --output failed SILENTLY: the tarball went to gui/dist while
+# CI looked in dist/, and the only symptom was a later step finding no file.
+case "$signer" in /*) ;; *) signer="$caller_pwd/$signer" ;; esac
+case "$outdir" in /*) ;; *) outdir="$caller_pwd/$outdir" ;; esac
 
-# Resolved BEFORE the cd, or a relative --signer silently becomes a path
-# relative to gui/ and the copy fails after the build has already run. The
-# check above passed for exactly that reason: it ran in the caller's directory.
-signer="$(cd "$(dirname "$signer")" && pwd)/$(basename "$signer")"
+[ -x "$signer" ] || die "no signer daemon at '$signer'. Build it: (cd daemon && zig build -Doptimize=ReleaseFast)"
 
 cd "$gui_root"
 version="$(sed -n 's/^ *\.version = "\(.*\)",$/\1/p' app.zon | head -1)"
