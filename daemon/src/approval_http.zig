@@ -2359,8 +2359,15 @@ test "Allow once actually lets one request through, and only one" {
 
 test "a one-shot answer covers only the question it answered" {
     var broker: Broker = .{};
-    const plaza = nostr.signer_ipc.clientId("plaza");
-    const other = nostr.signer_ipc.clientId("something-else");
+    // Two distinct client ids. `signer_ipc.clientId` built these until nostr
+    // 0.13.0 removed it along with the header a local client used to introduce
+    // itself with; production names the one caller it has with the
+    // `local_client` literal above, so a test that needs two makes its own.
+    // Only their distinctness matters here.
+    const plaza: [32]u8 = local_client;
+    var other: [32]u8 = local_client;
+
+    other[31] +%= 1;
 
     var info = Pending{ .local = true, .kind = 1, .method_id = .sign_event, .client_id = plaza };
     try testing.expectEqual(Broker.Knock.filed, broker.knock(info));
