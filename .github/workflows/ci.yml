@@ -148,20 +148,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev
 
-      # The retried fetch: `zig build` dies with "unable to discover remote git
-      # server capabilities: ProtocolError" pulling secp256k1, which this repo
-      # pins by git URL rather than by tarball. Seen on three runners now, and
-      # it failed a release build outright over in Plaza.
-      - name: Fetch the dependency tree
-        run: |
-          for attempt in 1 2 3 4 5; do
-            if (cd daemon && zig build --fetch); then exit 0; fi
-            echo "fetch attempt $attempt failed" >&2
-            sleep $((attempt * 10))
-          done
-          echo "could not fetch dependencies in five attempts" >&2
-          exit 1
-
       - name: Build the daemon
         run: cd daemon && zig build -Doptimize=ReleaseFast -Dcpu=baseline
 
