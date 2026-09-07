@@ -7,6 +7,22 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.10.9] - 2026-09-07
+
+### Changed
+
+- When a relay connection has gone quiet, and what to do about it, comes from
+  the `nostr` library (`nostr.liveness`) rather than from a copy kept here. The
+  same three numbers and the same decision existed in this daemon and in the
+  client built on the same library, and were written down in neither, so a
+  correction to one would silently not reach the other. The table of
+  connections and the thread that ticks stay here: what "give up" means differs
+  between a signer and a client.
+
+- Pins `nostr` 0.14.1, which fixes a leak on this daemon's own reconnect path:
+  `Relay.deinit` freed everything a dial allocated except the `Relay` itself, so
+  every reconnect leaked one.
+
 ## [0.10.1] - 2026-08-28
 
 ### Changed

@@ -1,5 +1,13 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.10.9
+
+**Housekeeping, and one leak.** When a relay connection has gone quiet and what to do about it now comes from the `nostr` library rather than a copy kept here: the same three numbers and the same decision existed in Notary and in Plaza, written down in neither, so a correction to one would silently not reach the other.
+
+The library release that carries it also fixes a leak on Notary's own reconnect path: freeing a relay connection freed everything except the connection object itself, so every reconnect left one behind for the life of the daemon.
+
+Nothing you can see changed. Everything in v0.10.8 below is in this release too.
+
 ### What's new in v0.10.8
 
 **There is a Linux download now.** 0.10.7 said Notary ran on Linux and offered only a macOS app, which was true and useless. This release carries a tarball for x86_64 and aarch64:
