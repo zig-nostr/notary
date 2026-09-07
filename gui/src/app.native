@@ -48,7 +48,7 @@
       <if test="{backup_closed}">
         <row gap="8">
           <button variant="secondary" on-press="reveal_backup">Back up your key</button>
-          <text grow="1" foreground="text_muted" wrap="true">This Mac holds the only copy. Without a backup, losing it loses the identity: a nostr key cannot be replaced.</text>
+          <text grow="1" foreground="text_muted" wrap="true">This computer holds the only copy. Without a backup, losing it loses the identity: a nostr key cannot be replaced.</text>
         </row>
       </if>
       <if test="{backup_open}">

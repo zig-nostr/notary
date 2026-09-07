@@ -342,7 +342,11 @@ pub const Model = struct {
     relays_len: usize = 0,
     /// Short human note for the `.daemon_exited` state, e.g. "signer exited
     /// (code 1)".
-    exit_note_buf: [64]u8 = [_]u8{0} ** 64,
+    // 160, not 64. `setExitNote` formats into this and `catch return`s, so a
+    // message one byte too long is not truncated, it is DROPPED: the reader
+    // gets a dead window with no note at all, which is the failure the note
+    // exists to explain.
+    exit_note_buf: [160]u8 = [_]u8{0} ** 160,
     exit_note_len: usize = 0,
 
     rows: [max_pending]Row = [_]Row{.{}} ** max_pending,
@@ -422,7 +426,9 @@ pub const Model = struct {
 
     /// A `/setup` or `/unlock` POST is in flight (disables the submit button).
     submitting: bool = false,
-    onboard_error_buf: [96]u8 = [_]u8{0} ** 96,
+    // 160, not 96. The longest message here names two things to quit and was
+    // silently truncated at 96, which turns an instruction into a fragment.
+    onboard_error_buf: [160]u8 = [_]u8{0} ** 160,
     onboard_error_len: usize = 0,
 
     // -- config accessors --
@@ -555,7 +561,7 @@ pub const Model = struct {
     ///
     /// This window ships inside more than one app. Started from Plaza, the
     /// signer beside it is Plaza's, and naming Notary's sends a reader to a
-    /// path that does not exist on their Mac unless they also installed Notary
+    /// path that does not exist on their machine unless they also installed Notary
     /// on its own. So the real neighbour wins whenever there is one.
     ///
     /// The constant stays for the case it was written for: a dev build with no
@@ -884,7 +890,14 @@ pub const Model = struct {
 
     fn setExitNote(self: *Model, exit: native_sdk.EffectExit) void {
         const s = switch (exit.reason) {
-            .spawn_failed, .rejected => std.fmt.bufPrint(&self.exit_note_buf, "The signer failed to start, check SIGNER_BIN.", .{}),
+            // Names a path, not an environment variable. `SIGNER_BIN` is a
+            // developer override documented in gui/README.md, and a reader who
+            // installed with the one-line installer has never heard of it: the
+            // message told them to check something they do not have. What is
+            // actually true for them is that the two binaries have to sit
+            // together, which is what both packagers arrange and what an
+            // interrupted install breaks.
+            .spawn_failed, .rejected => std.fmt.bufPrint(&self.exit_note_buf, "The signer did not start. It has to sit beside Notary in the same folder; installing again puts it back.", .{}),
             .signaled => std.fmt.bufPrint(&self.exit_note_buf, "The signer was terminated (signal).", .{}),
             else => std.fmt.bufPrint(&self.exit_note_buf, "The signer exited (code {d}).", .{exit.code}),
         } catch return;
@@ -1789,8 +1802,28 @@ fn onOnboardResponse(model: *Model, fx: *Effects, r: native_sdk.EffectResponse, 
     if (r.outcome == .ok) switch (r.status) {
         401 => model.setOnboardError("Wrong passphrase."),
         400 => model.setOnboardError(if (kind == .setup) "Check the passphrase and key." else "Bad request."),
-        // Initialized/unlocked out from under us: re-sync from /info.
-        409 => fetchInfo(model, fx),
+        409 => {
+            // TWO different situations answer 409, and they need different
+            // words. One is benign: the key was initialized or unlocked out
+            // from under us, so re-syncing from /info lands on the right
+            // screen. The other is not: another Notary already holds this key
+            // open (the daemon takes a non-blocking exclusive lock on the key
+            // file), and re-syncing alone leaves the reader on the unlock
+            // screen with no error at all. They type the RIGHT passphrase, the
+            // spinner stops, and nothing happens, forever, with nothing
+            // anywhere saying why.
+            //
+            // Two ways in, both ordinary: installing Plaza and then running
+            // Notary's installer, which starts a second Notary while Plaza's
+            // embedded keyholder holds the lock; and re-running the installer
+            // to upgrade while Notary is open.
+            //
+            // The daemon says which it is, so read it rather than guess.
+            if (std.mem.indexOf(u8, r.body, "already has this key open") != null) {
+                model.setOnboardError("Another Notary already has this key open. Quit it, or the app that started it, then try again.");
+            }
+            fetchInfo(model, fx);
+        },
         else => model.setOnboardError("The signer rejected the request."),
     } else {
         model.setOnboardError("Could not reach the signer.");
