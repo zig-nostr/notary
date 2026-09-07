@@ -77,6 +77,13 @@ trust nothing you didn't run? Read the
 curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-linux.sh | bash
 ```
 
+A reasonably recent distribution: **Ubuntu 23.10+, Debian 13+, or Fedora 39+**.
+The toolkit's Linux host declares a GTK floor of 4.10 and the binaries are built
+against glibc 2.38, which land on the same generation, so Ubuntu 22.04 and
+Debian 12 are too old. The installer checks that before downloading anything,
+because "it will not start" is not something to discover after trusting an app
+with your key.
+
 GTK 4 is the one runtime dependency, and the installer says so before it
 downloads anything rather than after the window fails to open. It verifies the
 SHA-256, installs into `~/.local` so nothing needs root and nothing lands
