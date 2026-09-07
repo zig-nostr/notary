@@ -7,6 +7,37 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.10.11] - 2026-09-08
+
+### Fixed
+
+- Off macOS, a codepoint the toolkit's bundled face does not carry was painted
+  as a solid filled rectangle, and that face covers Latin and Cyrillic. Notary's
+  own text is English so this looked like nothing, but two fields on the
+  approval screen are not Notary's text: the client's chosen name, and the
+  preview of the event it wants signed. A Japanese note was a row of blocks on
+  the one screen that has to be readable before somebody agrees to it. The
+  window now carries Noto for Greek, Japanese, Chinese and Korean, about 13 MB
+  off macOS and nothing on it.
+
+- Medium and bold resolved to the regular face off macOS, because the toolkit
+  maps a span's weight onto reserved font ids and bundles no face for them, so
+  every heading and button label in the window was flat. It supplies the two
+  Geist weights now.
+
+### Changed
+
+- The window builds against a framework pinned by commit, in `gui/build.zig.zon`,
+  rather than against whatever `@native-sdk/cli` was installed on the machine
+  doing the build. `native eject` had written a machine-local path into
+  somebody's npm directory, which is reproducible on exactly one computer: every
+  runner and every contributor compiled against a different framework, and a
+  release was whatever npm served that afternoon.
+
+- The framework is 0.10.1, and the CLI pin in CI moves with it in the same
+  commit. The two have to agree on the automation protocol, and a mismatch does
+  not fail a build, it silently breaks every live test.
+
 ## [0.10.10] - 2026-09-07
 
 ### Fixed
