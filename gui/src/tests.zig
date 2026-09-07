@@ -93,6 +93,11 @@ test "the secret is minted fresh and never leaves this process except down the p
     // (`ps -Eww` printed one), and could always read a 0600 token file, because
     // file permissions separate USERS and not apps. A pipe to a child has no
     // name and no path, so there is nothing to open.
+    // The mint reaches the OS CSPRNG through `io`, so the test provides one.
+    var threaded = std.Io.Threaded.init(testing.allocator, .{});
+    defer threaded.deinit();
+    main.setIoForTest(threaded.io());
+
     var a = Model{};
     var b = Model{};
     a.mintDaemonSecret();
@@ -293,7 +298,7 @@ test "an approval row says who is asking and what would be signed" {
     const old_tree = try buildTree(arena_state.allocator(), &old);
     _ = try expectByText(old_tree.root, .text, "unknown client");
 
-    // An app on this Mac gets the other sentence. It named itself, and any
+    // An app on this computer gets the other sentence. It named itself, and any
     // program running as this user could have named itself the same, so the
     // row says what happened rather than asserting an identity: this is the
     // one screen in the application whose whole job is to be read carefully
@@ -305,7 +310,7 @@ test "an approval row says who is asking and what would be signed" {
         \\"local":true,"client":"plaza","preview":"gm"}]}
     );
     const here_tree = try buildTree(arena_state.allocator(), &here);
-    _ = try expectByText(here_tree.root, .text, "an app on this Mac calling itself \"plaza\"");
+    _ = try expectByText(here_tree.root, .text, "an app on this computer calling itself \"plaza\"");
 
     // And it must not be dressed up as proof of who is asking.
     try testing.expect(findByText(here_tree.root, .text, "from plaza") == null);
@@ -683,7 +688,7 @@ test "a refused nostrconnect link says which thing went wrong" {
 test "the destructive key removal is inert until the phrase matches exactly" {
     var m = main.Model{};
     // Disabled by default, so the press that removes somebody's only copy of an
-    // identity on this Mac cannot be a mis-click.
+    // identity on this computer cannot be a mis-click.
     try testing.expect(m.forget_disabled());
 
     m.forget_buf.set("yes");

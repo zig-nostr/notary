@@ -5,7 +5,7 @@
     .description = "Notary: approve or deny Nostr signing requests; your key stays in the signer daemon.",
     .version = "0.10.6",
     .icons = .{"assets/icon.png"},
-    .platforms = .{"macos"},
+    .platforms = .{ "macos", "linux" },
     .permissions = .{ "view", "command", "clipboard" },
     .capabilities = .{ "native_views", "gpu_surfaces" },
     .shell = .{
