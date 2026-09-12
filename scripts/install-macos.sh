@@ -42,7 +42,31 @@ main() {
   local tag url digest
   tag="$(printf '%s' "$json" | grep -o '"tag_name":[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
   url="$(printf '%s' "$json" | grep -o '"browser_download_url":[[:space:]]*"[^"]*macos\.zip"' | head -1 | sed -E 's/.*"(https[^"]+)".*/\1/')"
-  digest="$(printf '%s' "$json" | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2)"
+  # The digest OF THE FILE BEING DOWNLOADED, which is not the same thing as the
+  # first digest in the release.
+  #
+  # This used to be `grep -o 'sha256:...' | head -1` over the whole response,
+  # which takes the first digest in the JSON whatever asset it belongs to.
+  # Correct while a release carried one asset, and wrong from the moment the
+  # Linux tarballs were added: GitHub lists assets in upload order, so the first
+  # digest belongs to whichever packaging job finished first. On v0.10.11 that
+  # is notary-0.10.11-linux-aarch64.tar.gz, so every macOS install fails with a
+  # checksum mismatch on a download that is perfectly fine.
+  #
+  # That is the worst way for a checksum to fail. The bytes are right and the
+  # comparison is against something else, so the tool tells people their
+  # download is corrupt and refuses. A check that cries wolf teaches people to
+  # skip checks.
+  #
+  # So the digest is read from the asset that names the file. The response is
+  # pretty-printed, so it is FLATTENED FIRST and only then split on the `{` that
+  # starts each object: without the flatten every field is already on its own
+  # line and the name and the digest can never meet. The segment naming the
+  # macOS zip ends at the next asset's `{`, so it cannot reach a neighbour's.
+  #
+  # No jq. This runs before anything is installed and uses only what macOS
+  # already ships. Plaza carries the identical fix and the identical guard.
+  digest="$(printf '%s' "$json" | tr -d '\n' | tr '{' '\n' | grep 'macos\.zip' | grep -o 'sha256:[0-9a-f]\{64\}' | head -1 | cut -d: -f2 || true)"
 
   [ -n "$url" ] || die "no macOS build found on the latest release (${tag:-unknown})."
   say "Latest release: ${tag:-unknown}"
