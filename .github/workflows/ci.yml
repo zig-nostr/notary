@@ -67,6 +67,19 @@ jobs:
           fi
           echo "release notes are for v$version"
 
+      # The installer verifies the file it downloaded, not whatever is listed
+      # first. The script read the first `sha256:` in the release JSON, which
+      # was correct while a release carried one asset and became wrong the
+      # moment the Linux tarballs were added: GitHub lists assets in upload
+      # order, so the first digest belongs to whichever packaging job finished
+      # first. On v0.10.11 that is the Linux aarch64 tarball, so every macOS
+      # install failed with a checksum mismatch on a perfectly good download.
+      #
+      # The checks live in the script so they can be run by hand, and so this
+      # file does not carry shell that only ever runs on a runner.
+      - name: The macOS installer verifies the macOS download
+        run: scripts/check-macos-installer.sh ${{ github.repository }} .
+
   # The GUI (Native SDK): macOS only, via the native CLI.
   gui:
     runs-on: macos-latest
