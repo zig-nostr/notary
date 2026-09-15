@@ -109,6 +109,23 @@ pub const Server = struct {
     /// forever.
     idle_exit_ms: i64 = 0,
 
+    /// The process that spawned this daemon, recorded at startup. Zero means
+    /// nobody is being watched.
+    ///
+    /// This daemon holds an advisory lock on the key file for as long as it
+    /// lives, and one keyholder per key is the rule. The kernel drops that lock
+    /// when the process ends, so a daemon that CRASHES releases it. A daemon
+    /// whose parent crashed does not: it is orphaned, still alive, still
+    /// holding the lock, and the next app to start is told another Notary has
+    /// the key open. The only wait that ever cleared it was the idle exit, a
+    /// quarter of an hour later.
+    ///
+    /// A pid rather than a pipe, because the pipe is gone: the spawner writes
+    /// the secret to stdin and closes it immediately, which `readSecretFromStdin`
+    /// relies on to know the secret ended. There is no channel left to notice
+    /// an end on, so the parent is watched directly.
+    parent_pid: std.posix.pid_t = 0,
+
     active: std.atomic.Value(u32) = .init(0),
     /// Filled once the listener is up. With `port` 0 this is the only place the
     /// real port exists.
@@ -293,7 +310,36 @@ fn runReaper(self: *Server) void {
         self.broker.expireUnanswered(std.Io.Timestamp.now(io, .real).toSeconds());
         if (idleExpired(self.idle_exit_ms, self.broker.last_request_ms.load(.monotonic), now))
             exitIdle(self, io);
+        if (parentGone(self.parent_pid, std.posix.getppid()))
+            exitOrphaned(self, io);
     }
+}
+
+/// Whether the process that started this daemon has gone.
+///
+/// Pure over the two pids, because the alternative is a test that kills a real
+/// parent and races the kernel's re-parenting.
+///
+/// Compares against the RECORDED parent rather than looking for pid 1: on macOS
+/// an orphan is re-parented to launchd, on Linux to init or to a subreaper, and
+/// which of those it lands on is not this daemon's business. What it knows is
+/// which process started it, and that that process is no longer the one above
+/// it. Zero disables the watch, which is what a daemon nobody spawned gets.
+pub fn parentGone(recorded: std.posix.pid_t, current: std.posix.pid_t) bool {
+    if (recorded == 0) return false;
+    return current != recorded;
+}
+
+/// Goes, because the app this key was unlocked for is gone.
+///
+/// Distinct from `exitIdle` in the log line and nothing else. The lock this
+/// releases is the whole point: the reader's next launch has to be able to open
+/// their own key, and until this process ends it cannot.
+fn exitOrphaned(self: *Server, io: std.Io) noreturn {
+    note(self, io, .{ .what = "lock", .outcome = "orphaned" });
+    if (self.clients) |c| c.clear();
+    self.broker.reset();
+    std.process.exit(0);
 }
 
 /// Whether a daemon that has answered nobody for this long should go.
@@ -2312,6 +2358,42 @@ test "a daemon nobody is using clocks out, and one nobody has reached yet does n
     // silence is the normal state rather than a sign that everyone left.
     try testing.expect(!idleExpired(0, 1_000_000, 1_000_000 + 60 * minute));
     try testing.expect(!idleExpired(-1, 1_000_000, 1_000_000 + 60 * minute));
+}
+
+test "an orphaned keyholder goes instead of sitting on the key" {
+    // The bug this closes: Plaza segfaults, its signer is orphaned, the
+    // advisory lock on the key file is still held by a LIVE process, and the
+    // reader's next launch is told another Notary has their key open. A crashed
+    // daemon releases the lock; a daemon whose PARENT crashed does not.
+    const spawner: std.posix.pid_t = 4242;
+
+    // Still the same process above it: nothing to do.
+    try testing.expect(!parentGone(spawner, spawner));
+
+    // Re-parented, so the app that unlocked this key is gone. Which pid it
+    // landed on does not matter and is deliberately not asserted: macOS says
+    // launchd, Linux says init or a subreaper.
+    try testing.expect(parentGone(spawner, 1));
+    try testing.expect(parentGone(spawner, 9999));
+
+    // Nobody recorded, so nobody is watched. That is a daemon started from a
+    // terminal, which must not exit because a shell did.
+    try testing.expect(!parentGone(0, 1));
+    try testing.expect(!parentGone(0, 4242));
+}
+
+test "the parent is read before any thread could change what is above us" {
+    // Asserted on the source's ordering, because the alternative is spawning a
+    // real daemon and killing a real parent.
+    //
+    // `getppid` has to be read while this is still single-threaded and still
+    // owned by its spawner. Read it later and a re-parent that already happened
+    // records the NEW parent as the one to watch, which never changes again and
+    // silently disables the whole check.
+    const src = @embedFile("main.zig");
+    const read_at = std.mem.indexOf(u8, src, ".parent_pid = std.posix.getppid()").?;
+    const first_thread_at = std.mem.indexOf(u8, src, "std.Thread.spawn").?;
+    try testing.expect(read_at < first_thread_at);
 }
 
 test "the idle clock is only wound by a caller that presented the token" {

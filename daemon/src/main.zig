@@ -274,6 +274,13 @@ fn runGuiMode(gpa: std.mem.Allocator, addr: []const u8, conn_secret: ?[]const u8
         .local_paired = true,
         .log = &g_audit,
         .idle_exit_ms = idleExitMs(),
+        // Read HERE, before any thread exists and before anything can change
+        // what is above this process. Reaching this line at all means
+        // `--approval-http` was passed and a secret arrived on stdin, which is
+        // the spawned-by-an-app path and the only one where a parent is
+        // something to outlive. A daemon somebody started from a terminal takes
+        // the headless route and never builds this server.
+        .parent_pid = std.posix.getppid(),
         .info = .{ .relays = relays.items, .timeout_ms = broker_storage.timeout_ms, .secret = conn_secret, .relay_status = relay_status, .serve_relays = serve_relays, .conf_file = conf_path },
         .clients = &g_authorized_clients,
         .host = hp.host,
