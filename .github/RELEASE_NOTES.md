@@ -1,5 +1,11 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.10.12
+
+**The keyholder no longer sits on your key after the app it was unlocked for has gone.** Notary holds one keyholder per key, and it enforces that with a lock the system releases whenever the process ends. That covers a keyholder that crashes. What it did not cover was a keyholder whose PARENT crashed: the app died, this process was left running with nothing to do, and it kept the lock. Typing your passphrase then told you another Notary already had the key open, which was true, in a process nobody could see. The only thing that cleared it was a fifteen minute timer.
+
+It now notices that the app that started it is gone and exits within about a second, which hands the key back. A Notary you started yourself from a terminal is unaffected and keeps running, because it has no such parent to lose.
+
 ### What's new in v0.10.11
 
 **The signing prompt can be read in any language.** Off macOS Notary drew every character from the one font it had, which covers Latin and Cyrillic, so anything else was a solid grey rectangle. That is harmless for Notary's own text, which is English. It was not harmless for the two fields that are not Notary's text: the name of the app asking for a signature, and the preview of what it wants signed. A Japanese note came up as a row of blocks on the one screen where you have to read something before you agree to it.
