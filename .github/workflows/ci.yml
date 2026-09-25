@@ -80,6 +80,13 @@ jobs:
       - name: The macOS installer verifies the macOS download
         run: scripts/check-macos-installer.sh ${{ github.repository }} .
 
+      # The release's publish job refuses to lift the draft until this says every
+      # artifact is up. Its self-test covers a missing file, an upload that never
+      # finished, an empty file and another version's files, and checks its list
+      # of architectures against release.yml's matrix.
+      - name: The release check refuses an incomplete release
+        run: scripts/check-release-assets.sh --self-test
+
   # The GUI (Native SDK): macOS only, via the native CLI.
   gui:
     runs-on: macos-latest
