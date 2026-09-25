@@ -75,13 +75,22 @@ jobs:
       # succeeded, and a re-run is what somebody reaches for when a publish
       # fails halfway. The tests above still gate it, so nothing arrives here
       # that has not passed them on the tag's own source.
+      #
+      # An existing release goes back to being a draft FIRST, so both branches
+      # leave it invisible until `publish` has checked every artifact. Uploading
+      # straight into a published release offered a partial set for as long as
+      # the other jobs took. While it is a draft the release page and the latest
+      # link fall back to the newest other release. `publish` lifts it without
+      # claiming Latest for it, so re-running an older tag cannot take Latest
+      # away from a newer one.
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           asset="Notary-${GITHUB_REF_NAME}-macos.zip"
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            echo "release exists; replacing its artifact with the one built here"
+            echo "release exists; hiding it and replacing its artifact with the one built here"
+            gh release edit "$GITHUB_REF_NAME" --draft=true
             gh release upload "$GITHUB_REF_NAME" "$asset" --clobber
           else
             # A DRAFT. The Linux tarballs are built by another job that takes
@@ -161,16 +170,36 @@ jobs:
   # Lifts the draft, once and only once every artifact is up. Until this runs
   # the release is invisible, so there is no window in which the page offers a
   # Linux install that is not there yet.
+  #
+  # "Every artifact is up" is CHECKED, not inferred from the jobs above having
+  # exited 0: each expected file has to be listed by name, finished uploading,
+  # and not empty. The check is a script so it can be run by hand against any
+  # release, and ci.yml runs its self-test on every change.
   publish:
     needs: [macos-app, linux-tarball]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Every artifact is up
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            --jq '.assets[] | "\(.name)\t\(.state)\t\(.size)"' \
+            | scripts/check-release-assets.sh "$GITHUB_REF_NAME"
+
+      # `make_latest=legacy`, not gh's `--draft=false`. Publishing a draft
+      # defaults to making it Latest, which is right for a new tag and wrong for
+      # an older one re-run through the branch above: it would move
+      # /releases/latest, where both installers look, back a version. `legacy`
+      # lets GitHub pick Latest by version and date, so a new release still
+      # becomes Latest and a re-published old one does not. gh cannot send
+      # `legacy`, hence the API call.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release edit "$GITHUB_REF_NAME" --draft=false
-          echo "published $GITHUB_REF_NAME with:"
-          gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name'
+          id="$(gh release view "$GITHUB_REF_NAME" --json databaseId --jq .databaseId)"
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$id" \
+            -F draft=false -f make_latest=legacy --jq '"published \(.tag_name)"'
