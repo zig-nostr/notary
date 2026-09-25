@@ -24,7 +24,7 @@ LINUX_ARCHES="x86_64 aarch64"
 # Every file a release of $1 should carry, one per line.
 expected() {
   local tag="$1" ver="${1#v}" arch
-  printf '%s\n' "Notary-$tag-macos.zip"
+  printf '%s\n' "Notary-$tag-macos.zip" "Notary-$tag-macos.zip.sha256"
   for arch in $LINUX_ARCHES; do
     printf '%s\n' "notary-$ver-linux-$arch.tar.gz" "notary-$ver-linux-$arch.tar.gz.sha256"
   done
@@ -87,7 +87,9 @@ self_test() {
   refuses "an unfinished upload" "Notary-v9.9.9-macos.zip" 1 "${full/$from/$to}"
   from="x86_64.tar.gz${tab}uploaded${tab}1000" to="x86_64.tar.gz${tab}uploaded${tab}0"
   refuses "an empty file" "notary-9.9.9-linux-x86_64.tar.gz" 1 "${full/$from/$to}"
-  refuses "a release built for another version" "Notary-v9.9.9-macos.zip" 5 \
+  refuses "a macOS zip without its digest" "Notary-v9.9.9-macos.zip.sha256" 1 \
+    "$(grep -v 'macos.zip.sha256' <<<"$full")"
+  refuses "a release built for another version" "Notary-v9.9.9-macos.zip" 6 \
     "${full//9.9.9/9.9.8}"
 
   local matrix
