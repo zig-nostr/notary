@@ -1049,22 +1049,24 @@ test "a poll written before an answer landed does not bring the window back" {
     try testing.expect(m.surfaced);
 }
 
-/// How a `POST /decision` for `id` went.
-fn decidedMsg(id: u64, outcome: native_sdk.EffectFetchOutcome, status: u16) Msg {
+/// How the `POST /decision` for `id` that is on its way went.
+fn decidedMsg(m: *const Model, id: u64, outcome: native_sdk.EffectFetchOutcome, status: u16) Msg {
     const body = if (outcome == .ok and status == 200) "{\"ok\":true}" else "";
-    return .{ .decided = .{ .key = main.decisionKey(id), .outcome = outcome, .status = status, .body = body } };
+    return .{ .decided = .{ .key = m.decisionKeyOf(id).?, .outcome = outcome, .status = status, .body = body } };
 }
+
+const Outcome = struct { outcome: native_sdk.EffectFetchOutcome, status: u16 };
 
 test "an answer that did not reach the signer brings the request and the window back" {
     // A timeout, a refused token, a signer that failed, and a send that never
     // started. Each leaves the request waiting on the signer with nobody
     // looking at it, and no poll brings it back: the queue did not change.
-    const failures = [_]Msg{
-        decidedMsg(7, .timed_out, 0),
-        decidedMsg(7, .ok, 401),
-        decidedMsg(7, .ok, 500),
-        decidedMsg(7, .connect_failed, 0),
-        decidedMsg(7, .rejected, 0),
+    const failures = [_]Outcome{
+        .{ .outcome = .timed_out, .status = 0 },
+        .{ .outcome = .ok, .status = 401 },
+        .{ .outcome = .ok, .status = 500 },
+        .{ .outcome = .connect_failed, .status = 0 },
+        .{ .outcome = .rejected, .status = 0 },
     };
     for (failures) |failure| {
         var fx: main.Effects = undefined;
@@ -1080,7 +1082,7 @@ test "an answer that did not reach the signer brings the request and the window 
         try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
         try testing.expect(!m.has_decision_note());
 
-        main.update(&m, failure, &fx);
+        main.update(&m, decidedMsg(&m, 7, failure.outcome, failure.status), &fx);
         try testing.expectEqual(@as(usize, 1), m.rows_len);
         try testing.expectEqual(@as(u64, 7), m.rows[0].id);
         try testing.expectEqualStrings("sign_event", m.rows[0].method());
@@ -1104,7 +1106,7 @@ test "an answer that did not reach the signer brings the request and the window 
         // Answered again, and this time it lands: gone, and the window with it.
         main.update(&m, .{ .approve = 7 }, &fx);
         try testing.expect(!m.has_decision_note());
-        main.update(&m, decidedMsg(7, .ok, 200), &fx);
+        main.update(&m, decidedMsg(&m, 7, .ok, 200), &fx);
         try testing.expectEqual(@as(usize, 0), m.rows_len);
         try testing.expectEqual(@as(u32, 2), fx.windowActionState().hide_count);
         try testing.expect(m.window_hidden);
@@ -1119,7 +1121,7 @@ test "a failed answer puts back one request, in its place, even after a poll re-
 
     main.update(&m, pendingMsg(&.{ 3, 7, 9 }), &fx);
     main.update(&m, .{ .approve = 7 }, &fx);
-    main.update(&m, decidedMsg(7, .timed_out, 0), &fx);
+    main.update(&m, decidedMsg(&m, 7, .timed_out, 0), &fx);
     try testing.expectEqual(@as(usize, 3), m.rows_len);
     try testing.expectEqual(@as(u64, 3), m.rows[0].id);
     try testing.expectEqual(@as(u64, 7), m.rows[1].id);
@@ -1129,11 +1131,90 @@ test "a failed answer puts back one request, in its place, even after a poll re-
     // A poll written before the failure came back already listed it again.
     main.update(&m, .{ .approve = 9 }, &fx);
     main.update(&m, pendingMsg(&.{ 3, 9 }), &fx);
-    main.update(&m, decidedMsg(9, .ok, 503), &fx);
+    main.update(&m, decidedMsg(&m, 9, .ok, 503), &fx);
     try testing.expectEqual(@as(usize, 2), m.rows_len);
     try testing.expect(m.has_decision_note());
     // Neither counts as answered any more: both are still the reader's to answer.
     try testing.expectEqual(@as(usize, 0), m.answered_len);
+}
+
+/// The `POST /decision` requests on their way, as (key, request id) pairs.
+fn decisionsInFlight(fx: *main.Effects, out: [][2]u64) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    while (fx.pendingFetchAt(i)) |req| : (i += 1) {
+        if (!std.mem.endsWith(u8, req.url, "/decision")) continue;
+        const Body = struct { id: u64 };
+        const parsed = std.json.parseFromSlice(Body, testing.allocator, req.body, .{ .ignore_unknown_fields = true }) catch continue;
+        defer parsed.deinit();
+        out[n] = .{ req.key, parsed.value.id };
+        n += 1;
+    }
+    return n;
+}
+
+test "two answers in flight at once each go out under a key of their own" {
+    // Ids 1 and 9 used to share a key, and a second effect under a live key is
+    // refused, so the second answer never left. Both outcomes are checked:
+    // both reach the signer, and both come back when neither does.
+    for ([_]bool{ true, false }) |delivered| {
+        var fx: main.Effects = undefined;
+        initFx(&fx);
+        defer fx.deinit();
+        var m = residentAway();
+        // A real address, or the fetch is refused for its url before its key
+        // is ever looked at.
+        m.setBaseUrl("127.0.0.1:8787");
+        m.setAuth("token");
+
+        main.update(&m, pendingMsg(&.{ 1, 9 }), &fx);
+        main.update(&m, .{ .approve = 1 }, &fx);
+        main.update(&m, .{ .reject = 9 }, &fx);
+        try testing.expectEqual(@as(usize, 0), m.rows_len);
+
+        var sent: [8][2]u64 = undefined;
+        const n = decisionsInFlight(&fx, &sent);
+        try testing.expectEqual(@as(usize, 2), n);
+        try testing.expect(sent[0][0] != sent[1][0]);
+        try testing.expect(sent[0][1] != sent[1][1]);
+        for (sent[0..n]) |pair| try testing.expectEqual(m.decisionKeyOf(pair[1]).?, pair[0]);
+
+        const outcome: Outcome = if (delivered) .{ .outcome = .ok, .status = 200 } else .{ .outcome = .timed_out, .status = 0 };
+        main.update(&m, decidedMsg(&m, 9, outcome.outcome, outcome.status), &fx);
+        main.update(&m, decidedMsg(&m, 1, outcome.outcome, outcome.status), &fx);
+        try testing.expectEqual(@as(?u64, null), m.decisionKeyOf(1));
+        try testing.expectEqual(@as(?u64, null), m.decisionKeyOf(9));
+        if (delivered) {
+            try testing.expectEqual(@as(usize, 0), m.rows_len);
+            try testing.expect(!m.has_decision_note());
+            try testing.expect(m.window_hidden);
+        } else {
+            try testing.expectEqual(@as(usize, 2), m.rows_len);
+            try testing.expectEqual(@as(u64, 1), m.rows[0].id);
+            try testing.expectEqual(@as(u64, 9), m.rows[1].id);
+            try testing.expect(m.has_decision_note());
+            try testing.expect(!m.window_hidden);
+        }
+    }
+}
+
+test "an answer still on its way when the signer stopped puts nothing back" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    const failed = decidedMsg(&m, 7, .connect_failed, 0);
+    main.update(&m, .{ .daemon_exited = .{ .key = 0, .reason = .exited, .code = 1 } }, &fx);
+    // Its key stays taken until the result arrives, so a new answer cannot be
+    // refused for sharing it.
+    try testing.expect(m.decisionKeyOf(7) != null);
+    main.update(&m, failed, &fx);
+    try testing.expectEqual(@as(usize, 0), m.rows_len);
+    try testing.expect(!m.has_decision_note());
+    try testing.expectEqual(@as(?u64, null), m.decisionKeyOf(7));
 }
 
 test "an answer the signer took leaves the request gone and the window away" {
@@ -1144,7 +1225,7 @@ test "an answer the signer took leaves the request gone and the window away" {
 
     main.update(&m, pendingMsg(&.{7}), &fx);
     main.update(&m, .{ .approve = 7 }, &fx);
-    main.update(&m, decidedMsg(7, .ok, 200), &fx);
+    main.update(&m, decidedMsg(&m, 7, .ok, 200), &fx);
     try testing.expectEqual(@as(usize, 0), m.rows_len);
     try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
     try testing.expect(m.window_hidden);

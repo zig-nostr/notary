@@ -158,8 +158,9 @@ fn applyMaskedEdit(buf: *canvas.TextBuffer(128), event: canvas.TextInputEvent, m
 
 // Effect keys. Fetch/spawn/file effects share one key space and 16 slots; the
 // long-lived daemon spawn holds one slot for the process's lifetime. Timer
-// keys are their own namespace. Decisions use a small pool so several can be
-// in flight at once (a fast double-approve never collides on one key).
+// keys are their own namespace. Each answer in flight takes a key of its own
+// from the decision range, so two answers never share one: a second effect
+// under a live key is refused, and that answer would never reach the signer.
 /// The one daemon stdout line the GUI parses. Must match
 /// `approval_http.port_line_prefix` in the daemon.
 const daemon_port_prefix = "notary-approval-port";
@@ -178,18 +179,40 @@ const clipboard_key: u64 = 7;
 /// rejected while the first is still in flight.
 const command_clipboard_key: u64 = 17;
 const info_refresh_key: u64 = 16; // periodic /info re-poll (distinct from the initial info_key)
-const relays_key: u64 = 17; // POST /relays
-const decision_key_base: u64 = 8;
-const decision_key_slots: u64 = 8;
+const relays_key: u64 = 20; // POST /relays
+/// Answers in flight, one key and one stash slot each, taken from whichever
+/// slot is free rather than worked out from the request id: ids that agree
+/// modulo the range would otherwise meet. More slots than effects can run at
+/// once, so a free one is always there.
+const decision_key_base: u64 = 1000;
+const decision_key_slots = 64;
 const retry_timer_key: u64 = 100;
 const copy_reset_timer_key: u64 = 101;
 const info_refresh_timer_key: u64 = 102;
 
-pub fn decisionKey(id: u64) u64 {
-    return decision_key_base + (id % decision_key_slots);
+comptime {
+    std.debug.assert(decision_key_slots > native_sdk.max_effects);
+    // Every fixed key, timers included, is its own and none is in the decision
+    // range. Two effects sharing a key is the second one refused.
+    const fixed = [_]u64{ daemon_key, info_key, pending_key, setup_key, unlock_key, nostrconnect_key, forget_key, lock_key, export_key, clipboard_key, command_clipboard_key, info_refresh_key, relays_key, retry_timer_key, copy_reset_timer_key, info_refresh_timer_key };
+    for (fixed, 0..) |a, i| {
+        if (a >= decision_key_base and a < decision_key_base + decision_key_slots)
+            @compileError(std.fmt.comptimePrint("effect key {d} is inside the decision range", .{a}));
+        for (fixed[i + 1 ..]) |b| {
+            if (a == b) @compileError(std.fmt.comptimePrint("effect key {d} is used twice", .{a}));
+        }
+    }
 }
 
 // ------------------------------------------------------------------ model
+
+/// An answer on its way to the signer, and the row it took off the screen.
+pub const Deciding = struct {
+    row: Row,
+    /// False once the signer it was sent to has gone, when there is nothing
+    /// to put back.
+    live: bool = true,
+};
 
 /// One pending signing request awaiting the operator's decision. Strings are
 /// copied into fixed buffers so a row never aliases a fetch response body
@@ -429,7 +452,7 @@ pub const Model = struct {
     /// decision key. An answer that does not reach the signer puts its row
     /// back from here: the poll will not, because a queue that has not changed
     /// gives a long poll nothing to return.
-    deciding: [decision_key_slots]?Row = @splat(null),
+    deciding: [decision_key_slots]?Deciding = @splat(null),
     /// Whether an answer did not reach the signer, for the line above the queue.
     decision_failed: bool = false,
 
@@ -998,8 +1021,22 @@ pub const Model = struct {
         // A daemon that went away takes its ids with it, and the next one
         // counts from the start again.
         self.answered_len = 0;
-        self.deciding = @splat(null);
+        // An answer still on its way to the signer that went away keeps its
+        // key until its result arrives, and then has nothing to put back.
+        for (&self.deciding) |*slot| {
+            if (slot.*) |*d| d.live = false;
+        }
         self.decision_failed = false;
+    }
+
+    /// The effect key the answer to `id` went out under, or null when none is
+    /// on its way.
+    pub fn decisionKeyOf(self: *const Model, id: u64) ?u64 {
+        for (self.deciding, 0..) |slot, i| {
+            const d = slot orelse continue;
+            if (d.row.id == id) return decision_key_base + i;
+        }
+        return null;
     }
 
     fn noteAnswered(self: *Model, id: u64) void {
@@ -1301,7 +1338,7 @@ fn sendServeRelays(model: *Model, fx: *Effects, on: bool) void {
     });
 }
 
-fn sendDecision(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const u8) void {
+fn sendDecision(model: *Model, fx: *Effects, key: u64, id: u64, approve: bool, remember: []const u8) void {
     var url_buf: [128]u8 = undefined;
     const url = std.fmt.bufPrint(&url_buf, "{s}/decision", .{model.baseUrl()}) catch return;
     var body_buf: [96]u8 = undefined;
@@ -1311,7 +1348,7 @@ fn sendDecision(model: *Model, fx: *Effects, id: u64, approve: bool, remember: [
         .{ .name = "content-type", .value = "application/json" },
     };
     fx.fetch(.{
-        .key = decisionKey(id),
+        .key = key,
         .method = .POST,
         .url = url,
         .headers = &headers,
@@ -1515,8 +1552,18 @@ fn applyPending(model: *Model, fx: *Effects, body: []const u8) void {
 /// the window away if that was the last one.
 fn decide(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const u8) void {
     model.decision_failed = false;
-    model.deciding[decisionKey(id) - decision_key_base] = model.findRow(id);
-    sendDecision(model, fx, id, approve, remember);
+    // Nothing on screen is nothing to answer: a poll took it away first.
+    const row = model.findRow(id) orelse return;
+    const slot = for (model.deciding, 0..) |d, i| {
+        if (d == null) break i;
+    } else {
+        // Cannot happen while there are more slots than effects can run, and
+        // if it did, the row stays where it is to be answered again.
+        model.decision_failed = true;
+        return;
+    };
+    model.deciding[slot] = .{ .row = row };
+    sendDecision(model, fx, decision_key_base + slot, id, approve, remember);
     model.removeRow(id); // optimistic; `decisionSent` puts it back if the send failed
     model.noteAnswered(id);
     putAwaySurfaced(model, fx);
@@ -1534,9 +1581,11 @@ fn decide(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const
 fn decisionSent(model: *Model, fx: *Effects, r: native_sdk.EffectResponse) void {
     if (r.key < decision_key_base or r.key >= decision_key_base + decision_key_slots) return;
     const slot = &model.deciding[r.key - decision_key_base];
-    const row = slot.* orelse return;
+    const sent = slot.* orelse return;
     slot.* = null;
+    if (!sent.live) return;
     if (r.outcome == .ok and r.status >= 200 and r.status < 300) return;
+    const row = sent.row;
     model.forgetAnswered(row.id);
     model.restoreRow(row);
     model.decision_failed = true;

@@ -2,7 +2,7 @@
 
 ### What's new in v0.11.2
 
-**An answer that does not reach the signer is no longer lost.** Pressing Allow or Deny takes the request off the screen straight away, and on macOS the window can go with it. If the signer then never got that answer, because it was slow to reply or hit an error, the request sat there unseen until it ran out. Now it comes back on screen, the window comes to the front, and a line above it says the answer did not get through, so you can answer it again.
+**An answer that does not reach the signer is no longer lost.** Pressing Allow or Deny takes the request off the screen straight away, and on macOS the window can go with it. If the signer then never got that answer, because it was slow to reply or hit an error, the request sat there unseen until it ran out. Now it comes back on screen, the window comes to the front, and a line above it says the answer did not get through, so you can answer it again. Answering two requests close together could also drop the second answer before it was sent, and each answer now goes out on its own.
 
 ### What's new in v0.11.1
 
