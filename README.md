@@ -143,6 +143,8 @@ cd gui && native build
   relays, and the approval API.
 - [`gui/README.md`](gui/README.md): the approval app and how it connects to (or
   supervises) the daemon.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): how the two processes work together, the
+  daemon's modules, NIP-49 key storage, and the daemon supervision model.
 
 ## License
 

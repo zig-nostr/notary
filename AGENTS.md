@@ -61,6 +61,10 @@ To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zi
 - A release is a version bump in `gui/app.zon` plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds the macOS app and the Linux tarballs.
 - Validate everything a client or relay sends at the boundary. Every request that reaches the daemon is untrusted until it is authenticated.
 
+## Architecture
+
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design: how the two processes talk, the daemon's modules, why the key stays isolated, the two operational modes, NIP-49 encryption, and the daemon supervision model.
+
 ## Related
 
 - [`nostr`](https://github.com/zig-nostr/nostr): the protocol library. It has an agent skill: `npx skills add zig-nostr/nostr`.
