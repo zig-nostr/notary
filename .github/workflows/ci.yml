@@ -67,6 +67,12 @@ jobs:
           fi
           echo "release notes are for v$version"
 
+      # Linux builds read gui/app.linux.zon, macOS reads gui/app.zon, and the
+      # version lives in both. They differ only in the lines that make the
+      # macOS app a background resident.
+      - name: The Linux manifest follows the macOS one
+        run: scripts/check-manifests.sh
+
       # The installer verifies the file it downloaded, not whatever is listed
       # first. The script read the first `sha256:` in the release JSON, which
       # was correct while a release carried one asset and became wrong the

@@ -51,6 +51,14 @@ strictly need it: an unlocked signer is the normal state, and whoever is at the
 keyboard then is not necessarily the person who set it up. Nothing is kept
 afterwards, and closing the panel takes the key off the screen with it.
 
+## Staying in the background
+
+On macOS, closing the window does not quit Notary. The signer keeps answering, and an `N` item in the menu bar shows how many requests are waiting. When a request arrives the window comes back to the front, and when you have answered the last one it goes away again. If you opened the window yourself, it stays open until you close it.
+
+The menu bar item has **Open Notary** to bring the window back by hand and **Quit Notary** to stop. Quitting stops the signer too, so nothing is left running with your key. If the signer stops by itself the window comes back and says so, rather than leaving a menu bar item that no longer answers anything.
+
+Notary has no Dock icon on macOS. A window that another app opened for its own keyholder (Plaza does this) behaves as it always did: it has a Dock icon, and closing it ends it. On Linux closing the window quits, because the toolkit's Linux host has no status item that could bring a hidden window back.
+
 ## Install
 
 **macOS (Apple Silicon):**

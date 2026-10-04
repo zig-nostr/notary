@@ -23,7 +23,8 @@ gui/             # the approval window ("notary" binary), a Native SDK app
   src/main.zig   # model, update, daemon supervision
   src/tests.zig
   app.zon        # app manifest; its .version is the release version
-scripts/         # installers and the installer check
+  app.linux.zon  # the same without the macOS background-resident lines; build.zig picks one by target
+scripts/         # installers, the installer check, check-manifests.sh
 .github/RELEASE_NOTES.md  # the text of each release page
 CHANGELOG.md
 ```
@@ -58,7 +59,7 @@ To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zi
 - `zig fmt` is the formatter; CI fails on unformatted code, in both packages.
 - [Conventional Commits](https://www.conventionalcommits.org/). One concern per pull request, with its tests, and every pull request links its issue.
 - Never commit to `main`; everything lands through a reviewed pull request.
-- A release is a version bump in `gui/app.zon` plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds the macOS app and the Linux tarballs.
+- A release is a version bump in `gui/app.zon` (and `gui/app.linux.zon`, which `scripts/check-manifests.sh` keeps in step) plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds the macOS app and the Linux tarballs.
 - Validate everything a client or relay sends at the boundary. Every request that reaches the daemon is untrusted until it is authenticated.
 
 ## Architecture
