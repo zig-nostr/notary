@@ -7,6 +7,14 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-04
+
+### Fixed
+
+- An answer that did not reach the signer is no longer lost. Pressing Allow or Deny takes the request off the screen at once, and on macOS can put the window away with it; if the answer then failed to arrive (the signer was slow to reply, refused it, or hit an error), nothing brought the request back while the window was away, and it ran out unanswered. Now the request comes back, the window comes to the front, and a line above the queue says the answer did not reach the signer, so it can be answered again.
+
+- Two answers given close together could be sent under the same internal key, and the second was then refused and never sent: requests whose numbers differed by 8 shared one. Each answer now goes out on its own. Copying the import command and changing the relay setting no longer share one either, nor do pasting a `nostrconnect://` link and removing the key with an answer.
+
 ## [0.11.1] - 2026-10-04
 
 ### Added

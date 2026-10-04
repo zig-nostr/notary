@@ -201,6 +201,9 @@
   <if test="{show_queue}">
     <scroll grow="1">
       <column gap="8" padding="12">
+        <if test="{has_decision_note}">
+          <text foreground="destructive" wrap="true">{decision_note}</text>
+        </if>
         <for each="visible" key="id" as="r">
           <card padding="12">
             <column gap="10">

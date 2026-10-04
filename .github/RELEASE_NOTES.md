@@ -1,5 +1,9 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.11.2
+
+**An answer that does not reach the signer is no longer lost.** Pressing Allow or Deny takes the request off the screen straight away, and on macOS the window can go with it. If the signer then never got that answer, because it was slow to reply or hit an error, the request sat there unseen until it ran out. Now it comes back on screen, the window comes to the front, and a line above it says the answer did not get through, so you can answer it again. Answering two requests close together could also drop the second answer before it was sent, and each answer now goes out on its own.
+
 ### What's new in v0.11.1
 
 **On macOS, closing the window no longer quits Notary.** The window goes away and the signer keeps answering. An `N` in the menu bar shows how many requests are waiting, a new request brings the window back to the front, and answering the last one puts it away again. Quit Notary from that menu stops the signer it started. There is no Dock icon. If you install over a copy that is running in the menu bar, quit it first.

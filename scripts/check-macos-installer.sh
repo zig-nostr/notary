@@ -41,7 +41,11 @@ echo "ok: a Linux asset listed first does not steal the macOS digest"
 
 # 2. The LIVE release, because a fixture only encodes what I think the response
 #    looks like, and what can break this again is GitHub changing exactly that.
-json="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest")"
+# With a token the API allows far more calls than the 60 an hour it gives an
+# address without one, which a shared CI runner can use up on its own.
+auth=()
+[ -n "${GH_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GH_TOKEN")
+json="$(curl -fsSL "${auth[@]+"${auth[@]}"}" "https://api.github.com/repos/$repo/releases/latest")"
 want="$(printf '%s' "$json" | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 for a in d.get("assets",[]):
