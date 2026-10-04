@@ -1,5 +1,13 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.11.0
+
+**On macOS, closing the window no longer quits Notary.** The window goes away and the signer keeps answering. An `N` in the menu bar shows how many requests are waiting, a new request brings the window back to the front, and answering the last one puts it away again. Quit Notary from that menu stops the signer it started. There is no Dock icon. If you install over a copy that is running in the menu bar, quit it first.
+
+If the signer Notary started stops while the window is away, the window comes back, so the menu bar never shows a signer that is no longer answering.
+
+Nothing changes on Linux, or for a Notary window another app opened with its own keyholder (Plaza does this): closing that window still ends it, and leaves the other app's keyholder running.
+
 ### What's new in v0.10.12
 
 **The keyholder no longer sits on your key after the app it was unlocked for has gone.** Notary holds one keyholder per key, and it enforces that with a lock the system releases whenever the process ends. That covers a keyholder that crashes. What it did not cover was a keyholder whose PARENT crashed: the app died, this process was left running with nothing to do, and it kept the lock. Typing your passphrase then told you another Notary already had the key open, which was true, in a process nobody could see. The only thing that cleared it was a fifteen minute timer.

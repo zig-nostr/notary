@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-10-04
+
 ### Added
 
 - On macOS, closing the window no longer quits Notary. The window hides, the signer keeps answering, and an `N` item in the menu bar shows how many requests are waiting. A new request brings the window back to the front, and answering the last one puts it away again. The menu has Open Notary and Quit Notary; quitting stops the signer Notary started. There is no Dock icon. A window another app opened with its own keyholder (Plaza does this) still ends when it is closed, as before, and leaves that app's keyholder running, and Linux closes and quits as before.
@@ -16,6 +18,12 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 ### Changed
 
 - `gui/app.zon` declares the macOS behaviour and Linux builds read the new `gui/app.linux.zon`, picked in `gui/build.zig`, because the toolkit refuses a window that hides on close where it has no status item to bring it back. `scripts/check-manifests.sh` fails CI when the two differ anywhere else.
+
+## [0.10.12] - 2026-09-15
+
+### Fixed
+
+- A keyholder whose app died was left running and kept the lock on the key, so the next unlock was told another Notary already had it open until a fifteen minute timer ran out. It now notices that the app that started it is gone and exits within about a second. A keyholder started from a terminal has no such parent and keeps running.
 
 ## [0.10.11] - 2026-09-08
 
