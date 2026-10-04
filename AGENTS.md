@@ -31,6 +31,8 @@ CHANGELOG.md
 
 The daemon runs in one of two modes, never both: standalone, a bunker on real relays; or embedded, the private keyholder of one parent app (Plaza), reachable only down a pipe that parent was handed at startup, with no relay connections. A signer that any local app can reach cannot tell which app is asking, so do not add one.
 
+On macOS the standalone window is a background resident: closing it hides it, a menu bar item stays, and a new request brings it back. A window another app starts with `--approval-http` (Plaza) is not: it has no menu bar item, a Dock icon, and exits when it is closed, and the keyholder it was handed is never started or stopped by it. Keep both behaviours when changing `gui/src/main.zig`; `ARCHITECTURE.md` explains how they are told apart.
+
 ## Build and test
 
 Zig 0.16.0 exactly.
@@ -51,6 +53,8 @@ native test
 native build
 zig fmt --check src
 ```
+
+From the repository root, `scripts/check-manifests.sh` checks that `gui/app.linux.zon` follows `gui/app.zon` (CI runs it).
 
 To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zig-out/bin/signer`) when starting `native dev`. The window then starts and supervises that daemon the way a packaged app does with the one beside it. The full example, with the key and relay variables, is under "Managed mode" in `gui/README.md`; `daemon/README.md` covers key setup and the approval API.
 

@@ -119,7 +119,7 @@ main() {
   xattr -dr com.apple.quarantine "$dest/$app" 2>/dev/null || true
 
   say "Installed $app to $dest."
-  say "Opening Notary..."
+  say "Opening Notary. Closing its window leaves it running in the menu bar; choose Quit Notary there to stop it."
   open "$dest/$app" || say "Open it from $dest/$app whenever you're ready."
 }
 

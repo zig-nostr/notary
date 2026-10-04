@@ -9,9 +9,9 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ### Added
 
-- On macOS, closing the window no longer quits Notary. The window hides, the signer keeps answering, and an `N` item in the menu bar shows how many requests are waiting. A new request brings the window back to the front, and answering the last one puts it away again. The menu has Open Notary and Quit Notary; quitting stops the signer with it. There is no Dock icon. A window another app opened with its own keyholder still ends when it is closed, as before, and Linux closes and quits as before.
+- On macOS, closing the window no longer quits Notary. The window hides, the signer keeps answering, and an `N` item in the menu bar shows how many requests are waiting. A new request brings the window back to the front, and answering the last one puts it away again. The menu has Open Notary and Quit Notary; quitting stops the signer Notary started. There is no Dock icon. A window another app opened with its own keyholder (Plaza does this) still ends when it is closed, as before, and leaves that app's keyholder running, and Linux closes and quits as before.
 
-- The signer stopping while the window is away brings the window back, instead of leaving a menu bar item that no longer answers anything.
+- The signer Notary started stopping while the window is away brings the window back, instead of leaving a menu bar item that no longer answers anything.
 
 ### Changed
 
