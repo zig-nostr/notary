@@ -7,6 +7,8 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-04
+
 ### Fixed
 
 - An answer that did not reach the signer is no longer lost. Pressing Allow or Deny takes the request off the screen at once, and on macOS can put the window away with it; if the answer then failed to arrive (the signer was slow to reply, refused it, or hit an error), nothing brought the request back while the window was away, and it ran out unanswered. Now the request comes back, the window comes to the front, and a line above the queue says the answer did not reach the signer, so it can be answered again.
