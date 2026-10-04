@@ -1049,6 +1049,108 @@ test "a poll written before an answer landed does not bring the window back" {
     try testing.expect(m.surfaced);
 }
 
+/// How a `POST /decision` for `id` went.
+fn decidedMsg(id: u64, outcome: native_sdk.EffectFetchOutcome, status: u16) Msg {
+    const body = if (outcome == .ok and status == 200) "{\"ok\":true}" else "";
+    return .{ .decided = .{ .key = main.decisionKey(id), .outcome = outcome, .status = status, .body = body } };
+}
+
+test "an answer that did not reach the signer brings the request and the window back" {
+    // A timeout, a refused token, a signer that failed, and a send that never
+    // started. Each leaves the request waiting on the signer with nobody
+    // looking at it, and no poll brings it back: the queue did not change.
+    const failures = [_]Msg{
+        decidedMsg(7, .timed_out, 0),
+        decidedMsg(7, .ok, 401),
+        decidedMsg(7, .ok, 500),
+        decidedMsg(7, .connect_failed, 0),
+        decidedMsg(7, .rejected, 0),
+    };
+    for (failures) |failure| {
+        var fx: main.Effects = undefined;
+        initFx(&fx);
+        defer fx.deinit();
+        var m = residentAway();
+
+        main.update(&m, pendingMsg(&.{ 3, 7, 9 }), &fx);
+        main.update(&m, .{ .reject = 3 }, &fx);
+        main.update(&m, .{ .reject = 9 }, &fx);
+        main.update(&m, .{ .approve = 7 }, &fx);
+        try testing.expectEqual(@as(usize, 0), m.rows_len);
+        try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+        try testing.expect(!m.has_decision_note());
+
+        main.update(&m, failure, &fx);
+        try testing.expectEqual(@as(usize, 1), m.rows_len);
+        try testing.expectEqual(@as(u64, 7), m.rows[0].id);
+        try testing.expectEqualStrings("sign_event", m.rows[0].method());
+        try testing.expectEqual(@as(u32, 2), fx.windowActionState().show_count);
+        try testing.expect(!m.window_hidden);
+        try testing.expect(m.surfaced);
+        try testing.expect(m.has_decision_note());
+        {
+            var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+            defer arena_state.deinit();
+            const tree = try buildTree(arena_state.allocator(), &m);
+            _ = try expectByText(tree.root, .text, m.decision_note());
+        }
+
+        // The next poll still lists it, and it is the same request rather
+        // than a second one.
+        main.update(&m, pendingMsg(&.{7}), &fx);
+        try testing.expectEqual(@as(usize, 1), m.rows_len);
+        try testing.expectEqual(@as(u32, 2), fx.windowActionState().show_count);
+
+        // Answered again, and this time it lands: gone, and the window with it.
+        main.update(&m, .{ .approve = 7 }, &fx);
+        try testing.expect(!m.has_decision_note());
+        main.update(&m, decidedMsg(7, .ok, 200), &fx);
+        try testing.expectEqual(@as(usize, 0), m.rows_len);
+        try testing.expectEqual(@as(u32, 2), fx.windowActionState().hide_count);
+        try testing.expect(m.window_hidden);
+    }
+}
+
+test "a failed answer puts back one request, in its place, even after a poll re-listed it" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{ 3, 7, 9 }), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    main.update(&m, decidedMsg(7, .timed_out, 0), &fx);
+    try testing.expectEqual(@as(usize, 3), m.rows_len);
+    try testing.expectEqual(@as(u64, 3), m.rows[0].id);
+    try testing.expectEqual(@as(u64, 7), m.rows[1].id);
+    try testing.expectEqual(@as(u64, 9), m.rows[2].id);
+    try testing.expectEqual(@as(usize, 0), m.answered_len);
+
+    // A poll written before the failure came back already listed it again.
+    main.update(&m, .{ .approve = 9 }, &fx);
+    main.update(&m, pendingMsg(&.{ 3, 9 }), &fx);
+    main.update(&m, decidedMsg(9, .ok, 503), &fx);
+    try testing.expectEqual(@as(usize, 2), m.rows_len);
+    try testing.expect(m.has_decision_note());
+    // Neither counts as answered any more: both are still the reader's to answer.
+    try testing.expectEqual(@as(usize, 0), m.answered_len);
+}
+
+test "an answer the signer took leaves the request gone and the window away" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    main.update(&m, decidedMsg(7, .ok, 200), &fx);
+    try testing.expectEqual(@as(usize, 0), m.rows_len);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expect(m.window_hidden);
+    try testing.expect(!m.has_decision_note());
+}
+
 test "a restarted signer's requests are news even when an old answer had the same id" {
     var fx: main.Effects = undefined;
     initFx(&fx);

@@ -185,7 +185,7 @@ const retry_timer_key: u64 = 100;
 const copy_reset_timer_key: u64 = 101;
 const info_refresh_timer_key: u64 = 102;
 
-fn decisionKey(id: u64) u64 {
+pub fn decisionKey(id: u64) u64 {
     return decision_key_base + (id % decision_key_slots);
 }
 
@@ -425,6 +425,13 @@ pub const Model = struct {
     /// over whatever the reader went back to.
     answered: [max_pending]u64 = undefined,
     answered_len: usize = 0,
+    /// The rows taken off the screen while their answer is on its way, one per
+    /// decision key. An answer that does not reach the signer puts its row
+    /// back from here: the poll will not, because a queue that has not changed
+    /// gives a long poll nothing to return.
+    deciding: [decision_key_slots]?Row = @splat(null),
+    /// Whether an answer did not reach the signer, for the line above the queue.
+    decision_failed: bool = false,
 
     // -- onboarding (first-run key setup / unlock) --
 
@@ -710,6 +717,13 @@ pub const Model = struct {
     pub fn has_backup_error(self: *const Model) bool {
         return self.backup_error_len > 0;
     }
+    pub fn has_decision_note(self: *const Model) bool {
+        return self.decision_failed;
+    }
+    pub fn decision_note(self: *const Model) []const u8 {
+        _ = self;
+        return "That answer did not reach the signer. The request is still waiting.";
+    }
     pub fn backup_copy_label(self: *const Model) []const u8 {
         return if (self.backup_copied) "Copied" else "Copy";
     }
@@ -766,8 +780,9 @@ pub const Model = struct {
     /// something someone forgot to wire up.
     ///
     /// The background residency fields are read by `update` and the menu bar
-    /// item, and drawn by nothing.
-    pub const view_unbound = .{ "passphrase", "backup_passphrase", "resident", "window_hidden", "surfaced", "answered", "answered_len" };
+    /// item, and drawn by nothing. So are the answers on their way to the
+    /// signer, and `decision_failed` is drawn through `has_decision_note`.
+    pub const view_unbound = .{ "passphrase", "backup_passphrase", "resident", "window_hidden", "surfaced", "answered", "answered_len", "deciding", "decision_failed" };
 
     pub fn passphrase(self: *const Model) []const u8 {
         return self.passphrase_buf.text();
@@ -983,6 +998,8 @@ pub const Model = struct {
         // A daemon that went away takes its ids with it, and the next one
         // counts from the start again.
         self.answered_len = 0;
+        self.deciding = @splat(null);
+        self.decision_failed = false;
     }
 
     fn noteAnswered(self: *Model, id: u64) void {
@@ -996,6 +1013,12 @@ pub const Model = struct {
 
     fn wasAnswered(self: *const Model, id: u64) bool {
         return std.mem.indexOfScalar(u64, self.answered[0..self.answered_len], id) != null;
+    }
+
+    fn forgetAnswered(self: *Model, id: u64) void {
+        const i = std.mem.indexOfScalar(u64, self.answered[0..self.answered_len], id) orelse return;
+        std.mem.copyForwards(u64, self.answered[i .. self.answered_len - 1], self.answered[i + 1 .. self.answered_len]);
+        self.answered_len -= 1;
     }
 
     fn setInfoState(self: *Model, s: []const u8) void {
@@ -1023,6 +1046,22 @@ pub const Model = struct {
         self.passphrase_buf.clear();
         self.secret_buf.clear();
         self.passphrase_showing = false;
+    }
+
+    fn findRow(self: *const Model, id: u64) ?Row {
+        for (self.rows[0..self.rows_len]) |row| {
+            if (row.id == id) return row;
+        }
+        return null;
+    }
+
+    /// Puts `row` back in id order, unless a poll already did.
+    fn restoreRow(self: *Model, row: Row) void {
+        if (self.findRow(row.id) != null or self.rows_len == self.rows.len) return;
+        var i = self.rows_len;
+        while (i > 0 and self.rows[i - 1].id > row.id) : (i -= 1) self.rows[i] = self.rows[i - 1];
+        self.rows[i] = row;
+        self.rows_len += 1;
     }
 
     pub fn removeRow(self: *Model, id: u64) void {
@@ -1468,16 +1507,40 @@ fn putAwaySurfaced(model: *Model, fx: *Effects) void {
 /// emptied behind the reader's back puts it away.
 fn applyPending(model: *Model, fx: *Effects, body: []const u8) void {
     const fresh = parsePendingCountingNew(model, body);
+    if (model.rows_len == 0) model.decision_failed = false;
     if (fresh > 0) surfaceWindow(model, fx, true) else putAwaySurfaced(model, fx);
 }
 
 /// Sends the reader's answer, takes the row off the screen at once, and puts
 /// the window away if that was the last one.
 fn decide(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const u8) void {
+    model.decision_failed = false;
+    model.deciding[decisionKey(id) - decision_key_base] = model.findRow(id);
     sendDecision(model, fx, id, approve, remember);
-    model.removeRow(id); // optimistic; a poll re-adds it if the send failed
+    model.removeRow(id); // optimistic; `decisionSent` puts it back if the send failed
     model.noteAnswered(id);
     putAwaySurfaced(model, fx);
+}
+
+/// Acts on how a `POST /decision` went. Anything but a 2xx means the signer
+/// never took the answer, and the request is still waiting on it: a timeout, a
+/// refused token, a signer that failed. Its row was taken off the screen and
+/// the window may have gone with it, so both come back, with a line saying
+/// why. Left as it was, nothing brought it back while the window was away,
+/// and the request ran out unsigned.
+///
+/// A 200 for a request the signer no longer has (`"ok":false`) is not this: it
+/// was answered elsewhere or ran out, and there is nothing to put back.
+fn decisionSent(model: *Model, fx: *Effects, r: native_sdk.EffectResponse) void {
+    if (r.key < decision_key_base or r.key >= decision_key_base + decision_key_slots) return;
+    const slot = &model.deciding[r.key - decision_key_base];
+    const row = slot.* orelse return;
+    slot.* = null;
+    if (r.outcome == .ok and r.status >= 200 and r.status < 300) return;
+    model.forgetAnswered(row.id);
+    model.restoreRow(row);
+    model.decision_failed = true;
+    surfaceWindow(model, fx, true);
 }
 
 /// How many requests in `body` were not in the queue already.
@@ -1671,7 +1734,6 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             },
         },
 
-        // The poll chain reflects the removal; nothing else to do on ack.
         .toggle_relays => {
             const want = !model.serve_relays;
             model.serve_relays = want; // optimistic; the next /info confirms it
@@ -1680,7 +1742,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
         // The daemon owns the answer; this only re-reads it.
         .relays_set => fetchInfo(model, fx),
 
-        .decided => {},
+        .decided => |r| decisionSent(model, fx, r),
 
         .tick => |t| {
             if (t.outcome != .fired) return;
