@@ -19,6 +19,21 @@ client, and Notary neither knows nor cares which one is asking.
 > relays, including those that require NIP-42 authentication. Downloads are
 > ad-hoc signed (not notarized). See [Install](#install).
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install.sh | bash
+```
+
+That works on macOS (Apple Silicon) and Linux (x86_64 and aarch64). It downloads the latest release for your system, checks it against the SHA-256 published beside it, installs it and starts it: `Notary.app` goes to `/Applications` (or `~/Applications` when that is not writable) on macOS, and everything goes under `~/.local` on Linux, so nothing needs root.
+
+- Linux needs GTK 4 and a recent distribution: Ubuntu 23.10+, Debian 13+ or Fedora 39+. Ubuntu 22.04 and Debian 12 are too old for the GTK 4.10 the toolkit needs. The installer checks both before it downloads anything.
+- The macOS build is ad-hoc signed, not notarized, on purpose. Notary holds your key, so the trust anchor is a build you can reproduce rather than an Apple signature: every release is built by CI from a tagged commit ([`release.yml`](.github/workflows/release.yml)). The installer clears the download-quarantine flag so Gatekeeper lets it open. Read the [installer](scripts/install.sh), or [build from source](#build).
+- On macOS, Notary keeps running in the menu bar after its window is closed, so choose **Quit Notary** there before you install over it. The installer stops and says so if it finds it running.
+- Options go after `bash -s --`, as in `curl -fsSL .../install.sh | bash -s -- --version v0.11.2`. `--version <tag>` installs a named release, `--archive <file>` installs a release file you already have with no network (a `.sha256` beside it is checked), `--prefix <dir>` installs somewhere else, and `--no-open` installs without starting it.
+
+The old `install-macos.sh` and `install-linux.sh` addresses still work: they run this installer.
+
 ![Notary: a native home for your key. Zig and Metal, no Electron. Your key stays in the signer.](docs/shots/hero.jpg)
 
 ## What it does
@@ -58,47 +73,6 @@ On macOS, closing the window does not quit Notary. The signer keeps answering, a
 The menu bar item has **Open Notary** to bring the window back by hand and **Quit Notary** to stop. Quitting stops the signer Notary started, so nothing is left running with your key. If the signer stops by itself the window comes back and says so, rather than leaving a menu bar item that no longer answers anything.
 
 Notary has no Dock icon on macOS. A window that another app opened for its own keyholder (Plaza does this) behaves as it always did: it has a Dock icon, and closing it ends the window and nothing else, because that keyholder belongs to the app that opened it. On Linux closing the window quits, because the toolkit's Linux host has no status item that could bring a hidden window back.
-
-## Install
-
-**macOS (Apple Silicon):**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-macos.sh | bash
-```
-
-That downloads the latest release, verifies its SHA-256, installs `Notary.app`
-to `/Applications` (or `~/Applications` when that is not writable), clears the
-download-quarantine flag so Gatekeeper does not stop an ad-hoc-signed build, and
-opens it. Notary keeps running in the menu bar after its window is closed, so choose **Quit Notary** there before you install over a copy that is already running.
-
-Notary is **ad-hoc signed, not notarized**, on purpose. It holds your keys, so
-the trust anchor is a build you can reproduce, not an Apple signature: every
-release is built by CI from a tagged commit
-([`.github/workflows/release.yml`](.github/workflows/release.yml)). Prefer to
-trust nothing you didn't run? Read the
-[installer](scripts/install-macos.sh) and [build from source](#build).
-
-**Linux (x86_64 and aarch64):**
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-linux.sh | bash
-```
-
-A reasonably recent distribution: **Ubuntu 23.10+, Debian 13+, or Fedora 39+**.
-The toolkit's Linux host declares a GTK floor of 4.10 and the binaries are built
-against glibc 2.38, which land on the same generation, so Ubuntu 22.04 and
-Debian 12 are too old. The installer checks that before downloading anything,
-because "it will not start" is not something to discover after trusting an app
-with your key.
-
-GTK 4 is the one runtime dependency, and the installer says so before it
-downloads anything rather than after the window fails to open. It verifies the
-SHA-256, installs into `~/.local` so nothing needs root and nothing lands
-outside your home directory, puts Notary in the launcher, and starts it. Pass
-`--archive <file>` to install a tarball you already have, which needs no
-network. There is nothing to sign or notarise here, and the trust anchor is the
-same: a build you can reproduce.
 
 ## Two components, one product
 

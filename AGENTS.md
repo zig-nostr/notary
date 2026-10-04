@@ -24,7 +24,7 @@ gui/             # the approval window ("notary" binary), a Native SDK app
   src/tests.zig
   app.zon        # app manifest; its .version is the release version
   app.linux.zon  # the same without the macOS background-resident lines; build.zig picks one by target
-scripts/         # installers, the installer check, check-manifests.sh
+scripts/         # install.sh (the one-line installer, macOS and Linux), install-macos.sh and install-linux.sh (old addresses that run it), check-installer.sh, check-manifests.sh
 .github/RELEASE_NOTES.md  # the text of each release page
 CHANGELOG.md
 ```
@@ -55,6 +55,8 @@ zig fmt --check src
 ```
 
 From the repository root, `scripts/check-manifests.sh` checks that `gui/app.linux.zon` follows `gui/app.zon` (CI runs it).
+
+`scripts/check-installer.sh` runs the installer end to end on the system it is run on: it installs the newest release into a temporary prefix with `--no-open`, so it never touches `/Applications`, `~/.local` or a running Notary, and checks that a tampered download is refused (CI runs it on macOS and Linux). `scripts/install.sh` is served over `curl | bash` and run by macOS's bash 3.2, so keep it and the two wrappers pure ASCII and free of bash 4 features. The check fails on a byte outside ASCII, and runs the installer under /bin/bash 3.2 on macOS.
 
 To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zig-out/bin/signer`) when starting `native dev`. The window then starts and supervises that daemon the way a packaged app does with the one beside it. The full example, with the key and relay variables, is under "Managed mode" in `gui/README.md`; `daemon/README.md` covers key setup and the approval API.
 
