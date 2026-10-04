@@ -84,6 +84,8 @@ jobs:
       # The checks live in the script so they can be run by hand, and so this
       # file does not carry shell that only ever runs on a runner.
       - name: The macOS installer verifies the macOS download
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: scripts/check-macos-installer.sh ${{ github.repository }} .
 
       # The release's publish job refuses to lift the draft until this says every
