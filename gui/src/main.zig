@@ -21,12 +21,18 @@
 //!    holding the approval port. The key still only ever lives in the daemon
 //!    child.
 //!
+//! On macOS the standalone app is a background resident: closing the window
+//! hides it, a menu bar item keeps the signer reachable, a new signing request
+//! brings the window back, and deciding the last one puts it away again. See
+//! `Model.resident`.
+//!
 //! The view lives in `app.native`; this file is the logic. All I/O is through
 //! the Native SDK effects channel (`fx.spawn` supervises the daemon, `fx.fetch`
 //! talks HTTP, `fx.startTimer` backs off), so
 //! `update` stays a pure state transition and the view stays declarative.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const runner = @import("runner");
 const native_sdk = @import("native_sdk");
 
@@ -72,6 +78,8 @@ else
     };
 
 const canvas_label = "main-canvas";
+const main_window_label = "main";
+const is_macos = builtin.os.tag == .macos;
 const window_width: f32 = 460;
 const window_height: f32 = 560;
 
@@ -85,11 +93,15 @@ const shell_views = [_]native_sdk.ShellView{
     .{ .label = canvas_label, .kind = .gpu_surface, .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = .metal, .gpu_pixel_format = .bgra8_unorm, .gpu_present_mode = .timer, .gpu_alpha_mode = .@"opaque", .gpu_color_space = .srgb, .gpu_vsync = true },
 };
 const shell_windows = [_]native_sdk.ShellWindow{.{
-    .label = "main",
+    .label = main_window_label,
     .title = "Notary",
     .width = window_width,
     .height = window_height,
     .restore_state = false,
+    // Matches app.zon, which is what the host reads for the startup window.
+    // Linux has no status item to bring a hidden window back, so it keeps
+    // closing for real.
+    .close_policy = if (is_macos) .hide else .quit,
     .views = &shell_views,
 }};
 const shell_scene: native_sdk.ShellConfig = .{ .windows = &shell_windows };
@@ -390,6 +402,29 @@ pub const Model = struct {
     /// The daemon's queue version; sent back as `?since=` so a poll returns
     /// as soon as the queue changes.
     version: u64 = 0,
+
+    // -- background residency --
+
+    /// Whether this is the standalone macOS app, which stays running in the
+    /// menu bar with its window put away. False on Linux, where closing the
+    /// window quits as it always has, and false when an app handed this window
+    /// its keyholder (see `loadConfig`): that app watches this process to learn
+    /// the window closed, so closing it has to end the process.
+    resident: bool = false,
+    /// Whether the window is ordered out, as last reported by the host. The host
+    /// tells the runtime when a close hides the window but tells the app
+    /// nothing, so `watchWindow` reads it back.
+    window_hidden: bool = false,
+    /// Whether the window is up because a request brought it, and so should
+    /// leave when the queue is empty again. A window the reader opened
+    /// themselves, or that was already open, stays until they close it.
+    surfaced: bool = false,
+    /// Requests the reader answered that a poll has not yet shown gone. A poll
+    /// the daemon wrote a moment before the answer reached it still lists
+    /// them, and counting one as new would bring the window straight back
+    /// over whatever the reader went back to.
+    answered: [max_pending]u64 = undefined,
+    answered_len: usize = 0,
 
     // -- onboarding (first-run key setup / unlock) --
 
@@ -729,7 +764,10 @@ pub const Model = struct {
     /// the reader asks to see the characters. Declaring them here is how the
     /// markup checker is told that going unbound is the point, rather than
     /// something someone forgot to wire up.
-    pub const view_unbound = .{ "passphrase", "backup_passphrase" };
+    ///
+    /// The background residency fields are read by `update` and the menu bar
+    /// item, and drawn by nothing.
+    pub const view_unbound = .{ "passphrase", "backup_passphrase", "resident", "window_hidden", "surfaced", "answered", "answered_len" };
 
     pub fn passphrase(self: *const Model) []const u8 {
         return self.passphrase_buf.text();
@@ -942,6 +980,22 @@ pub const Model = struct {
 
     pub fn clearRows(self: *Model) void {
         self.rows_len = 0;
+        // A daemon that went away takes its ids with it, and the next one
+        // counts from the start again.
+        self.answered_len = 0;
+    }
+
+    fn noteAnswered(self: *Model, id: u64) void {
+        if (self.answered_len == self.answered.len) {
+            std.mem.copyForwards(u64, self.answered[0 .. self.answered.len - 1], self.answered[1..]);
+            self.answered_len -= 1;
+        }
+        self.answered[self.answered_len] = id;
+        self.answered_len += 1;
+    }
+
+    fn wasAnswered(self: *const Model, id: u64) bool {
+        return std.mem.indexOfScalar(u64, self.answered[0..self.answered_len], id) != null;
     }
 
     fn setInfoState(self: *Model, s: []const u8) void {
@@ -1006,6 +1060,13 @@ pub const Msg = union(enum) {
     reject: u64,
     restart,
 
+    /// The host hid or showed the window (see `watchWindow`).
+    window_hidden: bool,
+    /// The menu bar item's "Open Notary".
+    show_window,
+    /// The menu bar item's "Quit Notary".
+    quit_app,
+
     // Copy the bunker:// URI to the clipboard, its result, and the timer that
     // clears the transient "Copied!" confirmation.
     copy_bunker,
@@ -1055,6 +1116,10 @@ pub const Msg = union(enum) {
     submit_unlock,
     setup_done: native_sdk.EffectResponse,
     unlock_done: native_sdk.EffectResponse,
+
+    /// Sent by the host side of the window and by the menu bar item, never by
+    /// the markup, which is the point: these are not on the screen.
+    pub const view_unbound = .{ "window_hidden", "show_window", "quit_app" };
 };
 
 // ---------------------------------------------------------------- effects
@@ -1063,7 +1128,7 @@ pub const AppUi = canvas.Ui(Msg);
 pub const app_markup = @embedFile("app.native");
 
 const NotaryApp = native_sdk.UiApp(Model, Msg);
-const Effects = NotaryApp.Effects;
+pub const Effects = NotaryApp.Effects;
 
 /// Whether this window should start a daemon.
 ///
@@ -1375,8 +1440,134 @@ fn onUnauthorized(model: *Model, fx: *Effects) void {
     armRetry(fx);
 }
 
+// ----------------------------------------------- background residency
+
+/// Brings the window to the front for something that needs the reader.
+///
+/// `for_request` is the one case the window should go away again afterwards,
+/// and only if it was away to begin with: a window the reader had open is
+/// theirs to close.
+fn surfaceWindow(model: *Model, fx: *Effects, for_request: bool) void {
+    if (!model.resident) return;
+    fx.showWindow(main_window_label);
+    model.surfaced = for_request and (model.surfaced or model.window_hidden);
+    model.window_hidden = false;
+}
+
+/// Puts the window away once a request brought it and nothing is waiting any
+/// more, whether the reader answered the last one or it went away on its own.
+fn putAwaySurfaced(model: *Model, fx: *Effects) void {
+    if (!model.resident or !model.surfaced or model.rows_len > 0) return;
+    fx.hideWindow(main_window_label);
+    model.surfaced = false;
+    model.window_hidden = true;
+}
+
+/// Applies a `GET /pending` answer and acts on what changed in the queue: a
+/// request that was not there before brings the window up, and a queue that
+/// emptied behind the reader's back puts it away.
+fn applyPending(model: *Model, fx: *Effects, body: []const u8) void {
+    const fresh = parsePendingCountingNew(model, body);
+    if (fresh > 0) surfaceWindow(model, fx, true) else putAwaySurfaced(model, fx);
+}
+
+/// Sends the reader's answer, takes the row off the screen at once, and puts
+/// the window away if that was the last one.
+fn decide(model: *Model, fx: *Effects, id: u64, approve: bool, remember: []const u8) void {
+    sendDecision(model, fx, id, approve, remember);
+    model.removeRow(id); // optimistic; a poll re-adds it if the send failed
+    model.noteAnswered(id);
+    putAwaySurfaced(model, fx);
+}
+
+/// How many requests in `body` were not in the queue already.
+///
+/// Compares ids rather than counts: one request answered while another arrives
+/// leaves the count unchanged and is still news. A request the reader already
+/// answered is not news either, even when a poll written before the answer
+/// landed lists it again.
+pub fn parsePendingCountingNew(model: *Model, body: []const u8) usize {
+    var before: [max_pending]u64 = undefined;
+    const before_len = model.rows_len;
+    for (model.rows[0..before_len], 0..) |row, i| before[i] = row.id;
+    if (!applyPendingBody(model, body)) return 0;
+    var fresh: usize = 0;
+    for (model.rows[0..model.rows_len]) |row| {
+        if (std.mem.indexOfScalar(u64, before[0..before_len], row.id) != null) continue;
+        if (model.wasAnswered(row.id)) continue;
+        fresh += 1;
+    }
+    // An answered id this poll no longer lists is gone for good.
+    var kept: usize = 0;
+    for (model.answered[0..model.answered_len]) |id| {
+        const listed = for (model.rows[0..model.rows_len]) |row| {
+            if (row.id == id) break true;
+        } else false;
+        if (!listed) continue;
+        model.answered[kept] = id;
+        kept += 1;
+    }
+    model.answered_len = kept;
+    return fresh;
+}
+
+/// The menu bar item's one-line summary of where things stand.
+pub fn statusLine(model: *const Model, buf: []u8) []const u8 {
+    if (model.rows_len > 0) {
+        return std.fmt.bufPrint(buf, "{d} {s} waiting", .{ model.rows_len, if (model.rows_len == 1) "request" else "requests" }) catch "Requests waiting";
+    }
+    return switch (model.phase) {
+        .connected => "No requests waiting",
+        .starting, .connecting => "Starting the signer",
+        .disconnected => "Reconnecting to the signer",
+        .unauthorized => "Cannot reach the signer",
+        .daemon_exited => "The signer stopped",
+        .needs_setup => "Needs a key",
+        .needs_unlock => "Locked",
+    };
+}
+
+/// The menu bar title: a letter, and the count of what is waiting.
+pub fn statusTitle(model: *const Model, buf: []u8) []const u8 {
+    if (model.rows_len == 0) return "N";
+    return std.fmt.bufPrint(buf, "N {d}", .{model.rows_len}) catch "N";
+}
+
+pub const command_show = "notary.show";
+pub const command_quit = "notary.quit";
+
+fn commandMsg(name: []const u8) ?Msg {
+    if (std.mem.eql(u8, name, command_show)) return .show_window;
+    if (std.mem.eql(u8, name, command_quit)) return .quit_app;
+    return null;
+}
+
+pub fn commandMsgForTest(name: []const u8) ?Msg {
+    return commandMsg(name);
+}
+
+/// The menu bar item, rebuilt from the model after every change.
+fn statusItem(model: *const Model, scratch: *NotaryApp.StatusItemScratch) NotaryApp.StatusItemState {
+    const waiting = model.rows_len > 0;
+    scratch.items[0] = .{ .id = 1, .label = statusLine(model, &scratch.arena_buffer), .role = .info };
+    scratch.items[1] = .{ .separator = true };
+    scratch.items[2] = .{ .id = 2, .label = if (waiting) "Review requests" else "Open Notary", .command = command_show };
+    scratch.items[3] = .{ .separator = true };
+    scratch.items[4] = .{ .id = 3, .label = "Quit Notary", .command = command_quit, .key = "q", .modifiers = .{ .primary = true } };
+    return .{
+        .title = statusTitle(model, &scratch.title_buffer),
+        .presentation = .{ .tone = if (waiting) .warning else .normal },
+        .tooltip = "Notary",
+        .items = scratch.items[0..5],
+    };
+}
+
 /// Boot command: in managed mode spawn the daemon; either way begin connecting.
 pub fn boot(model: *Model, fx: *Effects) void {
+    // The manifest starts every macOS process without a Dock icon, for the
+    // resident. A window handed a keyholder by another app is a window the
+    // reader opens and closes, and it keeps showing up as one.
+    if (is_macos and !model.resident) fx.setDockPresence(true);
     // Start it. There is nothing to look for first: the daemon has no shared
     // address and no credential on disk, so it is not something another app
     // could already be running and not something this window could attach to.
@@ -1433,6 +1624,8 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             model.clearSecrets(); // don't keep a passphrase around a dead daemon
             model.clearOnboardError();
             model.submitting = false;
+            // A resident whose signer stopped would otherwise fail silently.
+            surfaceWindow(model, fx, false);
         },
 
         // /info reports the daemon's key state, which selects the screen.
@@ -1460,7 +1653,7 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             .ok => switch (r.status) {
                 200 => {
                     model.phase = .connected;
-                    parsePending(model, r.body);
+                    applyPending(model, fx, r.body);
                     pollPending(model, fx); // re-arm the long-poll chain
                 },
                 401 => onUnauthorized(model, fx),
@@ -1502,24 +1695,25 @@ pub fn update(model: *Model, msg: Msg, fx: *Effects) void {
             attemptConnect(model, fx);
         },
 
-        .approve => |id| {
-            sendDecision(model, fx, id, true, "once");
-            model.removeRow(id); // optimistic; a poll re-adds it if the send failed
+        .approve => |id| decide(model, fx, id, true, "once"),
+        .approve_day => |id| decide(model, fx, id, true, "day"),
+        .approve_always => |id| decide(model, fx, id, true, "always"),
+        // A denial lasts an hour: long enough that a rejected app cannot
+        // pester, short enough that a misclick is not permanent.
+        .reject => |id| decide(model, fx, id, false, "hour"),
+
+        .window_hidden => |hidden| {
+            model.window_hidden = hidden;
+            if (!hidden) return;
+            // Put away by the reader, so nothing is left to put away.
+            model.surfaced = false;
+            // An app that handed this window its keyholder learns the window
+            // was closed when this process exits, and the host now hides on
+            // close rather than ending it.
+            if (!model.resident) fx.quitApp();
         },
-        .approve_day => |id| {
-            sendDecision(model, fx, id, true, "day");
-            model.removeRow(id);
-        },
-        .approve_always => |id| {
-            sendDecision(model, fx, id, true, "always");
-            model.removeRow(id);
-        },
-        .reject => |id| {
-            // A denial lasts an hour: long enough that a rejected app cannot
-            // pester, short enough that a misclick is not permanent.
-            sendDecision(model, fx, id, false, "hour");
-            model.removeRow(id);
-        },
+        .show_window => surfaceWindow(model, fx, false),
+        .quit_app => fx.quitApp(),
 
         .restart => {
             if (!model.managed) return;
@@ -1897,6 +2091,12 @@ pub fn parseInfo(model: *Model, body: []const u8) void {
 /// `{"version":N,"pending":[{"id":,"method":,"kind":,"created_at":},..]}`.
 /// Malformed input leaves the previous queue untouched.
 pub fn parsePending(model: *Model, body: []const u8) void {
+    _ = applyPendingBody(model, body);
+}
+
+/// `parsePending`, saying whether the body parsed. One that did not leaves the
+/// queue as it was.
+fn applyPendingBody(model: *Model, body: []const u8) bool {
     var buf: [16 * 1024]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const Pending = struct {
@@ -1911,7 +2111,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
             preview: []const u8 = "",
         } = &.{},
     };
-    const parsed = std.json.parseFromSliceLeaky(Pending, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return;
+    const parsed = std.json.parseFromSliceLeaky(Pending, fba.allocator(), body, .{ .ignore_unknown_fields = true }) catch return false;
 
     model.version = parsed.version;
     var n: usize = 0;
@@ -1925,6 +2125,7 @@ pub fn parsePending(model: *Model, body: []const u8) void {
         n += 1;
     }
     model.rows_len = n;
+    return true;
 }
 
 // -------------------------------------------------------------------- app
@@ -2091,24 +2292,115 @@ fn loadConfig(model: *Model, io: std.Io, environ: *const std.process.Environ.Map
     model.port_known = r.port_known;
 }
 
-pub fn main(init: std.process.Init) !void {
+/// Whether another app started this window with a keyholder of its own (see
+/// `attachedAddress`). Looks at argv only: the secret behind it is read once,
+/// later, and not here.
+fn handedKeyholder(raw_args: anytype) bool {
+    var args = std.process.Args.Iterator.init(raw_args);
+    _ = args.skip(); // argv[0]
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--approval-http")) return true;
+    }
+    return false;
+}
+
+// ------------------------------------------------------------ window watch
+
+var g_app_state: *NotaryApp = undefined;
+const InnerEventFn = @TypeOf(@as(native_sdk.App, undefined).event_fn);
+var g_inner_event: InnerEventFn = null;
+var g_seen_hidden: bool = false;
+var g_watch_timer_armed: bool = false;
+
+/// A platform timer of this file's own, below the range the toolkit reserves.
+/// No `on_timer` is declared, so the app ignores it and nothing is rebuilt: it
+/// exists only to run `watchWindow`.
+pub const window_watch_timer_id: u64 = 0x6e6f_7461_7279;
+/// How soon a window another app opened notices it was closed.
+const window_watch_interval_ns: u64 = 250 * std.time.ns_per_ms;
+
+/// Tells the app when the host hides or shows its window.
+///
+/// A close under the hide policy only hides the window, and the host reports
+/// that on the frame channel the runtime keeps and nowhere the app can hear it.
+/// So this runs the app's own event handler and then reads the window table,
+/// which is the one place the answer is. It runs on every event, and the
+/// refresh timer fires every few seconds even with nothing on screen, so the
+/// resident notices a hide within about that long.
+///
+/// A window another app opened cannot wait that long: that app learns the
+/// window was closed when this process exits, and a reader who closes it and
+/// opens it again straight away would be told one is already open. So that
+/// window also runs a quiet timer of its own, which costs a table read four
+/// times a second and no rebuild.
+fn watchWindow(context: *anyopaque, runtime: *native_sdk.Runtime, event: native_sdk.Event) anyerror!void {
+    if (g_inner_event) |inner| try inner(context, runtime, event);
+    if (!g_watch_timer_armed and !g_app_state.model.resident) {
+        g_watch_timer_armed = true;
+        runtime.startTimer(window_watch_timer_id, window_watch_interval_ns, true) catch {};
+    }
+    var buffer: [native_sdk.platform.max_windows]native_sdk.WindowInfo = undefined;
+    for (runtime.listWindows(&buffer)) |window| {
+        if (!std.mem.eql(u8, window.label, main_window_label)) continue;
+        if (window.hidden == g_seen_hidden) return;
+        g_seen_hidden = window.hidden;
+        try g_app_state.dispatch(runtime, window.id, .{ .window_hidden = window.hidden });
+        return;
+    }
+}
+
+fn createApp(io: std.Io, resident: bool) !*NotaryApp {
     const app_state = try NotaryApp.create(std.heap.page_allocator, .{
         .name = "notary",
         .scene = shell_scene,
         .canvas_label = canvas_label,
         .init_fx = boot,
         .update_fx = update,
-        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = init.io },
+        .markup = .{ .source = app_markup, .watch_path = "src/app.native", .io = io },
         // Empty on macOS, where CoreText draws the text. See
         // `registered_fonts`.
         .fonts = registered_fonts,
+        .on_command = if (resident) commandMsg else null,
+        .status_item = if (resident) .{ .title = "N", .tooltip = "Notary" } else null,
+        .status_item_fn = if (resident) statusItem else null,
     });
-    defer app_state.destroy();
     app_state.model = initialModel();
+    app_state.model.resident = resident;
+    return app_state;
+}
+
+/// The app with its events passed through `watchWindow`, on macOS, where a
+/// close can hide the window.
+fn watchedApp(app_state: *NotaryApp) native_sdk.App {
+    var app = app_state.app();
+    if (!is_macos) return app;
+    g_app_state = app_state;
+    g_inner_event = app.event_fn;
+    g_seen_hidden = false;
+    g_watch_timer_armed = false;
+    app.event_fn = watchWindow;
+    return app;
+}
+
+pub fn createAppForTest(io: std.Io, resident: bool) !*NotaryApp {
+    return createApp(io, resident);
+}
+
+pub fn watchedAppForTest(app_state: *NotaryApp) native_sdk.App {
+    return watchedApp(app_state);
+}
+
+pub fn main(init: std.process.Init) !void {
+    // Living in the menu bar is for the app that owns its keyholder. Closing a
+    // window that another app opened has to end it, because that app waits on
+    // the process.
+    const resident = is_macos and !handedKeyholder(init.minimal.args);
+    const app_state = try createApp(init.io, resident);
+    defer app_state.destroy();
     g_io = init.io;
     loadConfig(&app_state.model, init.io, init.environ_map, init.minimal.args);
 
-    try runner.runWithOptions(app_state.app(), .{
+    try runner.runWithOptions(watchedApp(app_state), .{
         .app_name = "notary",
         .window_title = "Notary",
         .bundle_id = "com.zig-nostr.notary",

@@ -47,6 +47,8 @@ native build    # produce a binary in zig-out/bin/
 native check    # validate src/app.native + app.zon
 ```
 
+Linux builds read `app.linux.zon` instead of `app.zon`; see [Background operation](#background-operation-macos).
+
 ## Connect to a signer
 
 Run the daemon in **GUI mode** (see the signer's
@@ -104,6 +106,21 @@ connects, and if the daemon exits the app shows **Signer stopped** with a
 none is left orphaned holding the approval port. The key still only ever lives
 in the daemon child.
 
+## Background operation (macOS)
+
+On macOS the standalone app is a background resident. Closing the window hides it instead of ending the app, a menu bar item stays, and the window comes back when a decision is needed:
+
+- `app.zon` declares the window with `close_policy = "hide"`, the app with `dock_visible = false` (so no Dock icon), and the `tray` capability the toolkit requires for that.
+- The menu bar item is built from the model after every change (`statusItem` in `src/main.zig`). Its title is `N`, or `N 2` with two requests waiting, and its menu has a status line, **Open Notary** (**Review requests** when something is waiting) and **Quit Notary**.
+- A request that was not in the previous poll brings the window to the front. The test is on request ids, not on the count, so one answered while another arrives still counts as new, and one you just answered does not count again when a poll the signer wrote a moment earlier still lists it.
+- If the window was away when the request came, it goes away again once the queue is empty, whether you answered the last request or it went away on its own. A window you had open, or opened from the menu, stays.
+- If the signer the app started stops, the window comes back showing **Signer stopped**.
+- **Quit Notary** ends the app. The runtime stops the signer child with it, so no daemon is left holding the key. A daemon you started yourself and attached to with `SIGNER_APPROVAL_HTTP` is not the app's to stop, and keeps running.
+
+The host reports a hidden window to the runtime but not to the app, so `watchWindow` in `src/main.zig` wraps the app's event handler and reads the window table after each event. That is how the app knows the window is away. The resident hears about a hide within a few seconds, from the refresh timer and the request poll. A window started with another app's keyholder runs a quarter-second timer of its own as well, which only reads that table, so it exits about as soon as it is closed.
+
+Two cases keep the old behaviour. An app that starts this window with its own keyholder (`--approval-http`) gets no menu bar item and its Dock icon back, and when the window is hidden the process exits, because that app watches the process to learn the window was closed. The keyholder is that app's own, so closing the window leaves it running. Linux builds read `app.linux.zon`, which is `app.zon` without the three lines above, because the toolkit refuses a hiding window where it has no status item to bring it back. `build.zig` picks the file by target, and `scripts/check-manifests.sh` fails CI if the two differ anywhere else.
+
 ## Packaging
 
 `scripts/package-macos.sh` produces a single, self-contained
@@ -143,6 +160,7 @@ scripts/package-macos.sh --signing identity \
 - [x] Bundle the daemon into the app, one `.app`, discovered and supervised
 - [x] First-run key onboarding in-app (create / import / unlock)
 - [x] Ad-hoc signed macOS releases + one-line installer (CI on tag; clears quarantine on install)
+- [x] macOS background resident: menu bar item, window on demand, quit from the menu bar
 
 What comes next is set by what clients ask a signer for:
 

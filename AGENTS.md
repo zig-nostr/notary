@@ -23,12 +23,15 @@ gui/             # the approval window ("notary" binary), a Native SDK app
   src/main.zig   # model, update, daemon supervision
   src/tests.zig
   app.zon        # app manifest; its .version is the release version
-scripts/         # installers and the installer check
+  app.linux.zon  # the same without the macOS background-resident lines; build.zig picks one by target
+scripts/         # installers, the installer check, check-manifests.sh
 .github/RELEASE_NOTES.md  # the text of each release page
 CHANGELOG.md
 ```
 
 The daemon runs in one of two modes, never both: standalone, a bunker on real relays; or embedded, the private keyholder of one parent app (Plaza), reachable only down a pipe that parent was handed at startup, with no relay connections. A signer that any local app can reach cannot tell which app is asking, so do not add one.
+
+On macOS the standalone window is a background resident: closing it hides it, a menu bar item stays, and a new request brings it back. A window another app starts with `--approval-http` (Plaza) is not: it has no menu bar item, a Dock icon, and exits when it is closed, and the keyholder it was handed is never started or stopped by it. Keep both behaviours when changing `gui/src/main.zig`; `ARCHITECTURE.md` explains how they are told apart.
 
 ## Build and test
 
@@ -51,6 +54,8 @@ native build
 zig fmt --check src
 ```
 
+From the repository root, `scripts/check-manifests.sh` checks that `gui/app.linux.zon` follows `gui/app.zon` (CI runs it).
+
 To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zig-out/bin/signer`) when starting `native dev`. The window then starts and supervises that daemon the way a packaged app does with the one beside it. The full example, with the key and relay variables, is under "Managed mode" in `gui/README.md`; `daemon/README.md` covers key setup and the approval API.
 
 ## Conventions
@@ -58,8 +63,12 @@ To run the window against a daemon you built, set `SIGNER_BIN` to it (`daemon/zi
 - `zig fmt` is the formatter; CI fails on unformatted code, in both packages.
 - [Conventional Commits](https://www.conventionalcommits.org/). One concern per pull request, with its tests, and every pull request links its issue.
 - Never commit to `main`; everything lands through a reviewed pull request.
-- A release is a version bump in `gui/app.zon` plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds the macOS app and the Linux tarballs.
+- A release is a version bump in `gui/app.zon` (and `gui/app.linux.zon`, which `scripts/check-manifests.sh` keeps in step) plus a matching `### What's new in vX.Y.Z` section in `.github/RELEASE_NOTES.md`. CI checks that the two agree. Merging the bump tags the release and builds the macOS app and the Linux tarballs.
 - Validate everything a client or relay sends at the boundary. Every request that reaches the daemon is untrusted until it is authenticated.
+
+## Architecture
+
+Read [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full design: how the two processes talk, the daemon's modules, why the key stays isolated, the two operational modes, NIP-49 encryption, and the daemon supervision model.
 
 ## Related
 

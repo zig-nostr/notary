@@ -51,6 +51,14 @@ strictly need it: an unlocked signer is the normal state, and whoever is at the
 keyboard then is not necessarily the person who set it up. Nothing is kept
 afterwards, and closing the panel takes the key off the screen with it.
 
+## Staying in the background
+
+On macOS, closing the window does not quit Notary. The signer keeps answering, and an `N` item in the menu bar shows how many requests are waiting. When a request arrives the window comes back to the front, and when you have answered the last one it goes away again. If you opened the window yourself, it stays open until you close it.
+
+The menu bar item has **Open Notary** to bring the window back by hand and **Quit Notary** to stop. Quitting stops the signer Notary started, so nothing is left running with your key. If the signer stops by itself the window comes back and says so, rather than leaving a menu bar item that no longer answers anything.
+
+Notary has no Dock icon on macOS. A window that another app opened for its own keyholder (Plaza does this) behaves as it always did: it has a Dock icon, and closing it ends the window and nothing else, because that keyholder belongs to the app that opened it. On Linux closing the window quits, because the toolkit's Linux host has no status item that could bring a hidden window back.
+
 ## Install
 
 **macOS (Apple Silicon):**
@@ -62,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/insta
 That downloads the latest release, verifies its SHA-256, installs `Notary.app`
 to `/Applications` (or `~/Applications` when that is not writable), clears the
 download-quarantine flag so Gatekeeper does not stop an ad-hoc-signed build, and
-opens it.
+opens it. Notary keeps running in the menu bar after its window is closed, so choose **Quit Notary** there before you install over a copy that is already running.
 
 Notary is **ad-hoc signed, not notarized**, on purpose. It holds your keys, so
 the trust anchor is a build you can reproduce, not an Apple signature: every
@@ -143,6 +151,8 @@ cd gui && native build
   relays, and the approval API.
 - [`gui/README.md`](gui/README.md): the approval app and how it connects to (or
   supervises) the daemon.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md): how the two processes work together, the
+  daemon's modules, NIP-49 key storage, and the daemon supervision model.
 
 ## License
 

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const native_sdk = @import("native_sdk");
 const main = @import("main.zig");
 
@@ -932,4 +933,344 @@ test "the standalone window asks for a bunker, an embedded one does not" {
     // And a kernel-chosen port, because a well-known one is something else can
     // be sitting on first.
     try testing.expect(std.mem.indexOf(u8, argv, "127.0.0.1:0") != null);
+}
+
+// ------------------------------------------------- background residency
+
+fn initFx(fx: *main.Effects) void {
+    fx.* = main.Effects.init(testing.allocator);
+    fx.executor = .fake;
+}
+
+/// A `GET /pending` answer carrying exactly these request ids.
+fn pendingMsg(comptime ids: []const u64) Msg {
+    comptime var body: []const u8 = "{\"version\":2,\"pending\":[";
+    inline for (ids, 0..) |id, i| {
+        body = body ++ (if (i == 0) "" else ",") ++ std.fmt.comptimePrint("{{\"id\":{d},\"method\":\"sign_event\",\"kind\":1,\"created_at\":0}}", .{id});
+    }
+    body = body ++ "]}";
+    return .{ .pending = .{ .key = 0, .outcome = .ok, .status = 200, .body = body } };
+}
+
+/// A standalone app whose window the reader closed.
+fn residentAway() Model {
+    var m = Model{};
+    m.resident = true;
+    m.window_hidden = true;
+    m.phase = .connected;
+    return m;
+}
+
+test "a request that was not there before is news, and a count alone does not say so" {
+    var m = Model{};
+    const one = "{\"version\":1,\"pending\":[{\"id\":4,\"method\":\"ping\",\"kind\":-1,\"created_at\":0}]}";
+    try testing.expectEqual(@as(usize, 1), main.parsePendingCountingNew(&m, one));
+    // The same queue again: nothing new.
+    try testing.expectEqual(@as(usize, 0), main.parsePendingCountingNew(&m, one));
+    // One answered while another arrived leaves the count at one and is news.
+    const swapped = "{\"version\":2,\"pending\":[{\"id\":5,\"method\":\"ping\",\"kind\":-1,\"created_at\":0}]}";
+    try testing.expectEqual(@as(usize, 1), main.parsePendingCountingNew(&m, swapped));
+    // A queue that emptied is not news.
+    try testing.expectEqual(@as(usize, 0), main.parsePendingCountingNew(&m, "{\"version\":3,\"pending\":[]}"));
+    // And a body that does not parse leaves the queue alone and reports nothing.
+    try testing.expectEqual(@as(usize, 1), main.parsePendingCountingNew(&m, swapped));
+    try testing.expectEqual(@as(usize, 0), main.parsePendingCountingNew(&m, "not json"));
+    try testing.expectEqual(@as(usize, 1), m.rows_len);
+}
+
+test "a new request brings the put-away window back, and answering the last one puts it away" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
+    try testing.expect(m.surfaced);
+    try testing.expect(!m.window_hidden);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+    try testing.expectEqualStrings("main", fx.windowActionState().lastLabel());
+    try testing.expect(!m.surfaced);
+    try testing.expect(m.window_hidden);
+}
+
+test "every way of answering puts the window away" {
+    const answers = [_]Msg{ .{ .approve = 7 }, .{ .approve_day = 7 }, .{ .approve_always = 7 }, .{ .reject = 7 } };
+    for (answers) |answer| {
+        var fx: main.Effects = undefined;
+        initFx(&fx);
+        defer fx.deinit();
+        var m = residentAway();
+        main.update(&m, pendingMsg(&.{7}), &fx);
+        main.update(&m, answer, &fx);
+        try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+    }
+}
+
+test "the window stays while another request is still waiting" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{ 7, 8 }), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+    try testing.expect(m.surfaced);
+
+    main.update(&m, .{ .reject = 8 }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+}
+
+test "a poll written before an answer landed does not bring the window back" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+
+    // The daemon answered this poll a moment before the decision reached it.
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expect(m.window_hidden);
+
+    // Once a poll shows it gone, a request that really is new still counts.
+    main.update(&m, pendingMsg(&.{}), &fx);
+    main.update(&m, pendingMsg(&.{8}), &fx);
+    try testing.expectEqual(@as(u32, 2), fx.windowActionState().show_count);
+    try testing.expect(m.surfaced);
+}
+
+test "a restarted signer's requests are news even when an old answer had the same id" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{1}), &fx);
+    main.update(&m, .{ .approve = 1 }, &fx);
+    // The signer stops before any poll shows the answer gone, and the next one
+    // numbers its requests from the start again.
+    main.update(&m, .{ .daemon_exited = .{ .key = 0, .reason = .exited, .code = 1 } }, &fx);
+    main.update(&m, .{ .window_hidden = true }, &fx);
+    m.phase = .connected;
+    const shown = fx.windowActionState().show_count;
+    main.update(&m, pendingMsg(&.{1}), &fx);
+    try testing.expectEqual(shown + 1, fx.windowActionState().show_count);
+}
+
+test "a second request while the window is up is brought to the front and does not forget why it is up" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, pendingMsg(&.{ 7, 8 }), &fx);
+    try testing.expectEqual(@as(u32, 2), fx.windowActionState().show_count);
+    try testing.expect(m.surfaced);
+}
+
+test "a window the reader had open is not put away behind them" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+    m.window_hidden = false; // the reader is looking at it
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    // Brought to the front, in case it was behind other windows.
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expect(!m.surfaced);
+
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+}
+
+test "opening the window from the menu bar keeps it open through an answer" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    try testing.expect(m.surfaced);
+    main.update(&m, .show_window, &fx);
+    try testing.expectEqual(@as(u32, 2), fx.windowActionState().show_count);
+    try testing.expect(!m.surfaced);
+
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+}
+
+test "closing the window by hand means there is nothing left to put away" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, .{ .window_hidden = true }, &fx);
+    try testing.expect(m.window_hidden);
+    try testing.expect(!m.surfaced);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().quit_count);
+
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+}
+
+test "a queue that emptied without an answer puts the window away" {
+    // The client gave up, or another route answered it.
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, pendingMsg(&.{}), &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().hide_count);
+    try testing.expect(!m.surfaced);
+}
+
+test "an idle poll leaves the window alone" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+    main.update(&m, pendingMsg(&.{}), &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().show_count);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+}
+
+test "a signer that stopped brings the window back instead of failing quietly" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+    main.update(&m, .{ .daemon_exited = .{ .key = 0, .reason = .exited, .code = 1 } }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+    try testing.expect(!m.surfaced);
+    try testing.expectEqual(main.Phase.daemon_exited, m.phase);
+
+    // Ending the app on purpose is not a failure to report.
+    var quiet = residentAway();
+    main.update(&quiet, .{ .daemon_exited = .{ .key = 0, .reason = .cancelled, .code = 0 } }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().show_count);
+}
+
+test "a window another app opened is never shown, hidden or kept: closing it ends it" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = Model{};
+    m.phase = .connected;
+
+    main.update(&m, pendingMsg(&.{7}), &fx);
+    main.update(&m, .{ .approve = 7 }, &fx);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().show_count);
+    try testing.expectEqual(@as(u32, 0), fx.windowActionState().hide_count);
+
+    // The host hides on close, and the app that opened this window is waiting
+    // for the process to exit.
+    main.update(&m, .{ .window_hidden = true }, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().quit_count);
+}
+
+test "quitting from the menu bar asks the app to stop" {
+    var fx: main.Effects = undefined;
+    initFx(&fx);
+    defer fx.deinit();
+    var m = residentAway();
+    main.update(&m, .quit_app, &fx);
+    try testing.expectEqual(@as(u32, 1), fx.windowActionState().quit_count);
+}
+
+test "the menu bar item's commands map to what they say" {
+    try testing.expectEqual(@as(?Msg, .show_window), main.commandMsgForTest(main.command_show));
+    try testing.expectEqual(@as(?Msg, .quit_app), main.commandMsgForTest(main.command_quit));
+    try testing.expectEqual(@as(?Msg, null), main.commandMsgForTest("something.else"));
+}
+
+test "the menu bar item says how many requests are waiting" {
+    var buf: [64]u8 = undefined;
+    var line: [64]u8 = undefined;
+    var m = Model{};
+    m.phase = .connected;
+    try testing.expectEqualStrings("N", main.statusTitle(&m, &buf));
+    try testing.expectEqualStrings("No requests waiting", main.statusLine(&m, &line));
+
+    m.rows_len = 1;
+    try testing.expectEqualStrings("N 1", main.statusTitle(&m, &buf));
+    try testing.expectEqualStrings("1 request waiting", main.statusLine(&m, &line));
+
+    m.rows_len = 3;
+    try testing.expectEqualStrings("N 3", main.statusTitle(&m, &buf));
+    try testing.expectEqualStrings("3 requests waiting", main.statusLine(&m, &line));
+}
+
+test "the menu bar item says why nothing is waiting when the signer is not up" {
+    var line: [64]u8 = undefined;
+    const cases = [_]struct { phase: main.Phase, text: []const u8 }{
+        .{ .phase = .starting, .text = "Starting the signer" },
+        .{ .phase = .connecting, .text = "Starting the signer" },
+        .{ .phase = .disconnected, .text = "Reconnecting to the signer" },
+        .{ .phase = .unauthorized, .text = "Cannot reach the signer" },
+        .{ .phase = .daemon_exited, .text = "The signer stopped" },
+        .{ .phase = .needs_setup, .text = "Needs a key" },
+        .{ .phase = .needs_unlock, .text = "Locked" },
+    };
+    for (cases) |c| {
+        var m = Model{};
+        m.phase = c.phase;
+        try testing.expectEqualStrings(c.text, main.statusLine(&m, &line));
+    }
+}
+
+test "a window another app opened ends soon after the host hides it" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = .init(460, 560) });
+    defer harness.destroy(testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    const app_state = try main.createAppForTest(testing.io, false);
+    defer app_state.destroy();
+    const app = main.watchedAppForTest(app_state);
+    try harness.start(app);
+
+    // The watch timer is armed and repeats.
+    const timer = harness.null_platform.startedTimer(main.window_watch_timer_id) orelse return error.TestUnexpectedResult;
+    try testing.expect(timer.active and timer.repeats);
+
+    // The reader closes the window: the host hides it and says so on the
+    // frame channel, which reaches the runtime's window table and not the app.
+    var buffer: [native_sdk.platform.max_windows]native_sdk.WindowInfo = undefined;
+    const window = for (harness.runtime.listWindows(&buffer)) |w| {
+        if (std.mem.eql(u8, w.label, "main")) break w;
+    } else return error.TestUnexpectedResult;
+    try harness.runtime.dispatchPlatformEvent(app, .{ .window_frame_changed = .{ .id = window.id, .label = "main", .frame = window.frame, .open = true, .focused = false, .hidden = true } });
+    try testing.expectEqual(@as(u32, 0), app_state.effects.windowActionState().quit_count);
+
+    // The next tick of the watch timer is enough to end the process.
+    const tick = harness.null_platform.fireTimer(main.window_watch_timer_id, 1) orelse return error.TestUnexpectedResult;
+    try harness.runtime.dispatchPlatformEvent(app, tick);
+    try testing.expectEqual(@as(u32, 1), app_state.effects.windowActionState().quit_count);
+    try testing.expect(app_state.model.window_hidden);
+}
+
+test "the standalone app runs no watch timer of its own" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const harness = try native_sdk.TestHarness().create(testing.allocator, .{ .size = .init(460, 560) });
+    defer harness.destroy(testing.allocator);
+    harness.null_platform.gpu_surfaces = true;
+    const app_state = try main.createAppForTest(testing.io, true);
+    defer app_state.destroy();
+    try harness.start(main.watchedAppForTest(app_state));
+    try testing.expect(harness.null_platform.startedTimer(main.window_watch_timer_id) == null);
 }

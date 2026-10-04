@@ -7,8 +7,7 @@
     .icons = .{"assets/icon.png"},
     .platforms = .{ "macos", "linux" },
     .permissions = .{ "view", "command", "clipboard" },
-    .capabilities = .{ "native_views", "gpu_surfaces", "tray" },
-    .dock_visible = false,
+    .capabilities = .{ "native_views", "gpu_surfaces" },
     .shell = .{
         .windows = .{
             .{
@@ -18,7 +17,6 @@
                 .height = 560,
                 .restore_state = false,
                 .restore_policy = "center_on_primary",
-                .close_policy = "hide",
                 .views = .{
                     .{ .label = "main-canvas", .kind = "gpu_surface", .fill = true, .role = "Notary canvas", .accessibility_label = "Notary", .gpu_backend = "metal", .gpu_pixel_format = "bgra8_unorm", .gpu_present_mode = "timer", .gpu_alpha_mode = "opaque", .gpu_color_space = "srgb", .gpu_vsync = true },
                 },

@@ -41,5 +41,5 @@
             .hash = "native_sdk-0.1.0-hzDzQkVysQJeCEkO1f6kfnZt7cQ0YNriPiqOdn_CAYXg",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "assets", "app.zon", "app.linux.zon" },
 }
