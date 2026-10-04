@@ -7,7 +7,7 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-10-04
+## [0.11.1] - 2026-10-04
 
 ### Added
 

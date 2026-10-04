@@ -153,7 +153,11 @@ jobs:
 
       - name: Read Zig version
         id: zig-version
-        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+        # This job runs from the root, and the version lives under daemon/.
+        run: |
+          version="$(cat daemon/.zigversion)"
+          [ -n "$version" ] || { echo "no Zig version in daemon/.zigversion" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: mlugg/setup-zig@v2
         with:

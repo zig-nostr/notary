@@ -130,7 +130,13 @@ jobs:
 
       - name: Read Zig version
         id: zig-version
-        run: echo "version=$(cat .zigversion)" >> "$GITHUB_OUTPUT"
+        # The version lives under daemon/, and this job runs from the root. An
+        # empty read made setup-zig install whatever Zig was newest, so the
+        # read has to find one.
+        run: |
+          version="$(cat daemon/.zigversion)"
+          [ -n "$version" ] || { echo "no Zig version in daemon/.zigversion" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: mlugg/setup-zig@v2
         with:
