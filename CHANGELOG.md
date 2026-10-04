@@ -7,6 +7,16 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+### Added
+
+- One installer for macOS and Linux, `curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install.sh | bash`, which picks the build for the system it runs on. The old `install-macos.sh` and `install-linux.sh` addresses keep working and run it with the same arguments. It takes `--version <tag>` to install a named release, `--prefix <dir>` to install somewhere else, and `--no-open` to install without starting Notary, and `--archive <file>` now works on macOS too and checks a `.sha256` beside the file when there is one.
+
+### Changed
+
+- On macOS the installer checks the download against the `.sha256` published beside it, and refuses to install when that cannot be fetched or does not match. It used to read the digest out of the release listing and install unverified when there was none.
+
+- On macOS the installer stops, before changing anything, when Notary is running from the place it would install to, and says to quit it first. Replacing a running copy left the old version running, and opening the new one brought the old one forward.
+
 ## [0.11.2] - 2026-10-04
 
 ### Fixed

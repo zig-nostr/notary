@@ -57,8 +57,8 @@ jobs:
         run: ditto -c -k --sequesterRsrc --keepParent "gui/dist/Notary.app" "Notary-${{ github.ref_name }}-macos.zip"
 
       # Published beside the zip, the same way each Linux tarball has its
-      # `.sha256`, so the macOS installer can read the digest of the file it
-      # downloads by name instead of picking it out of the release JSON, and a
+      # `.sha256`, so the installer reads the digest of the file it downloads
+      # by name on macOS too, instead of picking it out of the release JSON, and a
       # reader can check a download by hand from the release page.
       - name: Write the zip's digest
         run: shasum -a 256 "Notary-${{ github.ref_name }}-macos.zip" > "Notary-${{ github.ref_name }}-macos.zip.sha256"
@@ -102,7 +102,7 @@ jobs:
           else
             # A DRAFT. The Linux tarballs are built by another job that takes
             # minutes longer, and a release published before they arrive is one
-            # whose Linux installer 404s for exactly as long as that takes. The
+            # whose Linux install 404s for exactly as long as that takes. The
             # `publish` job below lifts the draft once every artifact is up.
             gh release create "$GITHUB_REF_NAME" "$asset" "$asset.sha256" \
               --draft \
@@ -205,7 +205,7 @@ jobs:
       # `make_latest=legacy`, not gh's `--draft=false`. Publishing a draft
       # defaults to making it Latest, which is right for a new tag and wrong for
       # an older one re-run through the branch above: it would move
-      # /releases/latest, where both installers look, back a version. `legacy`
+      # /releases/latest, where the installer looks, back a version. `legacy`
       # lets GitHub pick Latest by version and date, so a new release still
       # becomes Latest and a re-published old one does not. gh cannot send
       # `legacy`, hence the API call.
