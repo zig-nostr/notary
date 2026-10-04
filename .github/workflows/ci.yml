@@ -73,27 +73,43 @@ jobs:
       - name: The Linux manifest follows the macOS one
         run: scripts/check-manifests.sh
 
-      # The installer verifies the file it downloaded, not whatever is listed
-      # first. The script read the first `sha256:` in the release JSON, which
-      # was correct while a release carried one asset and became wrong the
-      # moment the Linux tarballs were added: GitHub lists assets in upload
-      # order, so the first digest belongs to whichever packaging job finished
-      # first. On v0.10.11 that is the Linux aarch64 tarball, so every macOS
-      # install failed with a checksum mismatch on a perfectly good download.
-      #
-      # The checks live in the script so they can be run by hand, and so this
-      # file does not carry shell that only ever runs on a runner.
-      - name: The macOS installer verifies the macOS download
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: scripts/check-macos-installer.sh ${{ github.repository }} .
-
       # The release's publish job refuses to lift the draft until this says every
       # artifact is up. Its self-test covers a missing file, an upload that never
       # finished, an empty file and another version's files, and checks its list
       # of architectures against release.yml's matrix.
       - name: The release check refuses an incomplete release
         run: scripts/check-release-assets.sh --self-test
+
+  # The one-line installer, on each system it installs to: install.sh and the
+  # two old addresses that run it are ASCII and parse, the newest published
+  # release installs and its signer runs, a tampered or unverifiable download is
+  # refused, and the old addresses pass their arguments through. Everything
+  # goes into a temporary prefix.
+  #
+  # The checks live in the script so they can be run by hand, and so this file
+  # does not carry shell that only ever runs on a runner.
+  installer:
+    name: installer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/checkout@v4
+
+      # The installer refuses a Linux system without GTK 4 before it downloads
+      # anything, and the runner image does not promise it.
+      - name: Install GTK 4
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-1
+
+      - name: The installer installs, verifies, and refuses what it should
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/check-installer.sh
 
   # The GUI (Native SDK): macOS only, via the native CLI.
   gui:

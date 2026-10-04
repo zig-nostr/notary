@@ -57,7 +57,7 @@ Nothing you can see changed. Everything in v0.10.8 below is in this release too.
 **There is a Linux download now.** 0.10.7 said Notary ran on Linux and offered only a macOS app, which was true and useless. This release carries a tarball for x86_64 and aarch64:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install-linux.sh | bash
+curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install.sh | bash
 ```
 
 GTK 4 is the one runtime dependency, and the installer says so before it downloads anything rather than after the window fails to open. It verifies the SHA-256, installs into `~/.local` so nothing needs root and nothing lands outside your home directory, puts Notary in the launcher, and starts it. Pass `--archive <file>` to install a tarball you already have.
