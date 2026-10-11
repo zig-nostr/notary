@@ -7,15 +7,29 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.11.3] - 2026-10-11
+
 ### Added
 
 - One installer for macOS and Linux, `curl -fsSL https://raw.githubusercontent.com/zig-nostr/notary/main/scripts/install.sh | bash`, which picks the build for the system it runs on. The old `install-macos.sh` and `install-linux.sh` addresses keep working and run it with the same arguments. It takes `--version <tag>` to install a named release, `--prefix <dir>` to install somewhere else, and `--no-open` to install without starting Notary, and `--archive <file>` now works on macOS too and checks a `.sha256` beside the file when there is one.
+
+- The signer answers `nip04_encrypt` and `nip04_decrypt` requests, which a client built for older direct messages sends. They use the key, so in the app they wait in the queue for Allow or Deny like `nip44_encrypt` and `nip44_decrypt`, and a remembered answer applies to them the same way. The headless signer answers them under the same method allowlist as the NIP-44 pair, with no one asked.
 
 ### Changed
 
 - On macOS the installer checks the download against the `.sha256` published beside it, and refuses to install when that cannot be fetched or does not match. It used to read the digest out of the release listing and install unverified when there was none.
 
 - On macOS the installer stops, before changing anything, when Notary is running from the place it would install to, and says to quit it first. Replacing a running copy left the old version running, and opening the new one brought the old one forward.
+
+- Built on `nostr` v0.16.0. The signer's own log lines (each answered request, a failure to answer or to authenticate) keep going to stderr in the shipped build.
+
+### Fixed
+
+- An event signed here whose content or tags contain a control character now gets the id other clients compute for it, so it verifies everywhere.
+
+- A message from a relay that cannot be read, or a request event with a field the protocol does not name, used to make the serve loop return. The connection dropped and was redialled three seconds later, subscribing from that moment, so requests sent in the gap were lost. That message is now skipped and the connection stays up.
+
+- A relay that answers the websocket upgrade with anything but 101 no longer leaves its TLS state behind on each redial, and each resolved address is tried once instead of twice.
 
 ## [0.11.2] - 2026-10-04
 

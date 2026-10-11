@@ -1,5 +1,15 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.11.3
+
+**Requests for older encrypted messages now reach you.** A client built around the older direct messages asks the signer to encrypt or decrypt with the key. Notary used to refuse those outright. Now they come up in the queue like any other request that uses your key, and Allow, Deny and "remember" work the same way.
+
+**Fewer requests lost on a bad relay.** A message from a relay that Notary could not read, or a request with a field the protocol does not name, used to make Notary drop the connection and reconnect three seconds later, and requests sent in that gap were lost. Now only that message is skipped and the connection stays up. An event signed here with a control character in its text now gets the same id other apps compute, so it verifies everywhere.
+
+**Less left behind when a relay will not connect.** A relay that refuses the websocket upgrade no longer leaves memory behind on each retry, and each address is tried once instead of twice.
+
+**One installer for macOS and Linux.** The install command picks the build for the system it runs on, checks the download against its published SHA-256 and refuses to install if that cannot be fetched, and, on macOS, stops before changing anything when Notary is running from the place it would install to.
+
 ### What's new in v0.11.2
 
 **An answer that does not reach the signer is no longer lost.** Pressing Allow or Deny takes the request off the screen straight away, and on macOS the window can go with it. If the signer then never got that answer, because it was slow to reply or hit an error, the request sat there unseen until it ran out. Now it comes back on screen, the window comes to the front, and a line above it says the answer did not get through, so you can answer it again. Answering two requests close together could also drop the second answer before it was sent, and each answer now goes out on its own.
