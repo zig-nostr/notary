@@ -27,6 +27,17 @@ const nip46 = nostr.nip46;
 const nip49 = nostr.nip49;
 const hex = nostr.hex;
 
+/// The library's serve loop reports through `std.log` under the `.signer`
+/// scope: each answered request at info, failures to answer or authenticate at
+/// warn. Those lines used to be printed to stderr unconditionally. The default
+/// level in a ReleaseFast build is err, which would have silenced all of them
+/// in the build that ships, so that scope is set to info. Everything else
+/// logs at warn.
+pub const std_options: std.Options = .{
+    .log_level = .warn,
+    .log_scope_levels = &.{.{ .scope = .signer, .level = .info }},
+};
+
 // Turnkey defaults for GUI mode, so a freshly downloaded app works with zero
 // configuration; each is overridable via its environment variable. The key and
 // files sit under $HOME; relays default to a public relay.
