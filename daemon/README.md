@@ -9,7 +9,7 @@ native clients over a relay, the secret key never reaches the client.
 
 > **Status: early / work in progress.** The current build loads an encrypted
 > (NIP-49) key from disk, connects to your relays, and answers NIP-46 requests,
-> `get_public_key`, `sign_event`, `ping`, and NIP-44 encrypt/decrypt, behind the
+> `get_public_key`, `sign_event`, `ping`, and NIP-44 and NIP-04 encrypt/decrypt, behind the
 > connection secret and an optional method/event-kind allowlist. It works
 > against relays that require NIP-42 authentication. It can also run in **GUI
 > mode**: it holds each unanswered request for interactive approval over a loopback API,
@@ -68,7 +68,7 @@ Two optional variables narrow that to least privilege:
 - `SIGNER_ALLOWED_METHODS`: comma-separated methods the signer will honor, e.g.
   `get_public_key,sign_event`. `connect`, `ping`, and `logout` are always
   allowed so the handshake can't be locked out. Use this to run a **sign-only**
-  bunker that refuses `nip44_decrypt`, so a connected client can't read your DMs
+  bunker that refuses `nip44_decrypt` and `nip04_decrypt`, so a connected client can't read your DMs
   through it.
 - `SIGNER_ALLOWED_KINDS`: comma-separated event kinds `sign_event` may sign,
   e.g. `1,7`. A request to sign any other kind is denied.

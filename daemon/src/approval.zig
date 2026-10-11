@@ -514,7 +514,7 @@ pub const Interactive = struct {
 fn touchesKey(method_name: []const u8) bool {
     const method = nip46.Method.fromString(method_name) orelse return true;
     return switch (method) {
-        .sign_event, .nip44_encrypt, .nip44_decrypt => true,
+        .sign_event, .nip44_encrypt, .nip44_decrypt, .nip04_encrypt, .nip04_decrypt => true,
         .connect, .ping, .get_public_key, .logout => false,
     };
 }
@@ -683,6 +683,21 @@ test "broker denies on timeout when nothing resolves it" {
     try testing.expectEqual(Decision.reject, broker.submit(io, Pending{}));
 }
 
+test "every method that uses the key reaches the human, and the bookkeeping ones do not" {
+    // A new method in the library is a new case to decide here. Both NIP-04
+    // methods decrypt or encrypt with the secret key, so they are asked about
+    // exactly like the NIP-44 pair.
+    inline for (@typeInfo(nip46.Method).@"enum".fields) |f| {
+        const uses_key = switch (@field(nip46.Method, f.name)) {
+            .sign_event, .nip44_encrypt, .nip44_decrypt, .nip04_encrypt, .nip04_decrypt => true,
+            .connect, .ping, .get_public_key, .logout => false,
+        };
+        try testing.expectEqual(uses_key, touchesKey(f.name));
+    }
+    // A name nobody recognises is asked about too.
+    try testing.expect(touchesKey("something_new"));
+}
+
 test "interactive policy denies allowlist-disallowed requests without prompting" {
     var threaded = std.Io.Threaded.init(testing.allocator, .{});
     defer threaded.deinit();
@@ -745,8 +760,9 @@ test "housekeeping never reaches the human, so a stranger cannot park the relay 
     }
     try testing.expectEqual(@as(u64, 0), broker.version.load(.monotonic));
 
-    // An unrecognised name is not waved through.
-    const odd = nip46.Request{ .id = "2", .method = "nip04_decrypt", .params = &.{} };
+    // A name the library does not know is not waved through: it goes to the
+    // human, and with nobody answering it is refused.
+    const odd = nip46.Request{ .id = "2", .method = "switch_relays", .params = &.{} };
     try testing.expectEqual(nip46.Decision.reject, p.decide(&odd, [_]u8{0} ** 32));
 }
 
