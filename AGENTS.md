@@ -44,7 +44,7 @@ zig build test
 zig fmt --check .
 ```
 
-The window needs the Native SDK CLI (`npm install -g @native-sdk/cli@0.10.1`, the version CI uses):
+The window needs the Native SDK CLI (`npm install -g @native-sdk/cli@0.11.0`, the version CI uses):
 
 ```sh
 cd gui

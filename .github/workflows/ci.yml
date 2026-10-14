@@ -113,7 +113,7 @@ jobs:
 
   # The GUI (Native SDK): macOS only, via the native CLI.
   gui:
-    runs-on: macos-latest
+    runs-on: macos-15
     defaults:
       run:
         working-directory: gui
@@ -130,10 +130,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       - name: Check markup and manifest
         run: native check
@@ -183,10 +183,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # gtk4 only. Notary draws on a canvas and declares no web use, so the host
       # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing

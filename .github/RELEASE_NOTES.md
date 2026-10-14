@@ -1,5 +1,11 @@
 **Notary**: a native NIP-46 remote signer for Nostr. macOS (Apple Silicon), **ad-hoc signed (not notarized)**, and Linux (x86_64 and aarch64).
 
+### What's new in v0.11.4
+
+**On Linux, scrolling the window is smoother and drawing is faster.** Scrolling with a touchpad or a fast wheel stays responsive, a notch of the mouse wheel moves a set distance and stops instead of gliding on, and the window is redrawn in less time.
+
+Nothing you can see changes on macOS.
+
 ### What's new in v0.11.3
 
 **Requests for older encrypted messages now reach you.** A client built around the older direct messages asks the signer to encrypt or decrypt with the key. Notary used to refuse those outright. Now they come up in the queue like any other request that uses your key, and Allow, Deny and "remember" work the same way.

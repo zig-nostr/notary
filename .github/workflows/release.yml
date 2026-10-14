@@ -18,7 +18,7 @@ permissions:
 jobs:
   macos-app:
     name: package · ad-hoc sign · publish
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -32,10 +32,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # The suites run on every pull request, but a tag can be pushed at any
       # commit, and a release is the one artifact nobody gets to re-check. So
@@ -144,10 +144,10 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
 
       - name: Install the Native SDK CLI
-        run: npm install -g @native-sdk/cli@0.10.1
+        run: npm install -g @native-sdk/cli@0.11.0
 
       # gtk4 only. Notary draws on a canvas and declares no web use, so the host
       # compiles with the WebKitGTK stub and links gtk4 and libdl and nothing
