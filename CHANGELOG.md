@@ -7,6 +7,14 @@ While pre-1.0, minor versions add capability and patch versions are fixes.
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-10-14
+
+### Changed
+
+- On Linux, scroll input reaches the window once per frame instead of once per event, so scrolling with a touchpad or a high-resolution wheel stays responsive. A mouse wheel notch moves a fixed distance without a fling afterwards, and the software drawing path is faster and spreads its work across cores.
+
+- The window is built on Native SDK 0.11.0, and the CLI pin in CI is 0.11.0 with it, on Node 24 and macOS 15 runners, which that CLI needs.
+
 ## [0.11.3] - 2026-10-11
 
 ### Added
